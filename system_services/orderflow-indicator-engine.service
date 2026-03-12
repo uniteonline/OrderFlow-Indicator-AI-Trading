@@ -1,0 +1,18 @@
+[Unit]
+Description=Orderflow Indicator Engine
+After=network-online.target rabbitmq-server.service postgresql.service orderflow-market-data-ingestor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/data
+EnvironmentFile=-/etc/default/orderflow-common
+ExecStart=/data/target/release/indicator_engine
+Restart=always
+RestartSec=5
+TimeoutStopSec=3600
+
+[Install]
+WantedBy=multi-user.target

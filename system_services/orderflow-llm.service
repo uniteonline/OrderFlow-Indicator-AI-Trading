@@ -1,0 +1,17 @@
+[Unit]
+Description=Orderflow LLM Subsystem
+After=network-online.target rabbitmq-server.service postgresql.service orderflow-indicator-engine.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/data
+EnvironmentFile=-/etc/default/orderflow-common
+ExecStart=/data/target/release/llm
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

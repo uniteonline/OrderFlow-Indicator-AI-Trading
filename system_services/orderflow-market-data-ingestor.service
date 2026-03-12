@@ -1,0 +1,17 @@
+[Unit]
+Description=Orderflow Market Data Ingestor
+After=network-online.target rabbitmq-server.service postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/data
+EnvironmentFile=-/etc/default/orderflow-common
+ExecStart=/home/ubuntu/.cargo/bin/cargo run -p market_data_ingestor
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

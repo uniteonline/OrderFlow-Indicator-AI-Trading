@@ -1,0 +1,19 @@
+[Unit]
+Description=Orderflow API (codex-proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/tools/codex-proxy
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node /home/tools/codex-proxy/dist/index.js
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
