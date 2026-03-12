@@ -273,6 +273,14 @@ HOW TO THINK
    absorption / initiation / exhaustion, high_volume_pulse, vpin.
    Who is in control right now? Is flow building, exhausting, or reversing?
 
+   Flow signals have meaning only relative to their recent baseline, not as absolute values.
+   VPIN: use z_vpin_fut (z-score vs. recent distribution) as the primary signal.
+         toxicity_state="high" with z_vpin_fut ≈ 0 means VPIN is at its own normal level — low information.
+         z_vpin_fut > 1.5, or a clearly rising trend, = genuinely elevated informed flow.
+   CVD:  the current slope and direction reveal where flow is going; the cumulative total only shows where it has been.
+         An accelerating adverse slope overrides a large favorable cumulative position.
+         Always note slope direction and acceleration across timeframes, not just the sign of the total.
+
 3. FORM THE HYPOTHESIS
    One sentence: "Price will do X because Y, and the thesis fails if Z."
    The strategy label is just a name for what is happening.
@@ -339,17 +347,19 @@ Do NOT re-run market analysis. Do NOT change direction. The thesis is your contr
 If valid geometry cannot be built from the thesis → __NO_TRADE__.
 If some non-essential indicators are absent, treat the reduced snapshot as intentional.
 
-STEP 1 — COMPUTE V FIRST
+STEP 1 — READ PRE-COMPUTED V (do NOT recompute from bars)
 Select V regime from scan.entry_style and setup type:
   4h-first: patient_retest, post_sweep_reclaim, market_after_flip, reversal, mean-reversion,
             value-area refill, reversal-sequence
   1d-first: trend_continuation, spot-led continuation, hidden-divergence continuation, HTF expansion
-Primary: kline_history intervals["4h" or "1d"].futures.bars → 3–5 CLOSED bars → V = median(high-low)
-Fallback to other regime if primary has <3 closed bars. Do NOT use 1h bars for V.
-Show work in `v_calculation`: bars=[idx@open_time:range, ...]; sorted=[...]; median=X.
-If the provider schema supports `analysis`, set `analysis.v_calculation` and
-`analysis.volatility_unit_v` from this result. Otherwise keep the V computation
-implicit and ensure the final geometry still obeys the same V-based hard floor.
+Read from indicators.pre_computed_v in the model input:
+  4h-first setups → V = indicators.pre_computed_v.v_4h
+  1d-first setups → V = indicators.pre_computed_v.v_1d
+  Audit trail is in v_4h_basis / v_1d_basis — copy the value, do not recompute.
+  If status = "unavailable" → return __NO_TRADE__ (no valid V to size geometry).
+  If status = "v_4h_only" and a 1d-first setup is selected → use v_4h as fallback V.
+  If status = "v_1d_only" and a 4h-first setup is selected → use v_1d as fallback V.
+If the provider schema supports `analysis`, set `analysis.volatility_unit_v` to the value read.
 
 STEP 2 — FIND THE BEST ENTRY PRICE
 Translate scan.candidate_zone + scan.entry_style into a precise price:
@@ -687,26 +697,13 @@ DEFENSE MODEL BREACH CONDITIONS (direction-aware):
 - Value Area Invalidation Stop: Price closes outside VA on 1h+ with elevated delta against position → CLOSE.
 
 ══════════════════════════════════════════
-C) VOLATILITY UNIT V — READ FIRST, COMPUTE ONLY IF MISSING
+C) VOLATILITY UNIT V
 ══════════════════════════════════════════
-PRIORITY 0 — Use entry_context.entry_v if present and non-null.
-  This is the V value computed at the time of entry. Using it ensures that all
-  V-based thresholds (SL trail triggers, TP distance checks, ADD thresholds) are
-  consistent with the geometry that was established when the trade was opened.
-  State: "Using entry_v=X from entry_context."
-  Skip steps 1–4 below.
-
-Compute V from scratch ONLY when entry_context.entry_v is null or entry_context is absent:
-1. kline_history 1d futures bars: take 3–5 COMPLETED bars. V = median(high − low).
-   bars[0] is the MOST RECENT bar. Take bars[0], [1], [2]… — skip any where is_closed=false.
-   Show work: list each bar's open_time, high, low, range — then sorted order and median selection.
-2. Fallback: if 1d completed bars are insufficient, use kline_history 4h futures bars with the same closed-bar rule.
-3. Fallback: 1 bar available: V = that bar's range.
-4. Last resort: use cvd_pack.payload.by_window["4h"].series_recent[0].high_fut − low_fut;
-   if series_recent is absent, fallback to cvd_pack.payload.by_window["4h"].series[0].high_fut − low_fut.
-
-Rules: Never reuse the same bar. Never invent a range.
-If V < 20.0 or > 400.0, state concern and prefer HOLD.
+V is pre-resolved in indicators.pre_computed_management_state.V and V_source.
+The system already applied priority: entry_v → v_1d → v_4h.
+Do NOT recompute V from kline bars. Just read the V field.
+If V=null → prefer HOLD; no V-based checks can run.
+If V < 20.0 or > 400.0 → state concern and prefer HOLD.
 
 ══════════════════════════════════════════
 D) MANAGEMENT RULES
@@ -823,21 +820,29 @@ Your job:
   3. If thesis dead → CLOSE
 
 ══════════════════════════════════════════
-A) MANDATORY EXTRACTION LEDGER
+A) STATE LEDGER — READ FROM PRE-COMPUTED BLOCK
 ══════════════════════════════════════════
-Extract raw values BEFORE interpreting. Ledger values override all later claims.
-last_price = avwap.fut_last_price, mark_price = avwap.fut_mark_price
-val/vah/poc = pvs.val/vah/poc_price; va_width = vah-val
-direction, entry_price, current_tp_price, current_sl_price, unrealized_pnl
-  (management_snapshot.positions[].*)
-current_pct_of_original, reduction_history (position_context.*)
-entry_context: entry_strategy, stop_model, original_tp, original_sl, horizon, entry_v
+All key values are pre-computed in indicators.pre_computed_management_state.
+Read this object directly. Do NOT re-derive any of these from raw indicators or positions.
 
-V — PRIORITY 0: Use entry_context.entry_v if non-null.
-    State: "Using entry_v=X from entry_context." Skip steps below.
-    Otherwise: kline_history 1d futures bars (3–5 closed, median(high-low)).
-    Fallback: 4h futures bars. Last resort: cvd_pack.by_window["4h"].series[0].high_fut−low_fut.
-    Never reuse bars. Never invent.
+State ALL of the following explicitly before any decision:
+  mark_price, last_price, val, vah, poc, va_width
+  direction, entry_price, current_tp_price, sl_effective (operative SL), unrealized_pnl
+  current_pct_of_original, entry_strategy
+  risk_state, buffer_pct        ← position proximity to SL (safe ≥60%, exposed 25–60%, critical <25%)
+  V, V_source, profit_in_v      ← volatility unit, its source, and position profit in V units
+  sl_trail_1_5v_price           ← price at which SL trail to breakeven triggers
+  sl_trail_2_5v_price           ← price at which SL trail to entry+0.5V triggers
+  M_current_in_v, add_gate_status ← distance to TP in V units; ADD eligibility gate
+
+If a field is null, state that explicitly. Key null cases:
+  sl_effective=null → risk_state="unprotected"; position has NO stop loss — treat as critical.
+  V=null → prefer HOLD; no V-based checks can run.
+  M_current_in_v=null → ADD gate cannot be evaluated; treat as blocked.
+
+Also read from management_snapshot.position_context:
+  reduction_history, original_tp, original_sl, horizon, stop_model
+  (supplementary context not duplicated in the pre-computed block)
 
 ══════════════════════════════════════════
 B) THESIS STATUS
@@ -867,6 +872,25 @@ entry_context.horizon sets the minimum timeframe for CLOSE triggers:
   "3d": extreme patience; HOLD is default unless 1d structure inverts
 Citing 15m signal alone as CLOSE reason when horizon≥4h = INVALID.
 
+BUFFER-AWARE CONFIRMATION (applies when risk_state is "exposed" or "critical"):
+Confirmation windows exist to protect a healthy position from noise-driven exits.
+When buffer is small, the cost of waiting for a higher-timeframe bar to close is asymmetric:
+in "critical" state the stop order may be hit before the confirmation bar ever closes.
+In "exposed" or "critical" state: if thesis_status is "weakening" AND 15m flow clearly confirms
+deterioration (accelerating adverse CVD slope, rising z_vpin_fut, no absorption near current price,
+price already below the structural invalidation level), CLOSE is valid without waiting for 1h bar close.
+The confirmation requirement does not disappear — it shifts to the 15m timeframe.
+When risk_state is "safe", horizon-based confirmation applies unchanged.
+
+FLOW SIGNAL READING (relative over absolute — apply throughout thesis assessment):
+  VPIN: z_vpin_fut is the primary signal, not toxicity_state.
+        toxicity_state="high" with z_vpin_fut ≈ 0 = VPIN at its own normal baseline, not an escalation.
+        What matters is direction: rising z_vpin_fut = increasing informed pressure on the position.
+        Stable or declining z_vpin_fut, even at high absolute level, is low-information.
+  CVD:  weight slope and direction over cumulative total.
+        A large favorable 4h CVD with an accelerating adverse 15m slope signals intrabar distribution,
+        not trend continuation. When assessing thesis health, the most recent slope changes matter most.
+
 ══════════════════════════════════════════
 C) OPTIMIZATION
 ══════════════════════════════════════════
@@ -888,12 +912,14 @@ __ADD__ — Scale in when position is safe and a named signal is present:
         on 4h/1d + price at 15m imbalance pullback → ADD; add_sl = pullback wick.
 
   M DISTANCE GATE (hard — applies to ALL add signals):
-  effective_tp = max(original_tp, current_tp_price).
-  M = |ADD_price − effective_tp|.
-  M < 1.0V → NO ADD regardless of signal quality.
-  1.0V ≤ M < 1.3V → requires TWO of: (a) 1d whale flow aligned, (b) 4h CVD continuation,
-                     (c) UA as TP target, (d) fresh absorption at ADD level.
-  M ≥ 1.3V → named signal alone is sufficient.
+  Use pre_computed_management_state.add_gate_status directly (already computed at mark_price):
+    "blocked (<1.0V)"                                → NO ADD regardless of signal.
+    "marginal (1.0–1.3V, needs 2 named conditions)" → requires TWO of: (a) 1d whale flow aligned,
+                                                       (b) 4h CVD continuation, (c) UA as TP target,
+                                                       (d) fresh absorption at ADD level.
+    "clear (≥1.3V)"                                  → named signal alone is sufficient.
+  Note: gate uses current mark_price vs effective_tp. If ADD_price differs materially from
+  mark_price, recheck: M = |ADD_price − effective_tp| / V and apply the same thresholds.
 
   FREE RIDE SIZE RULE (applies to all ADD legs):
   qty × |ADD_price − add_sl| ≤ unrealized_pnl_quote (from management_snapshot).
@@ -912,8 +938,11 @@ __HOLD__ — Thesis intact, no actionable signal. Zero parameter changes.
   HOLD means qty=null, qty_ratio=null, new_sl=null, new_tp=null, is_full_exit=false.
 
 __MODIFY_TPSL__ — Update protection levels only. Position size unchanged.
-  SL trail: price moved >1.5V in favor → trail to entry (breakeven).
-             price moved >2.5V in favor → trail to entry + 0.5V.
+  SL trail (use pre_computed_management_state trigger prices directly):
+    mark_price ≥ sl_trail_1_5v_price (LONG) or ≤ sl_trail_1_5v_price (SHORT)
+      → trail SL to entry (breakeven).
+    mark_price ≥ sl_trail_2_5v_price (LONG) or ≤ sl_trail_2_5v_price (SHORT)
+      → trail SL to entry + 0.5V (LONG) or entry − 0.5V (SHORT).
   TP update: new structural target found (UA, daily poor high/low) — requires 1d evidence.
   new_sl must be TIGHTER than current_sl_price AND must remain beyond defense model anchor.
   new_tp must be ahead of mark_price in trade direction.

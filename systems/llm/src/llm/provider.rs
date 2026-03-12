@@ -3508,11 +3508,263 @@ fn log_claude_cache_stats(
 pub(crate) fn serialize_llm_input_minified(input: &ModelInvocationInput) -> Result<String> {
     let mut value = serde_json::to_value(input).context("serialize llm invocation input value")?;
     reverse_timeseries_newest_first(&mut value);
+    inject_precomputed_v(&mut value);
+    if !is_entry_mode(input) && !input.pending_order_mode {
+        inject_precomputed_management_state(&mut value);
+    }
     if is_entry_mode(input) {
         compact_entry_scan_input_in_place(&mut value);
     }
     round_json_floats_in_place(&mut value);
     serde_json::to_string(&value).context("serialize llm invocation input json")
+}
+
+/// Compute V = median(high − low) from the 3–5 most-recent CLOSED bars for a given timeframe.
+/// Returns (v, basis_string) or None if fewer than 3 closed bars are available.
+fn compute_v_for_timeframe(value: &Value, timeframe: &str) -> Option<(f64, String)> {
+    // Two possible paths in the serialised JSON:
+    //   .indicators.kline_history.payload.intervals[tf].futures.bars
+    //   .indicators.kline_history.payload.intervals[tf].markets.futures.bars
+    let base = format!("/indicators/kline_history/payload/intervals/{timeframe}");
+    let bars = value
+        .pointer(&format!("{base}/futures/bars"))
+        .or_else(|| value.pointer(&format!("{base}/markets/futures/bars")))?
+        .as_array()?;
+
+    // After reverse_timeseries_newest_first, bars[0] is the most-recent bar.
+    let closed_ranges: Vec<(String, f64)> = bars
+        .iter()
+        .filter(|bar| bar.get("is_closed").and_then(|v| v.as_bool()).unwrap_or(false))
+        .filter_map(|bar| {
+            let high = bar.get("high").and_then(|v| v.as_f64())?;
+            let low = bar.get("low").and_then(|v| v.as_f64())?;
+            let open_time = bar
+                .get("open_time")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            Some((open_time, high - low))
+        })
+        .take(5)
+        .collect();
+
+    if closed_ranges.len() < 3 {
+        return None;
+    }
+
+    let mut sorted: Vec<f64> = closed_ranges.iter().map(|(_, r)| *r).collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+
+    let bars_desc = closed_ranges
+        .iter()
+        .map(|(t, r)| format!("{}:{:.4}", t, r))
+        .collect::<Vec<_>>()
+        .join(",");
+    let basis = format!(
+        "tf={}; n={}; bars=[{}]; sorted=[{}]; median={:.4}",
+        timeframe,
+        closed_ranges.len(),
+        bars_desc,
+        sorted
+            .iter()
+            .map(|r| format!("{:.4}", r))
+            .collect::<Vec<_>>()
+            .join(","),
+        median
+    );
+
+    Some((median, basis))
+}
+
+/// Inject pre-computed V values into the indicators object so the model never needs to
+/// derive V from raw bars itself.
+fn inject_precomputed_v(value: &mut Value) {
+    let v_4h = compute_v_for_timeframe(value, "4h");
+    let v_1d = compute_v_for_timeframe(value, "1d");
+
+    let status = match (v_4h.is_some(), v_1d.is_some()) {
+        (true, true) => "ok",
+        (true, false) => "v_4h_only",
+        (false, true) => "v_1d_only",
+        (false, false) => "unavailable",
+    };
+
+    let mut pre_computed_v = Map::new();
+    pre_computed_v.insert("status".to_string(), Value::String(status.to_string()));
+    if let Some((v, basis)) = v_4h {
+        pre_computed_v.insert("v_4h".to_string(), json!(v));
+        pre_computed_v.insert("v_4h_basis".to_string(), Value::String(basis));
+    }
+    if let Some((v, basis)) = v_1d {
+        pre_computed_v.insert("v_1d".to_string(), json!(v));
+        pre_computed_v.insert("v_1d_basis".to_string(), Value::String(basis));
+    }
+
+    if let Some(indicators) = value
+        .pointer_mut("/indicators")
+        .and_then(|v| v.as_object_mut())
+    {
+        indicators.insert(
+            "pre_computed_v".to_string(),
+            Value::Object(pre_computed_v),
+        );
+    }
+}
+
+/// Pre-compute all management-mode derived metrics so the model can read one flat object
+/// instead of excavating nested JSON and doing arithmetic itself.
+fn inject_precomputed_management_state(value: &mut Value) {
+    // ── helpers ──────────────────────────────────────────────────────────────
+    let f64_at = |ptr: &str| -> Option<f64> {
+        value.pointer(ptr).and_then(|v| v.as_f64())
+    };
+    let str_at = |ptr: &str| -> Option<String> {
+        value.pointer(ptr).and_then(|v| v.as_str()).map(String::from)
+    };
+
+    // ── source values ────────────────────────────────────────────────────────
+    // Prices
+    let mark_price = f64_at("/management_snapshot/positions/0/mark_price")
+        .or_else(|| f64_at("/indicators/avwap/payload/fut_mark_price"));
+    let last_price = f64_at("/indicators/avwap/payload/fut_last_price");
+    let entry_price = f64_at("/management_snapshot/positions/0/entry_price");
+    let current_sl = f64_at("/management_snapshot/positions/0/current_sl_price");
+    let current_tp = f64_at("/management_snapshot/positions/0/current_tp_price");
+    let effective_sl = f64_at("/management_snapshot/position_context/effective_stop_loss");
+    let effective_tp = f64_at("/management_snapshot/position_context/effective_take_profit");
+    let unrealized_pnl = f64_at("/management_snapshot/positions/0/unrealized_pnl");
+    let current_pct = f64_at("/management_snapshot/position_context/current_pct_of_original");
+
+    // Direction: "LONG" | "SHORT"
+    let direction = str_at("/management_snapshot/positions/0/direction");
+    let is_long = direction.as_deref() == Some("LONG");
+
+    // Value area (from pvs)
+    let val = f64_at("/indicators/price_volume_structure/payload/val");
+    let vah = f64_at("/indicators/price_volume_structure/payload/vah");
+    let poc = f64_at("/indicators/price_volume_structure/payload/poc_price");
+    let va_width = val.zip(vah).map(|(l, h)| (h - l).abs());
+
+    // Entry context
+    let entry_v = f64_at("/management_snapshot/position_context/entry_context/entry_v");
+    let entry_strategy = str_at("/management_snapshot/position_context/entry_context/entry_strategy");
+
+    // V: priority — entry_v → v_1d → v_4h
+    let v_1d = f64_at("/indicators/pre_computed_v/v_1d");
+    let v_4h = f64_at("/indicators/pre_computed_v/v_4h");
+    let (v, v_source) = if let Some(ev) = entry_v {
+        (Some(ev), "entry_v")
+    } else if let Some(v1) = v_1d {
+        (Some(v1), "pre_computed_v.v_1d")
+    } else if let Some(v4) = v_4h {
+        (Some(v4), "pre_computed_v.v_4h")
+    } else {
+        (None, "unavailable")
+    };
+
+    // Operative SL: live exchange SL first, fallback to effective_stop_loss context
+    let sl_operative = current_sl.or(effective_sl);
+    // Operative TP: max of live TP and effective TP (effective_tp from context)
+    let tp_operative = match (current_tp, effective_tp) {
+        (Some(a), Some(b)) => Some(if is_long { a.max(b) } else { a.min(b) }),
+        (a, b) => a.or(b),
+    };
+
+    // ── derived metrics ──────────────────────────────────────────────────────
+    let (remaining_buffer, original_risk, buffer_pct, risk_state) =
+        match (mark_price, entry_price, sl_operative) {
+            (Some(mp), Some(ep), Some(sl)) => {
+                let buf = (mp - sl).abs();
+                let risk = (ep - sl).abs();
+                let pct = if risk > 0.0 { buf / risk * 100.0 } else { f64::INFINITY };
+                let state = if pct >= 60.0 {
+                    "safe"
+                } else if pct >= 25.0 {
+                    "exposed"
+                } else {
+                    "critical"
+                };
+                (Some(buf), Some(risk), Some(pct), state)
+            }
+            _ => (None, None, None, "unprotected"),
+        };
+
+    let profit_in_v = v.zip(mark_price).zip(entry_price).map(|((v_val, mp), ep)| {
+        let raw_profit = if is_long { mp - ep } else { ep - mp };
+        raw_profit / v_val
+    });
+
+    // SL trail trigger prices (in trade direction)
+    let sl_trail_1_5v = v.zip(entry_price).map(|(v_val, ep)| {
+        if is_long { ep + 1.5 * v_val } else { ep - 1.5 * v_val }
+    });
+    let sl_trail_2_5v = v.zip(entry_price).map(|(v_val, ep)| {
+        if is_long { ep + 2.5 * v_val } else { ep - 2.5 * v_val }
+    });
+
+    // M: distance from current mark to operative TP, in V units
+    let m_in_v = v.zip(mark_price).zip(tp_operative).map(|((v_val, mp), tp)| {
+        (tp - mp).abs() / v_val
+    });
+    let add_gate = m_in_v.map(|m| {
+        if m < 1.0 {
+            "blocked (<1.0V)"
+        } else if m < 1.3 {
+            "marginal (1.0–1.3V, needs 2 named conditions)"
+        } else {
+            "clear (≥1.3V)"
+        }
+    });
+
+    // ── assemble object ──────────────────────────────────────────────────────
+    let mut obj = Map::new();
+    let insert_f = |obj: &mut Map<String, Value>, k: &str, v: Option<f64>| {
+        obj.insert(k.to_string(), v.map(|x| json!(x)).unwrap_or(Value::Null));
+    };
+    let insert_s = |obj: &mut Map<String, Value>, k: &str, v: Option<String>| {
+        obj.insert(k.to_string(), v.map(Value::String).unwrap_or(Value::Null));
+    };
+
+    insert_f(&mut obj, "mark_price", mark_price);
+    insert_f(&mut obj, "last_price", last_price);
+    insert_f(&mut obj, "val", val);
+    insert_f(&mut obj, "vah", vah);
+    insert_f(&mut obj, "poc", poc);
+    insert_f(&mut obj, "va_width", va_width);
+    insert_s(&mut obj, "direction", direction);
+    insert_f(&mut obj, "entry_price", entry_price);
+    insert_f(&mut obj, "current_tp_price", current_tp);
+    insert_f(&mut obj, "current_sl_price", current_sl);
+    insert_f(&mut obj, "sl_effective", sl_operative);
+    insert_f(&mut obj, "unrealized_pnl", unrealized_pnl);
+    insert_f(&mut obj, "current_pct_of_original", current_pct);
+    insert_s(&mut obj, "entry_strategy", entry_strategy);
+    insert_f(&mut obj, "entry_v", entry_v);
+    obj.insert("risk_state".to_string(), Value::String(risk_state.to_string()));
+    insert_f(&mut obj, "buffer_pct", buffer_pct);
+    insert_f(&mut obj, "remaining_buffer", remaining_buffer);
+    insert_f(&mut obj, "original_risk", original_risk);
+    insert_f(&mut obj, "V", v);
+    obj.insert("V_source".to_string(), Value::String(v_source.to_string()));
+    insert_f(&mut obj, "profit_in_v", profit_in_v);
+    insert_f(&mut obj, "sl_trail_1_5v_price", sl_trail_1_5v);
+    insert_f(&mut obj, "sl_trail_2_5v_price", sl_trail_2_5v);
+    insert_f(&mut obj, "M_current_in_v", m_in_v);
+    obj.insert(
+        "add_gate_status".to_string(),
+        add_gate.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null),
+    );
+
+    if let Some(indicators) = value
+        .pointer_mut("/indicators")
+        .and_then(|v| v.as_object_mut())
+    {
+        indicators.insert(
+            "pre_computed_management_state".to_string(),
+            Value::Object(obj),
+        );
+    }
 }
 
 fn compact_entry_scan_input_in_place(value: &mut Value) {
