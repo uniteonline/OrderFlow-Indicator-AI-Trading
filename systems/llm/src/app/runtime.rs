@@ -10,6 +10,7 @@ use crate::llm::decision::{
     pending_order_management_intent_from_value_with_context,
     position_management_intent_from_value_with_context, trade_intent_from_value,
     PendingOrderManagementDecision, PositionManagementDecision, TradeDecision,
+    TradeIntent,
 };
 use crate::llm::provider::{
     invoke_models, serialize_llm_input_minified, EntryContextForLlm, ManagementSnapshotForLlm,
@@ -126,6 +127,37 @@ struct EntryContextForState {
     /// V captured at entry time; passed to management model to ensure
     /// consistent V-based threshold calculations throughout the trade.
     entry_v: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TradeSignalFields {
+    entry_price: Option<f64>,
+    leverage: Option<f64>,
+    risk_reward_ratio: Option<f64>,
+    take_profit: Option<f64>,
+    stop_loss: Option<f64>,
+}
+
+impl TradeSignalFields {
+    fn from_intent(intent: &TradeIntent) -> Self {
+        Self {
+            entry_price: intent.entry_price,
+            leverage: intent.leverage,
+            risk_reward_ratio: intent.risk_reward_ratio,
+            take_profit: intent.take_profit,
+            stop_loss: intent.stop_loss,
+        }
+    }
+
+    fn from_report(report: &crate::execution::binance::ExecutionReport) -> Self {
+        Self {
+            entry_price: Some(report.maker_entry_price),
+            leverage: Some(report.leverage as f64),
+            risk_reward_ratio: Some(report.actual_risk_reward_ratio),
+            take_profit: Some(report.actual_take_profit),
+            stop_loss: Some(report.actual_stop_loss),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -753,7 +785,9 @@ fn remap_trade_entry_and_stop_loss(
     }
 
     let pct = (execution_config.entry_sl_remap.entry_to_sl_distance_pct / 100.0).clamp(0.0, 1.0);
-    let remapped_entry = entry + (stop_loss - entry) * pct;
+    // Move entry toward the model stop by the configured percentage:
+    // remapped_entry = entry - (entry - stop_loss) * pct
+    let remapped_entry = entry - (entry - stop_loss) * pct;
     let reward_distance = (take_profit - remapped_entry).abs();
     if reward_distance <= f64::EPSILON {
         return None;
@@ -766,6 +800,36 @@ fn remap_trade_entry_and_stop_loss(
     };
 
     Some((remapped_entry, remapped_stop_loss))
+}
+
+async fn preview_trade_signal_fields(
+    http_client: &Client,
+    config: &RootConfig,
+    symbol: &str,
+    intent: &TradeIntent,
+) -> TradeSignalFields {
+    let mut preview_exec_config = config.llm.execution.clone();
+    preview_exec_config.dry_run = true;
+    match execute_trade_intent(
+        http_client,
+        &config.api.binance,
+        &preview_exec_config,
+        symbol,
+        intent,
+    )
+    .await
+    {
+        Ok(report) => TradeSignalFields::from_report(&report),
+        Err(err) => {
+            warn!(
+                symbol = %symbol,
+                decision = intent.decision.as_str(),
+                error = %err,
+                "trade signal preview failed, falling back to intent values"
+            );
+            TradeSignalFields::from_intent(intent)
+        }
+    }
 }
 
 async fn enrich_telegram_fields_from_entry_context(
@@ -2816,6 +2880,26 @@ async fn invoke_bundle_models(
                     continue;
                 }
             };
+            let mut execution_intent = intent.clone();
+            if let Some((remapped_entry, remapped_stop_loss)) =
+                remap_trade_entry_and_stop_loss(&out.provider, &config.llm.execution, &intent)
+            {
+                execution_intent.entry_price = Some(remapped_entry);
+                execution_intent.stop_loss = Some(remapped_stop_loss);
+                info!(
+                    model_name = %out.model_name,
+                    provider = %out.provider,
+                    symbol = %bundle.raw.symbol,
+                    decision = execution_intent.decision.as_str(),
+                    entry_to_sl_distance_pct = config.llm.execution.entry_sl_remap.entry_to_sl_distance_pct,
+                    model_entry = intent.entry_price.unwrap_or_default(),
+                    model_stop_loss = intent.stop_loss.unwrap_or_default(),
+                    remapped_entry = remapped_entry,
+                    remapped_stop_loss = remapped_stop_loss,
+                    "applied entry/sl remap for execution"
+                );
+            }
+
             if matches!(intent.decision, TradeDecision::NoTrade) {
                 debug!(
                     model_name = %out.model_name,
@@ -2848,6 +2932,13 @@ async fn invoke_bundle_models(
                 continue;
             }
             if execution_blocked_due_to_stale {
+                let notification_fields = preview_trade_signal_fields(
+                    &http_client,
+                    &config,
+                    &bundle.raw.symbol,
+                    &execution_intent,
+                )
+                .await;
                 execution_done = true;
                 warn!(
                     model_name = %out.model_name,
@@ -2867,11 +2958,11 @@ async fn invoke_bundle_models(
                     intent.decision.as_str(),
                     post_invoke_data_age_secs,
                     max_exec_stale_secs,
-                    format_metric_number(intent.entry_price),
-                    format_metric_number(intent.leverage),
-                    format_metric_number(intent.risk_reward_ratio),
-                    format_metric_number(intent.take_profit),
-                    format_metric_number(intent.stop_loss),
+                    format_metric_number(notification_fields.entry_price),
+                    format_metric_number(notification_fields.leverage),
+                    format_metric_number(notification_fields.risk_reward_ratio),
+                    format_metric_number(notification_fields.take_profit),
+                    format_metric_number(notification_fields.stop_loss),
                     intent.reason.replace('\n', " "),
                 );
                 let event = json!({
@@ -2882,11 +2973,11 @@ async fn invoke_bundle_models(
                     "symbol": bundle.raw.symbol,
                     "model_name": out.model_name.clone(),
                     "decision": intent.decision.as_str(),
-                    "entry_price": intent.entry_price,
-                    "leverage": intent.leverage,
-                    "risk_reward_ratio": intent.risk_reward_ratio,
-                    "take_profit": intent.take_profit,
-                    "stop_loss": intent.stop_loss,
+                    "entry_price": notification_fields.entry_price,
+                    "leverage": notification_fields.leverage,
+                    "risk_reward_ratio": notification_fields.risk_reward_ratio,
+                    "take_profit": notification_fields.take_profit,
+                    "stop_loss": notification_fields.stop_loss,
                     "post_invoke_data_age_secs": post_invoke_data_age_secs,
                     "max_execution_stale_secs": max_exec_stale_secs,
                     "reason": intent.reason.clone(),
@@ -2906,36 +2997,16 @@ async fn invoke_bundle_models(
                         symbol: &bundle.raw.symbol,
                         model_name: &out.model_name,
                         decision: intent.decision.as_str(),
-                        entry_price: intent.entry_price,
-                        leverage: intent.leverage,
-                        risk_reward_ratio: intent.risk_reward_ratio,
-                        take_profit: intent.take_profit,
-                        stop_loss: intent.stop_loss,
+                        entry_price: notification_fields.entry_price,
+                        leverage: notification_fields.leverage,
+                        risk_reward_ratio: notification_fields.risk_reward_ratio,
+                        take_profit: notification_fields.take_profit,
+                        stop_loss: notification_fields.stop_loss,
                         reason: &intent.reason,
                     },
                 )
                 .await;
                 continue;
-            }
-
-            let mut execution_intent = intent.clone();
-            if let Some((remapped_entry, remapped_stop_loss)) =
-                remap_trade_entry_and_stop_loss(&out.provider, &config.llm.execution, &intent)
-            {
-                execution_intent.entry_price = Some(remapped_entry);
-                execution_intent.stop_loss = Some(remapped_stop_loss);
-                info!(
-                    model_name = %out.model_name,
-                    provider = %out.provider,
-                    symbol = %bundle.raw.symbol,
-                    decision = execution_intent.decision.as_str(),
-                    entry_to_sl_distance_pct = config.llm.execution.entry_sl_remap.entry_to_sl_distance_pct,
-                    model_entry = intent.entry_price.unwrap_or_default(),
-                    model_stop_loss = intent.stop_loss.unwrap_or_default(),
-                    remapped_entry = remapped_entry,
-                    remapped_stop_loss = remapped_stop_loss,
-                    "applied entry/sl remap for execution"
-                );
             }
 
             match execute_trade_intent(
@@ -3134,6 +3205,13 @@ async fn invoke_bundle_models(
                     if let Err(err) = append_journal_event(event) {
                         warn!(error = %err, "append llm_order_execution_error journal failed");
                     }
+                    let notification_fields = preview_trade_signal_fields(
+                        &http_client,
+                        &config,
+                        &bundle.raw.symbol,
+                        &execution_intent,
+                    )
+                    .await;
                     send_trade_signal_notifications(
                         telegram_operator.as_ref(),
                         x_operator.as_ref(),
@@ -3146,11 +3224,11 @@ async fn invoke_bundle_models(
                             symbol: &bundle.raw.symbol,
                             model_name: &out.model_name,
                             decision: intent.decision.as_str(),
-                            entry_price: intent.entry_price,
-                            leverage: intent.leverage,
-                            risk_reward_ratio: intent.risk_reward_ratio,
-                            take_profit: intent.take_profit,
-                            stop_loss: intent.stop_loss,
+                            entry_price: notification_fields.entry_price,
+                            leverage: notification_fields.leverage,
+                            risk_reward_ratio: notification_fields.risk_reward_ratio,
+                            take_profit: notification_fields.take_profit,
+                            stop_loss: notification_fields.stop_loss,
                             reason: &intent.reason,
                         },
                     )
@@ -6084,6 +6162,78 @@ mod tests {
                 .expect("all providers should remap");
         assert!((entry_other_provider - 110.0).abs() < 1e-9);
         assert!((sl_other_provider - 120.0).abs() < 1e-9);
+
+        execution_config.entry_sl_remap.entry_to_sl_distance_pct = 20.0;
+        let long_example = TradeIntent {
+            decision: TradeDecision::Long,
+            entry_price: Some(2039.3),
+            take_profit: Some(2080.0),
+            stop_loss: Some(2020.0),
+            leverage: Some(2.0),
+            risk_reward_ratio: Some(2.11),
+            horizon: Some("4h".to_string()),
+            swing_logic: Some("test".to_string()),
+            reason: "test".to_string(),
+        };
+        let (example_entry, _) =
+            remap_trade_entry_and_stop_loss("custom_llm", &execution_config, &long_example)
+                .expect("20 pct long example should remap");
+        assert!((example_entry - 2035.44).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trade_signal_fields_from_intent_use_model_values() {
+        let intent = TradeIntent {
+            decision: TradeDecision::Long,
+            entry_price: Some(2039.3),
+            take_profit: Some(2080.0),
+            stop_loss: Some(2020.0),
+            leverage: Some(2.0),
+            risk_reward_ratio: Some(2.11),
+            horizon: Some("4h".to_string()),
+            swing_logic: Some("test".to_string()),
+            reason: "test".to_string(),
+        };
+
+        let fields = TradeSignalFields::from_intent(&intent);
+        assert_eq!(fields.entry_price, Some(2039.3));
+        assert_eq!(fields.leverage, Some(2.0));
+        assert_eq!(fields.risk_reward_ratio, Some(2.11));
+        assert_eq!(fields.take_profit, Some(2080.0));
+        assert_eq!(fields.stop_loss, Some(2020.0));
+    }
+
+    #[test]
+    fn trade_signal_fields_from_report_use_effective_execution_values() {
+        let report = crate::execution::binance::ExecutionReport {
+            decision: "LONG",
+            quantity: "0.100".to_string(),
+            leverage: 16,
+            leverage_source: "model_ratio",
+            margin_budget_usdt: 50.0,
+            margin_budget_source: "fixed_usdt",
+            account_total_wallet_balance: 1000.0,
+            account_available_balance: 900.0,
+            position_side: "LONG",
+            dry_run: true,
+            entry_order_id: None,
+            take_profit_order_id: None,
+            stop_loss_order_id: None,
+            exit_orders_deferred: false,
+            maker_entry_price: 2020.0,
+            actual_take_profit: 2080.0,
+            actual_stop_loss: 1991.56,
+            actual_risk_reward_ratio: 2.1108647450110867,
+            best_bid_price: 2020.12,
+            best_ask_price: 2020.13,
+        };
+
+        let fields = TradeSignalFields::from_report(&report);
+        assert_eq!(fields.entry_price, Some(2020.0));
+        assert_eq!(fields.leverage, Some(16.0));
+        assert_eq!(fields.take_profit, Some(2080.0));
+        assert_eq!(fields.stop_loss, Some(1991.56));
+        assert_eq!(fields.risk_reward_ratio, Some(2.1108647450110867));
     }
 
     #[test]
