@@ -1,0 +1,65 @@
+﻿{
+    "headers":  {
+                    "source_kind":  "ws",
+                    "backfill_in_progress":  false,
+                    "routing_key":  "md.futures.depth.ethusdt",
+                    "symbol":  "ETHUSDT",
+                    "market":  "futures",
+                    "producer_service":  "market_data_ingestor",
+                    "schema_version":  1,
+                    "msg_type":  "md.depth",
+                    "published_at":  "2026-02-25T14:00:01Z",
+                    "content_type":  "application/json",
+                    "producer_instance_id":  "ingestor-dev-1",
+                    "message_id":  "c1a9d7d0-3a2b-4f61-91f4-000000000002",
+                    "trace_id":  "11111111-1111-4111-8111-111111111111"
+                },
+    "body":  {
+                 "source_kind":  "ws",
+                 "backfill_in_progress":  false,
+                 "routing_key":  "md.futures.depth.ethusdt",
+                 "data":  {
+                              "stream_name":  "ethusdt@depth@100ms",
+                              "ts_recv":  "2026-02-25T14:00:00.905Z",
+                              "first_update_id":  660000001,
+                              "final_update_id":  660000008,
+                              "prev_final_update_id":  660000000,
+                              "bids_delta":  [
+                                                 [
+                                                     "3188.40",
+                                                     "2.1000"
+                                                 ],
+                                                 [
+                                                     "3188.35",
+                                                     "1.4500"
+                                                 ]
+                                             ],
+                              "asks_delta":  [
+                                                 [
+                                                     "3188.50",
+                                                     "1.8700"
+                                                 ],
+                                                 [
+                                                     "3188.55",
+                                                     "0.9300"
+                                                 ]
+                                             ],
+                              "event_count":  2,
+                              "payload_json":  {
+
+                                               }
+                          },
+                 "market":  "futures",
+                 "schema_version":  1,
+                 "event_ts":  "2026-02-25T14:00:00.900Z",
+                 "msg_type":  "md.depth",
+                 "published_at":  "2026-02-25T14:00:01Z",
+                 "symbol":  "ETHUSDT",
+                 "message_id":  "c1a9d7d0-3a2b-4f61-91f4-000000000002",
+                 "producer":  {
+                                  "service":  "market_data_ingestor",
+                                  "instance_id":  "ingestor-dev-1"
+                              },
+                 "trace_id":  "11111111-1111-4111-8111-111111111111"
+             }
+}

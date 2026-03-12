@@ -1,0 +1,54 @@
+﻿{
+    "headers":  {
+                    "source_kind":  "ws",
+                    "backfill_in_progress":  false,
+                    "routing_key":  "md.futures.kline.1m.ethusdt",
+                    "symbol":  "ETHUSDT",
+                    "market":  "futures",
+                    "producer_service":  "market_data_ingestor",
+                    "schema_version":  1,
+                    "msg_type":  "md.kline",
+                    "published_at":  "2026-02-25T14:01:00Z",
+                    "content_type":  "application/json",
+                    "producer_instance_id":  "ingestor-dev-1",
+                    "message_id":  "c1a9d7d0-3a2b-4f61-91f4-000000000004",
+                    "trace_id":  "11111111-1111-4111-8111-111111111111"
+                },
+    "body":  {
+                 "source_kind":  "ws",
+                 "backfill_in_progress":  false,
+                 "routing_key":  "md.futures.kline.1m.ethusdt",
+                 "data":  {
+                              "stream_name":  "ethusdt@kline_1m",
+                              "ts_recv":  "2026-02-25T14:01:00.005Z",
+                              "interval_code":  "1m",
+                              "open_time":  "2026-02-25T14:00:00Z",
+                              "close_time":  "2026-02-25T14:00:59.999Z",
+                              "open_price":  "3188.10",
+                              "high_price":  "3190.00",
+                              "low_price":  "3187.50",
+                              "close_price":  "3189.40",
+                              "volume_base":  "125.3400",
+                              "quote_volume":  "399522.1130",
+                              "trade_count":  4321,
+                              "taker_buy_base":  "66.1200",
+                              "taker_buy_quote":  "210775.4000",
+                              "is_closed":  true,
+                              "payload_json":  {
+
+                                               }
+                          },
+                 "market":  "futures",
+                 "schema_version":  1,
+                 "event_ts":  "2026-02-25T14:00:59.999Z",
+                 "msg_type":  "md.kline",
+                 "published_at":  "2026-02-25T14:01:00Z",
+                 "symbol":  "ETHUSDT",
+                 "message_id":  "c1a9d7d0-3a2b-4f61-91f4-000000000004",
+                 "producer":  {
+                                  "service":  "market_data_ingestor",
+                                  "instance_id":  "ingestor-dev-1"
+                              },
+                 "trace_id":  "11111111-1111-4111-8111-111111111111"
+             }
+}

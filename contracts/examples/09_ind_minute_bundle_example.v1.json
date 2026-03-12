@@ -1,0 +1,47 @@
+{
+  "headers": {
+    "schema_version": 1,
+    "message_id": "6a1e7f00-74a7-4cc5-b0f5-0ed5f2de1001",
+    "msg_type": "ind.minute_bundle",
+    "content_type": "application/json",
+    "producer_service": "indicator_engine",
+    "producer_instance_id": "indicator-engine-dev-1"
+  },
+  "body": {
+    "schema_version": 1,
+    "msg_type": "ind.minute_bundle",
+    "message_id": "6a1e7f00-74a7-4cc5-b0f5-0ed5f2de1001",
+    "trace_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "routing_key": "bundle.1m.ethusdt",
+    "symbol": "ETHUSDT",
+    "ts_bucket": "2026-02-26T07:15:00Z",
+    "window_code": "1m",
+    "indicator_count": 18,
+    "published_at": "2026-02-26T07:15:05Z",
+    "producer": {
+      "service": "indicator_engine",
+      "instance_id": "indicator-engine-dev-1"
+    },
+    "indicators": {
+      "price_volume_structure": {
+        "window_code": "1m",
+        "payload": {
+          "bar_volume": 3124.55,
+          "poc_price": 2038.2
+        }
+      },
+      "footprint": {
+        "window_code": "1m",
+        "payload": {
+          "window_delta": 85.12
+        }
+      },
+      "divergence": {
+        "window_code": "1m",
+        "payload": {
+          "signal": "none"
+        }
+      }
+    }
+  }
+}

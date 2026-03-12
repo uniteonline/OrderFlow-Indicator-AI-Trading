@@ -1,0 +1,1180 @@
+use anyhow::{anyhow, Result};
+use serde::Deserialize;
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RootConfig {
+    pub app: AppSection,
+    pub api: ApiConfig,
+    #[serde(default)]
+    pub network: NetworkConfig,
+    pub mq: MqConfig,
+    #[serde(default)]
+    pub llm: LlmConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppSection {
+    pub name: String,
+    pub env: String,
+    pub timezone: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiConfig {
+    pub claude: ClaudeApiConfig,
+    #[serde(default)]
+    pub qwen: QwenApiConfig,
+    #[serde(default)]
+    pub custom_llm: CustomLlmApiConfig,
+    #[serde(default)]
+    pub gemini: GeminiApiConfig,
+    #[serde(default)]
+    pub openrouter: OpenRouterApiConfig,
+    #[serde(default)]
+    pub grok: GrokApiConfig,
+    #[serde(default)]
+    pub telegram: TelegramApiConfig,
+    #[serde(default)]
+    pub x: XApiConfig,
+    pub binance: BinanceApiConfig,
+    #[serde(default)]
+    pub default_model: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClaudeApiConfig {
+    pub api_key: String,
+    #[serde(default = "default_claude_api_url")]
+    pub api_url: String,
+    #[serde(default = "default_claude_api_version")]
+    pub api_version: String,
+    #[serde(default = "default_claude_api_mode")]
+    pub mode: String,
+    #[serde(default = "default_claude_batch_api_url")]
+    pub batch_api_url: String,
+    #[serde(default = "default_claude_batch_poll_interval_secs")]
+    pub batch_poll_interval_secs: u64,
+    #[serde(default = "default_claude_batch_wait_timeout_secs")]
+    pub batch_wait_timeout_secs: u64,
+}
+
+impl ClaudeApiConfig {
+    pub fn resolved_api_key(&self) -> String {
+        resolve_secret(&self.api_key)
+    }
+
+    pub fn use_batch_api(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("batch")
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct QwenApiConfig {
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_qwen_base_api_url")]
+    pub base_api_url: String,
+    #[serde(default = "default_qwen_model")]
+    pub model: String,
+}
+
+impl QwenApiConfig {
+    pub fn resolved_api_key(&self) -> String {
+        resolve_secret(&self.api_key)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CustomLlmApiConfig {
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub base_api_url: String,
+    #[serde(default)]
+    pub model: String,
+}
+
+impl CustomLlmApiConfig {
+    pub fn resolved_api_key(&self) -> String {
+        resolve_secret(&self.api_key)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GeminiApiConfig {
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_gemini_base_api_url")]
+    pub base_api_url: String,
+    #[serde(default = "default_gemini_model")]
+    pub model: String,
+}
+
+impl GeminiApiConfig {
+    pub fn resolved_api_key(&self) -> String {
+        resolve_secret(&self.api_key)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OpenRouterApiConfig {
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_openrouter_base_api_url")]
+    pub base_api_url: String,
+    #[serde(default)]
+    pub site_url: String,
+    #[serde(default)]
+    pub app_name: String,
+}
+
+impl OpenRouterApiConfig {
+    pub fn resolved_api_key(&self) -> String {
+        resolve_secret(&self.api_key)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GrokApiConfig {
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default = "default_grok_base_api_url")]
+    pub base_api_url: String,
+    #[serde(default = "default_grok_model")]
+    pub model: String,
+}
+
+impl GrokApiConfig {
+    pub fn resolved_api_key(&self) -> String {
+        resolve_secret(&self.api_key)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TelegramApiConfig {
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub chat_id: String,
+    #[serde(default = "default_telegram_base_api_url")]
+    pub base_api_url: String,
+}
+
+impl TelegramApiConfig {
+    pub fn resolved_token(&self) -> String {
+        resolve_secret(&self.token)
+    }
+
+    pub fn resolved_chat_id(&self) -> String {
+        resolve_secret(&self.chat_id)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct XApiConfig {
+    #[serde(default)]
+    pub consumer_key: String,
+    #[serde(default)]
+    pub secret_key: String,
+    #[serde(default)]
+    pub access_token: String,
+    #[serde(default)]
+    pub access_token_secret: String,
+    #[serde(default = "default_x_base_api_url")]
+    pub base_api_url: String,
+}
+
+impl XApiConfig {
+    pub fn resolved_consumer_key(&self) -> String {
+        resolve_secret(&self.consumer_key)
+    }
+
+    pub fn resolved_secret_key(&self) -> String {
+        resolve_secret(&self.secret_key)
+    }
+
+    pub fn resolved_access_token(&self) -> String {
+        resolve_secret(&self.access_token)
+    }
+
+    pub fn resolved_access_token_secret(&self) -> String {
+        resolve_secret(&self.access_token_secret)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BinanceApiConfig {
+    pub api_key: String,
+    pub api_secret: String,
+    #[serde(default = "default_binance_futures_rest_api_url")]
+    pub futures_rest_api_url: String,
+}
+
+impl BinanceApiConfig {
+    pub fn resolved_api_key(&self) -> String {
+        resolve_secret(&self.api_key)
+    }
+
+    pub fn resolved_api_secret(&self) -> String {
+        resolve_secret(&self.api_secret)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct NetworkConfig {
+    #[serde(default)]
+    pub proxy: ProxyConfig,
+    #[serde(default)]
+    pub rest_proxy: ProxyConfig,
+}
+
+impl NetworkConfig {
+    pub fn effective_rest_proxy_url(&self) -> Option<String> {
+        self.rest_proxy
+            .effective_url()
+            .or_else(|| self.proxy.effective_url())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ProxyConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub address: Option<String>,
+}
+
+impl ProxyConfig {
+    pub fn effective_url(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        let raw = self.address.as_deref()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        if raw.contains("://") {
+            Some(raw.to_string())
+        } else {
+            Some(format!("http://{}", raw))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MqConfig {
+    pub host: String,
+    pub port: u16,
+    pub vhost: String,
+    pub user: String,
+    pub password_env: String,
+    pub heartbeat_secs: Option<u16>,
+    pub connection_timeout_secs: Option<u16>,
+    pub exchanges: MqExchanges,
+    pub queues: HashMap<String, MqQueueConfig>,
+}
+
+impl MqConfig {
+    pub fn resolved_password(&self) -> String {
+        resolve_secret(&self.password_env)
+    }
+
+    pub fn amqp_uri(&self) -> String {
+        let user = urlencoding::encode(&self.user);
+        let resolved_password = self.resolved_password();
+        let password = urlencoding::encode(&resolved_password);
+        let raw_vhost = self.vhost.trim();
+        let vhost = if raw_vhost.is_empty() {
+            urlencoding::encode("/")
+        } else {
+            urlencoding::encode(raw_vhost)
+        };
+        let mut uri = format!(
+            "amqp://{}:{}@{}:{}/{}",
+            user, password, self.host, self.port, vhost
+        );
+
+        let mut params = Vec::new();
+        if let Some(v) = self.heartbeat_secs {
+            params.push(format!("heartbeat={}", v));
+        }
+        if let Some(v) = self.connection_timeout_secs {
+            params.push(format!("connection_timeout={}", v));
+        }
+        if !params.is_empty() {
+            uri.push('?');
+            uri.push_str(&params.join("&"));
+        }
+
+        uri
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MqExchanges {
+    pub md_live: MqExchangeConfig,
+    pub md_replay: MqExchangeConfig,
+    pub ind: MqExchangeConfig,
+    pub dlx: MqExchangeConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MqExchangeConfig {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub durable: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MqQueueConfig {
+    pub name: String,
+    pub bind: Vec<MqBinding>,
+    /// x-message-ttl in milliseconds. Messages older than this are dropped.
+    #[serde(default)]
+    pub message_ttl_ms: Option<u32>,
+    /// x-max-length (message count). Combined with x-overflow=drop-head.
+    #[serde(default)]
+    pub max_length: Option<u32>,
+    /// x-max-length-bytes. Combined with x-overflow=drop-head.
+    #[serde(default)]
+    pub max_length_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MqBinding {
+    pub exchange: String,
+    pub routing_key: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmConfig {
+    #[serde(default = "default_llm_default_model")]
+    pub default_model: String,
+    #[serde(default = "default_llm_prompt_template")]
+    pub prompt_template: String,
+    #[serde(default = "default_symbol")]
+    pub symbol: String,
+    #[serde(default = "default_queue_key")]
+    pub queue_key: String,
+    #[serde(default = "default_llm_purge_queue_on_start")]
+    pub purge_queue_on_start: bool,
+    #[serde(default = "default_call_interval_secs")]
+    pub call_interval_secs: u64,
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    #[serde(default = "default_bundle_settle_ms")]
+    pub bundle_settle_ms: u64,
+    #[serde(default = "default_bundle_stale_secs")]
+    pub bundle_stale_secs: u64,
+    #[serde(default = "default_bundle_consume_stale_secs")]
+    pub bundle_consume_stale_secs: u64,
+    #[serde(default = "default_bundle_execution_stale_secs")]
+    pub bundle_execution_stale_secs: u64,
+    #[serde(default = "default_temp_cache_retention_minutes")]
+    pub temp_cache_retention_minutes: u64,
+    #[serde(default = "default_call_schedule_minutes")]
+    pub call_schedule_minutes: Vec<u8>,
+    #[serde(default)]
+    pub call_schedule_minutes_by_model: HashMap<String, Vec<u8>>,
+    #[serde(default)]
+    pub min_invoke_interval_secs_by_model: HashMap<String, u64>,
+    #[serde(default = "default_print_response")]
+    pub print_response: bool,
+    #[serde(default = "default_telegram_signal_decisions")]
+    pub telegram_signal_decisions: Vec<String>,
+    #[serde(default = "default_x_signal_decisions")]
+    pub x_signal_decisions: Vec<String>,
+    #[serde(default = "default_indicator_codes")]
+    pub indicator_codes: Vec<String>,
+    #[serde(default = "default_models")]
+    pub models: Vec<LlmModelConfig>,
+    #[serde(default)]
+    pub execution: LlmExecutionConfig,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            default_model: default_llm_default_model(),
+            prompt_template: default_llm_prompt_template(),
+            symbol: default_symbol(),
+            queue_key: default_queue_key(),
+            purge_queue_on_start: default_llm_purge_queue_on_start(),
+            call_interval_secs: default_call_interval_secs(),
+            request_timeout_secs: default_request_timeout_secs(),
+            bundle_settle_ms: default_bundle_settle_ms(),
+            bundle_stale_secs: default_bundle_stale_secs(),
+            bundle_consume_stale_secs: default_bundle_consume_stale_secs(),
+            bundle_execution_stale_secs: default_bundle_execution_stale_secs(),
+            temp_cache_retention_minutes: default_temp_cache_retention_minutes(),
+            call_schedule_minutes: default_call_schedule_minutes(),
+            call_schedule_minutes_by_model: HashMap::new(),
+            min_invoke_interval_secs_by_model: HashMap::new(),
+            print_response: default_print_response(),
+            telegram_signal_decisions: default_telegram_signal_decisions(),
+            x_signal_decisions: default_x_signal_decisions(),
+            indicator_codes: default_indicator_codes(),
+            models: default_models(),
+            execution: LlmExecutionConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmExecutionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub account_margin_ratio: f64,
+    #[serde(default = "default_execution_margin_usdt")]
+    pub margin_usdt: f64,
+    #[serde(
+        default = "default_execution_default_leverage_ratio",
+        alias = "default_leverage"
+    )]
+    pub default_leverage_ratio: f64,
+    #[serde(default = "default_execution_max_leverage")]
+    pub max_leverage: u32,
+    #[serde(default = "default_execution_hedge_mode")]
+    pub hedge_mode: bool,
+    #[serde(default = "default_execution_recv_window_ms")]
+    pub recv_window_ms: u64,
+    #[serde(default = "default_execution_place_exit_orders")]
+    pub place_exit_orders: bool,
+    #[serde(default)]
+    pub entry_sl_remap: ExecutionEntrySlRemapConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExecutionEntrySlRemapConfig {
+    #[serde(default = "default_execution_entry_sl_remap_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_execution_entry_to_sl_distance_pct")]
+    pub entry_to_sl_distance_pct: f64,
+}
+
+impl Default for ExecutionEntrySlRemapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_execution_entry_sl_remap_enabled(),
+            entry_to_sl_distance_pct: default_execution_entry_to_sl_distance_pct(),
+        }
+    }
+}
+
+impl Default for LlmExecutionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dry_run: false,
+            account_margin_ratio: 0.0,
+            margin_usdt: default_execution_margin_usdt(),
+            default_leverage_ratio: default_execution_default_leverage_ratio(),
+            max_leverage: default_execution_max_leverage(),
+            hedge_mode: default_execution_hedge_mode(),
+            recv_window_ms: default_execution_recv_window_ms(),
+            place_exit_orders: default_execution_place_exit_orders(),
+            entry_sl_remap: ExecutionEntrySlRemapConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmModelConfig {
+    pub name: String,
+    pub provider: String,
+    pub model: String,
+    #[serde(default)]
+    pub use_openrouter: Option<bool>,
+    #[serde(default = "default_model_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_model_temperature")]
+    pub temperature: f64,
+    #[serde(default = "default_model_max_tokens")]
+    pub max_tokens: u32,
+    /// Qwen only: set to true to enable thinking (extended reasoning) mode.
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    /// Optional model-specific reasoning effort hint for OpenAI-compatible custom_llm backends.
+    #[serde(default)]
+    pub reasoning: Option<String>,
+}
+
+fn default_symbol() -> String {
+    "ETHUSDT".to_string()
+}
+
+fn default_queue_key() -> String {
+    "llm_indicator_minute".to_string()
+}
+
+fn default_llm_purge_queue_on_start() -> bool {
+    true
+}
+
+fn default_call_interval_secs() -> u64 {
+    900
+}
+
+fn default_request_timeout_secs() -> u64 {
+    45
+}
+
+fn default_bundle_settle_ms() -> u64 {
+    1000
+}
+
+fn default_bundle_stale_secs() -> u64 {
+    59
+}
+
+fn default_bundle_consume_stale_secs() -> u64 {
+    300
+}
+
+fn default_bundle_execution_stale_secs() -> u64 {
+    300
+}
+
+fn default_temp_cache_retention_minutes() -> u64 {
+    60
+}
+
+fn default_call_schedule_minutes() -> Vec<u8> {
+    vec![0, 15, 30, 45]
+}
+
+fn validate_schedule_minutes(minutes: &[u8], field_name: &str) -> Result<()> {
+    if minutes.is_empty() {
+        return Err(anyhow!("{} cannot be empty", field_name));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for minute in minutes {
+        if *minute > 59 {
+            return Err(anyhow!(
+                "{} contains invalid minute {}; expected 0..=59",
+                field_name,
+                minute
+            ));
+        }
+        if !seen.insert(*minute) {
+            return Err(anyhow!(
+                "{} contains duplicate minute {}",
+                field_name,
+                minute
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn default_print_response() -> bool {
+    true
+}
+
+fn default_telegram_signal_decisions() -> Vec<String> {
+    vec!["long".to_string(), "short".to_string()]
+}
+
+fn default_x_signal_decisions() -> Vec<String> {
+    default_telegram_signal_decisions()
+}
+
+fn default_model_enabled() -> bool {
+    true
+}
+
+fn default_model_temperature() -> f64 {
+    0.1
+}
+
+fn default_model_max_tokens() -> u32 {
+    1200
+}
+
+fn default_claude_api_url() -> String {
+    "https://api.anthropic.com/v1/messages".to_string()
+}
+
+fn default_llm_default_model() -> String {
+    "claude".to_string()
+}
+
+fn default_llm_prompt_template() -> String {
+    "big_opportunity".to_string()
+}
+
+fn default_qwen_base_api_url() -> String {
+    "https://dashscope-intl.aliyuncs.com/compatible-mode/v1".to_string()
+}
+
+fn default_qwen_model() -> String {
+    "qwen3-max".to_string()
+}
+
+fn default_gemini_base_api_url() -> String {
+    "https://generativelanguage.googleapis.com/v1beta".to_string()
+}
+
+fn default_gemini_model() -> String {
+    "gemini-2.5-pro".to_string()
+}
+
+fn default_openrouter_base_api_url() -> String {
+    "https://openrouter.ai/api/v1".to_string()
+}
+
+fn default_grok_base_api_url() -> String {
+    "https://api.x.ai/v1".to_string()
+}
+
+fn default_grok_model() -> String {
+    "grok-4-1-fast-non-reasoning".to_string()
+}
+
+fn default_telegram_base_api_url() -> String {
+    "https://api.telegram.org".to_string()
+}
+
+fn default_x_base_api_url() -> String {
+    "https://api.x.com/2".to_string()
+}
+
+fn default_claude_api_version() -> String {
+    "2023-06-01".to_string()
+}
+
+fn default_claude_api_mode() -> String {
+    "batch".to_string()
+}
+
+fn default_claude_batch_api_url() -> String {
+    "https://api.anthropic.com/v1/messages/batches".to_string()
+}
+
+fn default_claude_batch_poll_interval_secs() -> u64 {
+    30
+}
+
+fn default_claude_batch_wait_timeout_secs() -> u64 {
+    3600
+}
+
+fn default_binance_futures_rest_api_url() -> String {
+    "https://fapi.binance.com".to_string()
+}
+
+fn default_indicator_codes() -> Vec<String> {
+    vec![
+        "price_volume_structure".to_string(),
+        "footprint".to_string(),
+        "divergence".to_string(),
+        "liquidation_density".to_string(),
+        "orderbook_depth".to_string(),
+        "fvg".to_string(),
+        "absorption".to_string(),
+        "initiation".to_string(),
+        "bullish_absorption".to_string(),
+        "bullish_initiation".to_string(),
+        "bearish_absorption".to_string(),
+        "bearish_initiation".to_string(),
+        "buying_exhaustion".to_string(),
+        "selling_exhaustion".to_string(),
+        "cvd_pack".to_string(),
+        "whale_trades".to_string(),
+        "funding_rate".to_string(),
+        "vpin".to_string(),
+        "avwap".to_string(),
+        "kline_history".to_string(),
+        "ema_trend_regime".to_string(),
+        "tpo_market_profile".to_string(),
+        "rvwap_sigma_bands".to_string(),
+        "high_volume_pulse".to_string(),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_indicator_codes;
+
+    #[test]
+    fn default_indicator_codes_include_fvg() {
+        let codes = default_indicator_codes();
+        assert!(codes.iter().any(|code| code == "fvg"));
+    }
+}
+
+fn default_models() -> Vec<LlmModelConfig> {
+    vec![LlmModelConfig {
+        name: "claude46_sonnet".to_string(),
+        provider: "claude".to_string(),
+        model: "claude-sonnet-4-6".to_string(),
+        use_openrouter: None,
+        enabled: true,
+        temperature: default_model_temperature(),
+        max_tokens: default_model_max_tokens(),
+        enable_thinking: None,
+        reasoning: None,
+    }]
+}
+
+fn default_execution_margin_usdt() -> f64 {
+    50.0
+}
+
+fn default_execution_max_leverage() -> u32 {
+    10
+}
+
+fn default_execution_default_leverage_ratio() -> f64 {
+    30.0
+}
+
+fn default_execution_hedge_mode() -> bool {
+    true
+}
+
+fn default_execution_recv_window_ms() -> u64 {
+    5000
+}
+
+fn default_execution_place_exit_orders() -> bool {
+    true
+}
+
+fn default_execution_entry_sl_remap_enabled() -> bool {
+    true
+}
+
+fn default_execution_entry_to_sl_distance_pct() -> f64 {
+    100.0
+}
+
+pub fn load_config(path: &str) -> Result<RootConfig> {
+    let text = std::fs::read_to_string(path)?;
+    let cfg: RootConfig = serde_yaml::from_str(&text)?;
+    validate_config(&cfg)?;
+    Ok(cfg)
+}
+
+impl RootConfig {
+    fn active_default_model_selector(&self) -> String {
+        let llm_default = self.llm.default_model.trim().to_ascii_lowercase();
+        if !llm_default.is_empty() {
+            return llm_default;
+        }
+        self.api.default_model.trim().to_ascii_lowercase()
+    }
+
+    pub fn active_default_model(&self) -> String {
+        let selector = self.active_default_model_selector();
+        if is_supported_provider_name(&selector) {
+            return selector;
+        }
+        if let Some(model) = self
+            .llm
+            .models
+            .iter()
+            .find(|m| m.enabled && m.name.trim().eq_ignore_ascii_case(&selector))
+        {
+            return model.provider.trim().to_ascii_lowercase();
+        }
+        selector
+    }
+
+    pub fn selected_enabled_models_for_default(&self) -> Vec<LlmModelConfig> {
+        let selector = self.active_default_model_selector();
+        if !is_supported_provider_name(&selector) {
+            let by_name = self
+                .llm
+                .models
+                .iter()
+                .filter(|m| m.enabled && m.name.trim().eq_ignore_ascii_case(&selector))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !by_name.is_empty() {
+                return by_name;
+            }
+        }
+
+        let provider = self.active_default_model();
+        self.llm
+            .models
+            .iter()
+            .filter(|m| m.enabled && m.provider.eq_ignore_ascii_case(&provider))
+            .cloned()
+            .collect::<Vec<_>>()
+    }
+}
+
+impl LlmModelConfig {
+    pub fn should_use_openrouter(&self) -> bool {
+        if self.provider.eq_ignore_ascii_case("gemini") {
+            self.use_openrouter.unwrap_or(true)
+        } else {
+            self.use_openrouter.unwrap_or(false)
+        }
+    }
+}
+
+fn validate_config(cfg: &RootConfig) -> Result<()> {
+    let default_selector = cfg.active_default_model_selector();
+    let default_provider = cfg.active_default_model();
+    if !is_supported_provider_name(&default_provider) {
+        return Err(anyhow!(
+            "llm.default_model must be one of [claude, qwen, custom_llm, gemini, grok] or an enabled llm.models[].name, got {}",
+            default_selector
+        ));
+    }
+    let prompt_template = cfg.llm.prompt_template.trim().to_ascii_lowercase();
+    if prompt_template != "big_opportunity" && prompt_template != "medium_large_opportunity" {
+        return Err(anyhow!(
+            "llm.prompt_template must be one of [big_opportunity, medium_large_opportunity]"
+        ));
+    }
+
+    if cfg.llm.call_interval_secs == 0 {
+        return Err(anyhow!("llm.call_interval_secs must be > 0"));
+    }
+    if cfg.llm.request_timeout_secs == 0 {
+        return Err(anyhow!("llm.request_timeout_secs must be > 0"));
+    }
+    if cfg.llm.bundle_settle_ms == 0 {
+        return Err(anyhow!("llm.bundle_settle_ms must be > 0"));
+    }
+    validate_schedule_minutes(&cfg.llm.call_schedule_minutes, "llm.call_schedule_minutes")?;
+    for (provider, minutes) in &cfg.llm.call_schedule_minutes_by_model {
+        let key = provider.trim().to_ascii_lowercase();
+        if key != "claude"
+            && key != "qwen"
+            && key != "custom_llm"
+            && key != "gemini"
+            && key != "grok"
+        {
+            return Err(anyhow!(
+                "llm.call_schedule_minutes_by_model key must be one of [claude, qwen, custom_llm, gemini, grok], got {}",
+                provider
+            ));
+        }
+        validate_schedule_minutes(
+            minutes,
+            &format!("llm.call_schedule_minutes_by_model.{}", key),
+        )?;
+    }
+    for (provider, secs) in &cfg.llm.min_invoke_interval_secs_by_model {
+        let key = provider.trim().to_ascii_lowercase();
+        if key != "claude"
+            && key != "qwen"
+            && key != "custom_llm"
+            && key != "gemini"
+            && key != "grok"
+        {
+            return Err(anyhow!(
+                "llm.min_invoke_interval_secs_by_model key must be one of [claude, qwen, custom_llm, gemini, grok], got {}",
+                provider
+            ));
+        }
+        if *secs == 0 {
+            return Err(anyhow!(
+                "llm.min_invoke_interval_secs_by_model.{} must be > 0",
+                key
+            ));
+        }
+    }
+    if cfg.llm.indicator_codes.is_empty() {
+        return Err(anyhow!("llm.indicator_codes cannot be empty"));
+    }
+    validate_telegram_signal_decisions(&cfg.llm.telegram_signal_decisions)?;
+    validate_x_signal_decisions(&cfg.llm.x_signal_decisions)?;
+    if !cfg.mq.queues.contains_key(&cfg.llm.queue_key) {
+        return Err(anyhow!(
+            "llm.queue_key={} not found in mq.queues",
+            cfg.llm.queue_key
+        ));
+    }
+
+    let enabled_models = cfg
+        .llm
+        .models
+        .iter()
+        .filter(|m| m.enabled)
+        .collect::<Vec<_>>();
+    if enabled_models.is_empty() && default_provider == "claude" {
+        return Err(anyhow!(
+            "llm.models has no enabled model; claude requires at least one enabled llm.models item"
+        ));
+    }
+    for model in &enabled_models {
+        if model.name.trim().is_empty() {
+            return Err(anyhow!("llm.models[].name is empty"));
+        }
+        if model.provider.trim().is_empty() {
+            return Err(anyhow!("llm.models[].provider is empty"));
+        }
+        if model.model.trim().is_empty() {
+            return Err(anyhow!("llm.models[].model is empty"));
+        }
+        if model.max_tokens == 0 {
+            return Err(anyhow!("llm.models[].max_tokens must be > 0"));
+        }
+    }
+
+    let selected_enabled_models = cfg.selected_enabled_models_for_default();
+
+    let claude_needed = default_provider == "claude";
+    if claude_needed && cfg.api.claude.resolved_api_key().trim().is_empty() {
+        return Err(anyhow!("api.claude.api_key is empty"));
+    }
+    if claude_needed {
+        if !cfg.api.claude.use_batch_api() {
+            return Err(anyhow!("api.claude.mode must be batch for llm subsystem"));
+        }
+        if cfg.api.claude.batch_poll_interval_secs == 0 {
+            return Err(anyhow!("api.claude.batch_poll_interval_secs must be > 0"));
+        }
+        if cfg.api.claude.batch_wait_timeout_secs == 0 {
+            return Err(anyhow!("api.claude.batch_wait_timeout_secs must be > 0"));
+        }
+    }
+
+    if default_provider == "qwen" {
+        if cfg.api.qwen.resolved_api_key().trim().is_empty() {
+            return Err(anyhow!("api.qwen.api_key is empty"));
+        }
+        if cfg.api.qwen.base_api_url.trim().is_empty() {
+            return Err(anyhow!("api.qwen.base_api_url is empty"));
+        }
+        if cfg.api.qwen.model.trim().is_empty() {
+            return Err(anyhow!("api.qwen.model is empty"));
+        }
+    }
+
+    if default_provider == "custom_llm" {
+        if cfg.api.custom_llm.resolved_api_key().trim().is_empty() {
+            return Err(anyhow!("api.custom_llm.api_key is empty"));
+        }
+        if cfg.api.custom_llm.base_api_url.trim().is_empty() {
+            return Err(anyhow!("api.custom_llm.base_api_url is empty"));
+        }
+        if cfg.api.custom_llm.model.trim().is_empty() {
+            return Err(anyhow!("api.custom_llm.model is empty"));
+        }
+    }
+
+    if default_provider == "gemini" {
+        let selected_uses_openrouter = selected_enabled_models
+            .iter()
+            .any(|m| m.should_use_openrouter());
+        let selected_uses_direct_gemini = selected_enabled_models
+            .iter()
+            .any(|m| !m.should_use_openrouter());
+
+        if selected_uses_openrouter {
+            if cfg.api.openrouter.resolved_api_key().trim().is_empty() {
+                return Err(anyhow!("api.openrouter.api_key is empty"));
+            }
+            if cfg.api.openrouter.base_api_url.trim().is_empty() {
+                return Err(anyhow!("api.openrouter.base_api_url is empty"));
+            }
+        }
+
+        if selected_uses_direct_gemini || !selected_uses_openrouter {
+            if cfg.api.gemini.resolved_api_key().trim().is_empty() {
+                return Err(anyhow!("api.gemini.api_key is empty"));
+            }
+            if cfg.api.gemini.base_api_url.trim().is_empty() {
+                return Err(anyhow!("api.gemini.base_api_url is empty"));
+            }
+            if cfg.api.gemini.model.trim().is_empty() {
+                return Err(anyhow!("api.gemini.model is empty"));
+            }
+        }
+    }
+
+    if default_provider == "grok" {
+        if cfg.api.grok.resolved_api_key().trim().is_empty() {
+            return Err(anyhow!("api.grok.api_key is empty"));
+        }
+        if cfg.api.grok.base_api_url.trim().is_empty() {
+            return Err(anyhow!("api.grok.base_api_url is empty"));
+        }
+        if cfg.api.grok.model.trim().is_empty() {
+            return Err(anyhow!("api.grok.model is empty"));
+        }
+    }
+
+    let telegram_token = cfg.api.telegram.resolved_token();
+    let telegram_chat_id = cfg.api.telegram.resolved_chat_id();
+    if telegram_token.trim().is_empty() != telegram_chat_id.trim().is_empty() {
+        return Err(anyhow!(
+            "api.telegram.token and api.telegram.chat_id must both be set or both empty"
+        ));
+    }
+
+    let x_consumer_key = cfg.api.x.resolved_consumer_key();
+    let x_secret_key = cfg.api.x.resolved_secret_key();
+    let x_access_token = cfg.api.x.resolved_access_token();
+    let x_access_token_secret = cfg.api.x.resolved_access_token_secret();
+    let x_required_values = [
+        x_consumer_key.trim(),
+        x_secret_key.trim(),
+        x_access_token.trim(),
+        x_access_token_secret.trim(),
+    ];
+    let x_all_empty = x_required_values.iter().all(|v| v.is_empty());
+    let x_all_set = x_required_values.iter().all(|v| !v.is_empty());
+    if !x_all_empty && !x_all_set {
+        return Err(anyhow!(
+            "api.x.consumer_key, api.x.secret_key, api.x.access_token and api.x.access_token_secret must all be set or all be empty"
+        ));
+    }
+    if x_all_set && cfg.api.x.base_api_url.trim().is_empty() {
+        return Err(anyhow!("api.x.base_api_url is empty"));
+    }
+
+    if !cfg
+        .llm
+        .execution
+        .entry_sl_remap
+        .entry_to_sl_distance_pct
+        .is_finite()
+    {
+        return Err(anyhow!(
+            "llm.execution.entry_sl_remap.entry_to_sl_distance_pct must be finite"
+        ));
+    }
+    if !(0.0..=100.0).contains(&cfg.llm.execution.entry_sl_remap.entry_to_sl_distance_pct) {
+        return Err(anyhow!(
+            "llm.execution.entry_sl_remap.entry_to_sl_distance_pct must be between 0 and 100"
+        ));
+    }
+
+    if cfg.llm.execution.enabled {
+        if default_provider == "claude" && selected_enabled_models.len() != 1 {
+            return Err(anyhow!(
+                "llm.execution.enabled with llm.default_model=claude requires exactly one enabled claude model"
+            ));
+        }
+        if default_provider == "qwen" && selected_enabled_models.len() > 1 {
+            return Err(anyhow!(
+                "llm.execution.enabled with llm.default_model=qwen supports at most one enabled qwen model"
+            ));
+        }
+        if default_provider == "custom_llm" && selected_enabled_models.len() > 1 {
+            return Err(anyhow!(
+                "llm.execution.enabled with llm.default_model=custom_llm supports at most one enabled custom_llm model"
+            ));
+        }
+        if default_provider == "gemini" && selected_enabled_models.len() > 1 {
+            return Err(anyhow!(
+                "llm.execution.enabled with llm.default_model=gemini supports at most one enabled gemini model"
+            ));
+        }
+        if default_provider == "grok" && selected_enabled_models.len() > 1 {
+            return Err(anyhow!(
+                "llm.execution.enabled with llm.default_model=grok supports at most one enabled grok model"
+            ));
+        }
+        if cfg.api.binance.resolved_api_key().trim().is_empty() {
+            return Err(anyhow!("api.binance.api_key is empty"));
+        }
+        if cfg.api.binance.resolved_api_secret().trim().is_empty() {
+            return Err(anyhow!("api.binance.api_secret is empty"));
+        }
+        if cfg.llm.execution.margin_usdt <= 0.0 {
+            return Err(anyhow!("llm.execution.margin_usdt must be > 0"));
+        }
+        if !(0.0..=1.0).contains(&cfg.llm.execution.account_margin_ratio) {
+            return Err(anyhow!(
+                "llm.execution.account_margin_ratio must be between 0.0 and 1.0"
+            ));
+        }
+        if cfg.llm.execution.max_leverage == 0 {
+            return Err(anyhow!("llm.execution.max_leverage must be > 0"));
+        }
+        if !cfg.llm.execution.default_leverage_ratio.is_finite() {
+            return Err(anyhow!(
+                "llm.execution.default_leverage_ratio must be finite"
+            ));
+        }
+        if cfg.llm.execution.default_leverage_ratio <= 0.0 {
+            return Err(anyhow!("llm.execution.default_leverage_ratio must be > 0"));
+        }
+        if cfg.llm.execution.recv_window_ms == 0 {
+            return Err(anyhow!("llm.execution.recv_window_ms must be > 0"));
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_secret(raw: &str) -> String {
+    std::env::var(raw).unwrap_or_else(|_| raw.to_string())
+}
+
+fn is_supported_provider_name(value: &str) -> bool {
+    matches!(value, "claude" | "qwen" | "custom_llm" | "gemini" | "grok")
+}
+
+fn validate_telegram_signal_decisions(decisions: &[String]) -> Result<()> {
+    validate_signal_decisions(
+        decisions,
+        "llm.telegram_signal_decisions",
+        "llm.telegram_signal_decisions",
+    )
+}
+
+fn validate_x_signal_decisions(decisions: &[String]) -> Result<()> {
+    validate_signal_decisions(
+        decisions,
+        "llm.x_signal_decisions",
+        "llm.x_signal_decisions",
+    )
+}
+
+fn validate_signal_decisions(
+    decisions: &[String],
+    field_label: &str,
+    duplicate_field_label: &str,
+) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for raw in decisions {
+        let normalized = raw.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return Err(anyhow!("{} cannot contain empty values", field_label));
+        }
+        if !is_supported_signal_decision(&normalized) {
+            return Err(anyhow!(
+                "{} contains unsupported value {}; supported: [long, short, no_trade, close, add, reduce, hold, modify_tpsl, modify_maker]",
+                field_label,
+                raw
+            ));
+        }
+        if !seen.insert(normalized.clone()) {
+            return Err(anyhow!(
+                "{} contains duplicate value {}",
+                duplicate_field_label,
+                normalized
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_supported_signal_decision(value: &str) -> bool {
+    matches!(
+        value,
+        "long"
+            | "short"
+            | "no_trade"
+            | "close"
+            | "add"
+            | "reduce"
+            | "hold"
+            | "modify_tpsl"
+            | "modify_maker"
+    )
+}

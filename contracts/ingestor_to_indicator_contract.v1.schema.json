@@ -1,0 +1,784 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "orderflow://contracts/ingestor_to_indicator_contract.v1.schema.json",
+  "title": "Orderflow MQ Body Contract V1 (Market Data Ingestor -> Indicator Engine)",
+  "description": "This schema validates the JSON message body. AMQP headers are defined in contracts/ingestor_to_indicator_headers.v1.schema.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "msg_type",
+    "message_id",
+    "trace_id",
+    "routing_key",
+    "market",
+    "symbol",
+    "source_kind",
+    "backfill_in_progress",
+    "event_ts",
+    "published_at",
+    "producer",
+    "data"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "msg_type": {
+      "type": "string",
+      "enum": [
+        "md.trade",
+        "md.depth",
+        "md.orderbook_snapshot_l2",
+        "md.bbo",
+        "md.kline",
+        "md.mark_price",
+        "md.funding_rate",
+        "md.force_order"
+      ]
+    },
+    "message_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "trace_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "routing_key": {
+      "type": "string",
+      "pattern": "^(md\\.(spot|futures)\\.(trade|depth|orderbook_snapshot_l2|bbo|mark_price|funding_rate|force_order)\\.[a-z0-9_]+|md\\.(spot|futures)\\.kline\\.(1m|15m|1h|4h|1d|3d)\\.[a-z0-9_]+)$"
+    },
+    "market": {
+      "type": "string",
+      "enum": [
+        "spot",
+        "futures"
+      ]
+    },
+    "symbol": {
+      "type": "string",
+      "pattern": "^[A-Z0-9]{2,20}$"
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": [
+        "ws",
+        "rest",
+        "derived",
+        "replay"
+      ]
+    },
+    "backfill_in_progress": {
+      "type": "boolean"
+    },
+    "event_ts": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "published_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "service",
+        "instance_id"
+      ],
+      "properties": {
+        "service": {
+          "type": "string",
+          "const": "market_data_ingestor"
+        },
+        "instance_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
+    "data": {
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "msg_type": {
+            "const": "md.trade"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/trade_data"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "msg_type": {
+            "const": "md.depth"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/depth_data"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "msg_type": {
+            "const": "md.orderbook_snapshot_l2"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/orderbook_snapshot_l2_data"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "msg_type": {
+            "const": "md.bbo"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/bbo_data"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "msg_type": {
+            "const": "md.kline"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/kline_data"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "msg_type": {
+            "const": "md.mark_price"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/mark_price_data"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "msg_type": {
+            "const": "md.funding_rate"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/funding_rate_data"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "msg_type": {
+            "const": "md.force_order"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "$ref": "#/$defs/force_order_data"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "decimal_string": {
+      "type": "string",
+      "pattern": "^-?\\d+(\\.\\d+)?$"
+    },
+    "nullable_decimal_string": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/decimal_string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullable_int64": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullable_bool": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "price_qty_level": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        {
+          "$ref": "#/$defs/decimal_string"
+        },
+        {
+          "$ref": "#/$defs/decimal_string"
+        }
+      ],
+      "items": false
+    },
+    "trade_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stream_name",
+        "ts_recv",
+        "agg_trade_id",
+        "exchange_trade_id",
+        "first_trade_id",
+        "last_trade_id",
+        "price",
+        "qty_raw",
+        "qty_eth",
+        "notional_usdt",
+        "is_buyer_maker",
+        "aggressor_side",
+        "is_best_match"
+      ],
+      "properties": {
+        "stream_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts_recv": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "agg_trade_id": {
+          "$ref": "#/$defs/nullable_int64"
+        },
+        "exchange_trade_id": {
+          "$ref": "#/$defs/nullable_int64"
+        },
+        "first_trade_id": {
+          "$ref": "#/$defs/nullable_int64"
+        },
+        "last_trade_id": {
+          "$ref": "#/$defs/nullable_int64"
+        },
+        "price": {
+          "$ref": "#/$defs/decimal_string"
+        },
+        "qty_raw": {
+          "$ref": "#/$defs/decimal_string"
+        },
+        "qty_eth": {
+          "$ref": "#/$defs/decimal_string"
+        },
+        "notional_usdt": {
+          "$ref": "#/$defs/decimal_string"
+        },
+        "is_buyer_maker": {
+          "$ref": "#/$defs/nullable_bool"
+        },
+        "aggressor_side": {
+          "type": "integer",
+          "enum": [
+            -1,
+            1
+          ]
+        },
+        "is_best_match": {
+          "$ref": "#/$defs/nullable_bool"
+        },
+        "payload_json": {
+          "type": "object"
+        }
+      }
+    },
+    "depth_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stream_name",
+        "ts_recv",
+        "first_update_id",
+        "final_update_id",
+        "prev_final_update_id",
+        "bids_delta",
+        "asks_delta",
+        "event_count"
+      ],
+      "properties": {
+        "stream_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts_recv": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "first_update_id": {
+          "$ref": "#/$defs/nullable_int64"
+        },
+        "final_update_id": {
+          "$ref": "#/$defs/nullable_int64"
+        },
+        "prev_final_update_id": {
+          "$ref": "#/$defs/nullable_int64"
+        },
+        "bids_delta": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/price_qty_level"
+          }
+        },
+        "asks_delta": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/price_qty_level"
+          }
+        },
+        "event_count": {
+          "$ref": "#/$defs/nullable_int64"
+        },
+        "payload_json": {
+          "type": "object"
+        }
+      }
+    },
+    "orderbook_snapshot_l2_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stream_name",
+        "ts_recv",
+        "ts_snapshot",
+        "depth_levels",
+        "last_update_id",
+        "bids",
+        "asks",
+        "checksum",
+        "metadata"
+      ],
+      "properties": {
+        "stream_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts_recv": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "ts_snapshot": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "depth_levels": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "last_update_id": {
+          "$ref": "#/$defs/nullable_int64"
+        },
+        "bids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/price_qty_level"
+          }
+        },
+        "asks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/price_qty_level"
+          }
+        },
+        "checksum": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "metadata": {
+          "type": "object"
+        }
+      }
+    },
+    "bbo_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stream_name",
+        "ts_recv",
+        "update_id",
+        "bid_price",
+        "bid_qty",
+        "ask_price",
+        "ask_qty"
+      ],
+      "properties": {
+        "stream_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts_recv": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "update_id": {
+          "$ref": "#/$defs/nullable_int64"
+        },
+        "bid_price": {
+          "$ref": "#/$defs/decimal_string"
+        },
+        "bid_qty": {
+          "$ref": "#/$defs/decimal_string"
+        },
+        "ask_price": {
+          "$ref": "#/$defs/decimal_string"
+        },
+        "ask_qty": {
+          "$ref": "#/$defs/decimal_string"
+        },
+        "payload_json": {
+          "type": "object"
+        }
+      }
+    },
+    "kline_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stream_name",
+        "ts_recv",
+        "interval_code",
+        "open_time",
+        "close_time",
+        "open_price",
+        "high_price",
+        "low_price",
+        "close_price",
+        "volume_base",
+        "quote_volume",
+        "trade_count",
+        "taker_buy_base",
+        "taker_buy_quote",
+        "is_closed"
+      ],
+      "properties": {
+        "stream_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts_recv": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "interval_code": {
+          "type": "string",
+          "enum": [
+            "1m",
+            "15m",
+            "1h",
+            "4h",
+            "1d",
+            "3d"
+          ]
+        },
+        "open_time": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "close_time": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "open_price": {
+          "$ref": "#/$defs/decimal_string"
+        },
+        "high_price": {
+          "$ref": "#/$defs/decimal_string"
+        },
+        "low_price": {
+          "$ref": "#/$defs/decimal_string"
+        },
+        "close_price": {
+          "$ref": "#/$defs/decimal_string"
+        },
+        "volume_base": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "quote_volume": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "trade_count": {
+          "$ref": "#/$defs/nullable_int64"
+        },
+        "taker_buy_base": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "taker_buy_quote": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "is_closed": {
+          "type": "boolean"
+        },
+        "payload_json": {
+          "type": "object"
+        }
+      }
+    },
+    "mark_price_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stream_name",
+        "ts_recv",
+        "mark_price",
+        "index_price",
+        "estimated_settle_price",
+        "funding_rate",
+        "next_funding_time"
+      ],
+      "properties": {
+        "stream_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts_recv": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "mark_price": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "index_price": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "estimated_settle_price": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "funding_rate": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "next_funding_time": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "payload_json": {
+          "type": "object"
+        }
+      }
+    },
+    "funding_rate_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stream_name",
+        "ts_recv",
+        "funding_time",
+        "funding_rate",
+        "mark_price",
+        "next_funding_time"
+      ],
+      "properties": {
+        "stream_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts_recv": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "funding_time": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "funding_rate": {
+          "$ref": "#/$defs/decimal_string"
+        },
+        "mark_price": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "next_funding_time": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "payload_json": {
+          "type": "object"
+        }
+      }
+    },
+    "force_order_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stream_name",
+        "ts_recv",
+        "order_side",
+        "position_side",
+        "order_type",
+        "tif",
+        "original_qty",
+        "price",
+        "average_price",
+        "filled_qty",
+        "last_filled_qty",
+        "trade_time",
+        "notional_usdt",
+        "liq_side"
+      ],
+      "properties": {
+        "stream_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "ts_recv": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "order_side": {
+          "type": "string",
+          "enum": [
+            "buy",
+            "sell",
+            "unknown"
+          ]
+        },
+        "position_side": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "order_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tif": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "original_qty": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "price": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "average_price": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "filled_qty": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "last_filled_qty": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "trade_time": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/timestamp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "notional_usdt": {
+          "$ref": "#/$defs/nullable_decimal_string"
+        },
+        "liq_side": {
+          "type": "string",
+          "enum": [
+            "long_liq",
+            "short_liq",
+            "unknown"
+          ]
+        },
+        "payload_json": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,52 @@
+﻿{
+    "headers":  {
+                    "source_kind":  "ws",
+                    "backfill_in_progress":  false,
+                    "routing_key":  "md.futures.trade.ethusdt",
+                    "symbol":  "ETHUSDT",
+                    "market":  "futures",
+                    "producer_service":  "market_data_ingestor",
+                    "schema_version":  1,
+                    "msg_type":  "md.trade",
+                    "published_at":  "2026-02-25T14:00:00Z",
+                    "content_type":  "application/json",
+                    "producer_instance_id":  "ingestor-dev-1",
+                    "message_id":  "c1a9d7d0-3a2b-4f61-91f4-000000000001",
+                    "trace_id":  "11111111-1111-4111-8111-111111111111"
+                },
+    "body":  {
+                 "source_kind":  "ws",
+                 "backfill_in_progress":  false,
+                 "routing_key":  "md.futures.trade.ethusdt",
+                 "data":  {
+                              "stream_name":  "ethusdt@aggTrade",
+                              "ts_recv":  "2026-02-25T13:59:59.124Z",
+                              "agg_trade_id":  9876543210,
+                              "exchange_trade_id":  1234567890,
+                              "first_trade_id":  1234567888,
+                              "last_trade_id":  1234567890,
+                              "price":  "3188.45",
+                              "qty_raw":  "0.2500",
+                              "qty_eth":  "0.2500",
+                              "notional_usdt":  "797.1125",
+                              "is_buyer_maker":  false,
+                              "aggressor_side":  1,
+                              "is_best_match":  true,
+                              "payload_json":  {
+
+                                               }
+                          },
+                 "market":  "futures",
+                 "schema_version":  1,
+                 "event_ts":  "2026-02-25T13:59:59.123Z",
+                 "msg_type":  "md.trade",
+                 "published_at":  "2026-02-25T14:00:00Z",
+                 "symbol":  "ETHUSDT",
+                 "message_id":  "c1a9d7d0-3a2b-4f61-91f4-000000000001",
+                 "producer":  {
+                                  "service":  "market_data_ingestor",
+                                  "instance_id":  "ingestor-dev-1"
+                              },
+                 "trace_id":  "11111111-1111-4111-8111-111111111111"
+             }
+}

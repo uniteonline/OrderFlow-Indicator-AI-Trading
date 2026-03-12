@@ -1,0 +1,45 @@
+﻿{
+    "headers":  {
+                    "source_kind":  "rest",
+                    "backfill_in_progress":  true,
+                    "routing_key":  "md.futures.funding_rate.ethusdt",
+                    "symbol":  "ETHUSDT",
+                    "market":  "futures",
+                    "producer_service":  "market_data_ingestor",
+                    "schema_version":  1,
+                    "msg_type":  "md.funding_rate",
+                    "published_at":  "2026-02-25T14:00:04Z",
+                    "content_type":  "application/json",
+                    "producer_instance_id":  "ingestor-dev-1",
+                    "message_id":  "c1a9d7d0-3a2b-4f61-91f4-000000000006",
+                    "trace_id":  "11111111-1111-4111-8111-111111111111"
+                },
+    "body":  {
+                 "source_kind":  "rest",
+                 "backfill_in_progress":  true,
+                 "routing_key":  "md.futures.funding_rate.ethusdt",
+                 "data":  {
+                              "stream_name":  "fapi/v1/fundingRate",
+                              "ts_recv":  "2026-02-25T14:00:03.950Z",
+                              "funding_time":  "2026-02-25T08:00:00Z",
+                              "funding_rate":  "0.00010000",
+                              "mark_price":  "3186.70",
+                              "next_funding_time":  "2026-02-25T16:00:00Z",
+                              "payload_json":  {
+
+                                               }
+                          },
+                 "market":  "futures",
+                 "schema_version":  1,
+                 "event_ts":  "2026-02-25T08:00:00Z",
+                 "msg_type":  "md.funding_rate",
+                 "published_at":  "2026-02-25T14:00:04Z",
+                 "symbol":  "ETHUSDT",
+                 "message_id":  "c1a9d7d0-3a2b-4f61-91f4-000000000006",
+                 "producer":  {
+                                  "service":  "market_data_ingestor",
+                                  "instance_id":  "ingestor-dev-1"
+                              },
+                 "trace_id":  "11111111-1111-4111-8111-111111111111"
+             }
+}

@@ -1,0 +1,34 @@
+# Build artifacts
+/target/
+**/target/
+
+# Runtime data / exports
+/exports/
+/orderflow/orderflow_data/
+/systems/llm/journal/
+/systems/llm/temp_indicator/
+/systems/llm/temp_model_input/
+
+# Local config / secrets / IDE state
+/config/*.yaml
+/config/*.yml
+/config/*.json
+/.claude/
+.env
+.env.*
+
+# Logs / temp files / local databases
+*.log
+*.log.*
+*.pid
+*.pid.lock
+*.tmp
+*.temp
+*.sqlite
+*.sqlite3
+*.db
+*.parquet
+*.swp
+*.swo
+*~
+.DS_Store

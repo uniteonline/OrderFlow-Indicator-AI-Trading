@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "orderflow://contracts/ingestor_to_indicator_headers.v1.schema.json",
+  "title": "Orderflow MQ AMQP Headers Contract V1 (Market Data Ingestor -> Indicator Engine)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "message_id",
+    "trace_id",
+    "msg_type",
+    "market",
+    "symbol",
+    "routing_key",
+    "source_kind",
+    "backfill_in_progress",
+    "published_at",
+    "content_type",
+    "producer_service",
+    "producer_instance_id"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "message_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "trace_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "source_kind": {
+      "type": "string",
+      "enum": [
+        "ws",
+        "rest",
+        "derived",
+        "replay"
+      ]
+    },
+    "backfill_in_progress": {
+      "type": "boolean"
+    },
+    "published_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "producer_service": {
+      "type": "string",
+      "const": "market_data_ingestor"
+    },
+    "producer_instance_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "msg_type": {
+      "type": "string",
+      "enum": [
+        "md.trade",
+        "md.depth",
+        "md.orderbook_snapshot_l2",
+        "md.bbo",
+        "md.kline",
+        "md.mark_price",
+        "md.funding_rate",
+        "md.force_order"
+      ]
+    },
+    "market": {
+      "type": "string",
+      "enum": [
+        "spot",
+        "futures"
+      ]
+    },
+    "symbol": {
+      "type": "string",
+      "pattern": "^[A-Z0-9]{2,20}$"
+    },
+    "routing_key": {
+      "type": "string",
+      "pattern": "^(md\\.(spot|futures)\\.(trade|depth|orderbook_snapshot_l2|bbo|mark_price|funding_rate|force_order)\\.[a-z0-9_]+|md\\.(spot|futures)\\.kline\\.(1m|15m|1h|4h|1d|3d)\\.[a-z0-9_]+)$"
+    },
+    "content_type": {
+      "type": "string",
+      "const": "application/json"
+    }
+  }
+}

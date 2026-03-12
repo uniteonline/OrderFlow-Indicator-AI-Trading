@@ -1,0 +1,67 @@
+{
+  "headers": {
+    "source_kind": "derived",
+    "backfill_in_progress": false,
+    "routing_key": "md.futures.orderbook_snapshot_l2.ethusdt",
+    "symbol": "ETHUSDT",
+    "market": "futures",
+    "producer_service": "market_data_ingestor",
+    "schema_version": 1,
+    "msg_type": "md.orderbook_snapshot_l2",
+    "published_at": "2026-02-25T14:00:06Z",
+    "content_type": "application/json",
+    "producer_instance_id": "ingestor-dev-1",
+    "message_id": "c1a9d7d0-3a2b-4f61-91f4-000000000008",
+    "trace_id": "11111111-1111-4111-8111-111111111111"
+  },
+  "body": {
+    "source_kind": "derived",
+    "backfill_in_progress": false,
+    "routing_key": "md.futures.orderbook_snapshot_l2.ethusdt",
+    "data": {
+      "stream_name": "orderbook_snapshot_l2@derived_200",
+      "ts_recv": "2026-02-25T14:00:05.901Z",
+      "ts_snapshot": "2026-02-25T14:00:05.900Z",
+      "depth_levels": 200,
+      "last_update_id": 660000008,
+      "bids": [
+        [
+          "3188.40",
+          "12.5000"
+        ],
+        [
+          "3188.35",
+          "9.2100"
+        ]
+      ],
+      "asks": [
+        [
+          "3188.50",
+          "11.7000"
+        ],
+        [
+          "3188.55",
+          "8.6400"
+        ]
+      ],
+      "checksum": "0x8f42c9a1",
+      "metadata": {
+        "build_reason": "cold_start_sync",
+        "source_depth_stream": "ethusdt@depth@100ms",
+        "snapshot_seq": 1
+      }
+    },
+    "market": "futures",
+    "schema_version": 1,
+    "event_ts": "2026-02-25T14:00:05.900Z",
+    "msg_type": "md.orderbook_snapshot_l2",
+    "published_at": "2026-02-25T14:00:06Z",
+    "symbol": "ETHUSDT",
+    "message_id": "c1a9d7d0-3a2b-4f61-91f4-000000000008",
+    "producer": {
+      "service": "market_data_ingestor",
+      "instance_id": "ingestor-dev-1"
+    },
+    "trace_id": "11111111-1111-4111-8111-111111111111"
+  }
+}

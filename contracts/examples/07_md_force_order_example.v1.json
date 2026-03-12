@@ -1,0 +1,53 @@
+﻿{
+    "headers":  {
+                    "source_kind":  "ws",
+                    "backfill_in_progress":  false,
+                    "routing_key":  "md.futures.force_order.ethusdt",
+                    "symbol":  "ETHUSDT",
+                    "market":  "futures",
+                    "producer_service":  "market_data_ingestor",
+                    "schema_version":  1,
+                    "msg_type":  "md.force_order",
+                    "published_at":  "2026-02-25T14:00:05Z",
+                    "content_type":  "application/json",
+                    "producer_instance_id":  "ingestor-dev-1",
+                    "message_id":  "c1a9d7d0-3a2b-4f61-91f4-000000000007",
+                    "trace_id":  "11111111-1111-4111-8111-111111111111"
+                },
+    "body":  {
+                 "source_kind":  "ws",
+                 "backfill_in_progress":  false,
+                 "routing_key":  "md.futures.force_order.ethusdt",
+                 "data":  {
+                              "stream_name":  "ethusdt@forceOrder",
+                              "ts_recv":  "2026-02-25T14:00:04.705Z",
+                              "order_side":  "sell",
+                              "position_side":  "BOTH",
+                              "order_type":  "LIMIT",
+                              "tif":  "IOC",
+                              "original_qty":  "5.0000",
+                              "price":  "3180.00",
+                              "average_price":  "3179.50",
+                              "filled_qty":  "5.0000",
+                              "last_filled_qty":  "5.0000",
+                              "trade_time":  "2026-02-25T14:00:04.690Z",
+                              "notional_usdt":  "15897.5000",
+                              "liq_side":  "long_liq",
+                              "payload_json":  {
+
+                                               }
+                          },
+                 "market":  "futures",
+                 "schema_version":  1,
+                 "event_ts":  "2026-02-25T14:00:04.700Z",
+                 "msg_type":  "md.force_order",
+                 "published_at":  "2026-02-25T14:00:05Z",
+                 "symbol":  "ETHUSDT",
+                 "message_id":  "c1a9d7d0-3a2b-4f61-91f4-000000000007",
+                 "producer":  {
+                                  "service":  "market_data_ingestor",
+                                  "instance_id":  "ingestor-dev-1"
+                              },
+                 "trace_id":  "11111111-1111-4111-8111-111111111111"
+             }
+}

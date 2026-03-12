@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "systems/market_data_ingestor",
+    "systems/indicator_engine",
+    "systems/md_replayer",
+    "systems/llm",
+]
+resolver = "2"

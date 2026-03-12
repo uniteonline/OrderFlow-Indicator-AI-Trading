@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "orderflow://contracts/indicator_to_strategy_headers.v1.schema.json",
+  "title": "Orderflow MQ AMQP Headers Contract V1 (Indicator Engine -> Strategy System Minute Bundle)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "message_id",
+    "msg_type",
+    "content_type",
+    "producer_service",
+    "producer_instance_id"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "message_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "msg_type": {
+      "type": "string",
+      "const": "ind.minute_bundle"
+    },
+    "content_type": {
+      "type": "string",
+      "const": "application/json"
+    },
+    "producer_service": {
+      "type": "string",
+      "const": "indicator_engine"
+    },
+    "producer_instance_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  }
+}
