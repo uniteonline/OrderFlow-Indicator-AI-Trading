@@ -311,7 +311,9 @@ scan fields:
   conviction        — "high" | "medium" | "low"
   entry_style       — one of the four styles above, or null
   candidate_zone    — structural area where entry would be placed (not a final price; cite the anchor field)
-  target_zone       — structural destination (not a final TP price)
+  target_zone       — structural destination implied by the thesis (not a final TP price).
+                      Ask: how far does this move want to go based on the flow and structure?
+                      Look beyond the first barrier; cite the structural anchor (field + value).
   invalidation      — the structural condition that proves the hypothesis wrong (cite the indicator field)
 
 Keep scan compact and decisive. Every cited level or signal must map to a real indicator field and value.
@@ -379,6 +381,16 @@ hvn_levels, tpo_single_print_zones. Never place SL at an arbitrary distance.
 
 TP: at the next major structural destination — HTF liquidity, unfinished auction, opposing VA boundary,
 rvwap mean, or major HVN. LVN or thin auction between entry and target is a positive.
+
+TP DEPTH RULE — apply when scan.target_zone gives |tp-entry| < 1.0V:
+  The scan's first target is an obstacle, not the final destination.
+  Scan DEEPER for the next legitimate structural anchor:
+    Priority order: 1d VAL / 1d VAH → 1d AVWAP → 1d major HVN → major round number
+                    → 1d footprint imbalance zone → 7d AVWAP
+  Use the first anchor that gives |tp-entry| ≥ 1.0V.
+  Record the skipped intermediate level in analysis.trade_logic
+  (it becomes a monitor point, not the target).
+  Return __NO_TRADE__ only if NO structural anchor exists within 3.0V of entry.
 
 STEP 4 — QUALITY CHECK (mandatory)
 HARD FLOOR: |tp-entry| < 1.0V OR RR < 2.0 → __NO_TRADE__. No exceptions.
