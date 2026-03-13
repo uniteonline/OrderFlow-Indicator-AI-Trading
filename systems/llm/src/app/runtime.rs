@@ -9,13 +9,12 @@ use crate::execution::binance::{
 use crate::llm::decision::{
     pending_order_management_intent_from_value_with_context,
     position_management_intent_from_value_with_context, trade_intent_from_value,
-    PendingOrderManagementDecision, PositionManagementDecision, TradeDecision,
-    TradeIntent,
+    PendingOrderManagementDecision, PositionManagementDecision, TradeDecision, TradeIntent,
 };
 use crate::llm::provider::{
-    invoke_models, serialize_llm_input_minified, EntryContextForLlm, ManagementSnapshotForLlm,
-    ModelInvocationInput, PendingOrderSummaryForLlm, PositionContextForLlm, PositionSummaryForLlm,
-    ReductionHistoryItemForLlm,
+    invoke_models, serialize_llm_input_minified, EntryContextForLlm, EntryStagePromptInputCapture,
+    ManagementSnapshotForLlm, ModelInvocationInput, PendingOrderSummaryForLlm,
+    PositionContextForLlm, PositionSummaryForLlm, ReductionHistoryItemForLlm,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Timelike, Utc};
@@ -1102,6 +1101,36 @@ async fn restore_position_context_from_journal_for_live_state(
                     .and_then(Value::as_u64)
                     .map(|v| v as u32)
                     .or(entry.effective_leverage);
+                // Restore entry_context if present (written since the fix was applied)
+                let has_entry_context = value.get("entry_strategy").is_some()
+                    || value.get("stop_model").is_some()
+                    || value.get("horizon").is_some();
+                if has_entry_context && entry.entry_context.is_none() {
+                    let entry_reason = reason.clone().unwrap_or_default();
+                    entry.entry_context = Some(EntryContextForState {
+                        entry_strategy: value
+                            .get("entry_strategy")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        stop_model: value
+                            .get("stop_model")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        entry_mode: value
+                            .get("entry_mode")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        original_tp: value.get("entry_original_tp").and_then(Value::as_f64),
+                        original_sl: value.get("entry_original_sl").and_then(Value::as_f64),
+                        sweep_wick_extreme: value.get("sweep_wick_extreme").and_then(Value::as_f64),
+                        horizon: value
+                            .get("horizon")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        entry_reason,
+                        entry_v: value.get("entry_v").and_then(Value::as_f64),
+                    });
+                }
             }
             "llm_management_execution" | "llm_management_execution_error" => {
                 let Some(key) = active_key.as_ref() else {
@@ -1782,6 +1811,50 @@ async fn invoke_bundle_models(
                     .map(Value::to_string)
                     .unwrap_or_else(|| "-".to_string())
             );
+        }
+        if let Some(captures) = out.entry_stage_prompt_inputs.as_deref() {
+            match persist_entry_stage_prompt_inputs_to_disk(
+                &bundle.raw,
+                trigger.as_ref(),
+                management_mode,
+                pending_order_mode,
+                &out.model_name,
+                &out.provider,
+                &out.model,
+                captures,
+                config.llm.temp_cache_retention_minutes,
+            )
+            .await
+            {
+                Ok(files) => {
+                    for (stage, path) in files {
+                        println!(
+                            "LLM_STAGE_INPUT_SOURCE ts_bucket={} trigger={} symbol={} model={} provider={} model_id={} stage={} source_stage_input_file={} stage_input_file_exists={}",
+                            bundle.raw.ts_bucket,
+                            &*trigger,
+                            bundle.raw.symbol,
+                            out.model_name,
+                            out.provider,
+                            out.model,
+                            stage,
+                            path.display(),
+                            path.exists(),
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        symbol = %bundle.raw.symbol,
+                        ts_bucket = %bundle.raw.ts_bucket,
+                        trigger = %trigger,
+                        model_name = %out.model_name,
+                        provider = %out.provider,
+                        model_id = %out.model,
+                        error = %err,
+                        "persist entry stage prompt inputs to temp_model_input failed"
+                    );
+                }
+            }
         }
         if let Some(err) = &out.error {
             error!(
@@ -3105,6 +3178,15 @@ async fn invoke_bundle_models(
                         "stop_loss_order_id": report.stop_loss_order_id,
                         "exit_orders_deferred": report.exit_orders_deferred,
                         "reason": intent.reason,
+                        // entry_context fields — persisted for service-restart restoration
+                        "entry_strategy": extract_nested_str(parsed_decision, &["analysis", "entry_strategy"]),
+                        "stop_model": extract_nested_str(parsed_decision, &["analysis", "stop_model"]),
+                        "entry_mode": extract_nested_str(parsed_decision, &["params", "entry_mode"]),
+                        "entry_original_tp": extract_nested_f64(parsed_decision, &["params", "tp"]),
+                        "entry_original_sl": extract_nested_f64(parsed_decision, &["params", "sl"]),
+                        "sweep_wick_extreme": extract_nested_f64(parsed_decision, &["params", "sweep_wick_extreme"]),
+                        "horizon": intent.horizon,
+                        "entry_v": extract_nested_f64(parsed_decision, &["analysis", "volatility_unit_v"]),
                     });
                     if let Err(err) = append_journal_event(event) {
                         warn!(error = %err, "append llm_order_execution journal failed");
@@ -5732,6 +5814,66 @@ async fn persist_model_input_to_disk(
     Ok(path)
 }
 
+async fn persist_entry_stage_prompt_inputs_to_disk(
+    bundle: &MinuteBundleEnvelope,
+    trigger: &str,
+    management_mode: bool,
+    pending_order_mode: bool,
+    model_name: &str,
+    provider: &str,
+    model_id: &str,
+    captures: &[EntryStagePromptInputCapture],
+    retention_minutes: u64,
+) -> Result<Vec<(String, PathBuf)>> {
+    ensure_temp_model_input_dir().await?;
+
+    let mut files = Vec::with_capacity(captures.len());
+    for capture in captures {
+        let path = llm_stage_prompt_input_path(
+            bundle,
+            trigger,
+            management_mode,
+            pending_order_mode,
+            provider,
+            model_name,
+            &capture.stage,
+        );
+        let value = json!({
+            "ts_bucket": bundle.ts_bucket,
+            "symbol": &bundle.symbol,
+            "trigger": trigger,
+            "management_mode": management_mode,
+            "pending_order_mode": pending_order_mode,
+            "model_name": model_name,
+            "provider": provider,
+            "model_id": model_id,
+            "stage": &capture.stage,
+            "captured_at": Utc::now().to_rfc3339(),
+            "prompt_input": &capture.prompt_input,
+            "stage_1_setup_scan_json": &capture.stage_1_setup_scan_json,
+        });
+        write_pretty_json_file(&path, &value)?;
+        files.push((capture.stage.clone(), path));
+    }
+
+    let removed = prune_expired_temp_model_input_files(
+        Path::new(TEMP_MODEL_INPUT_DIR),
+        bundle.ts_bucket,
+        retention_minutes_i64(retention_minutes),
+    )
+    .context("prune expired temp_model_input cache")?;
+    if removed > 0 {
+        debug!(
+            ts_bucket = %bundle.ts_bucket,
+            removed,
+            retention_minutes = retention_minutes,
+            "pruned expired temp_model_input cache"
+        );
+    }
+
+    Ok(files)
+}
+
 fn retention_minutes_i64(retention_minutes: u64) -> i64 {
     i64::try_from(retention_minutes).unwrap_or(i64::MAX)
 }
@@ -5775,6 +5917,38 @@ fn llm_model_input_path(
     Path::new(TEMP_MODEL_INPUT_DIR).join(format!(
         "{}_{}_{}_{}_{}.json",
         bucket_ts, symbol, mode, trigger, invoke_ts
+    ))
+}
+
+fn llm_stage_prompt_input_path(
+    bundle: &MinuteBundleEnvelope,
+    trigger: &str,
+    management_mode: bool,
+    pending_order_mode: bool,
+    provider: &str,
+    model_name: &str,
+    stage: &str,
+) -> PathBuf {
+    let bucket_ts = bundle.ts_bucket.format("%Y%m%dT%H%M%SZ").to_string();
+    let invoke_ts = Utc::now()
+        .format("%Y%m%dT%H%M%S%.3fZ")
+        .to_string()
+        .replace('.', "");
+    let symbol = sanitize_filename_component(&bundle.symbol);
+    let trigger = sanitize_filename_component(trigger);
+    let provider = sanitize_filename_component(provider);
+    let model_name = sanitize_filename_component(model_name);
+    let stage = sanitize_filename_component(stage);
+    let mode = if pending_order_mode {
+        "pending_management"
+    } else if management_mode {
+        "management"
+    } else {
+        "entry"
+    };
+    Path::new(TEMP_MODEL_INPUT_DIR).join(format!(
+        "{}_{}_{}_{}_{}_{}_{}_prompt_input_{}.json",
+        bucket_ts, symbol, mode, trigger, provider, model_name, stage, invoke_ts
     ))
 }
 
@@ -6009,6 +6183,7 @@ fn print_entry_stage_trace(
         let label = match event.get("stage").and_then(Value::as_str) {
             Some("scan") => "ENTRY_SCAN",
             Some("finalize") => "ENTRY_FINALIZE",
+            Some("finalize_skipped") => "ENTRY_FINALIZE_SKIPPED",
             _ => "ENTRY_STAGE",
         };
         println!(

@@ -151,7 +151,15 @@ pub struct ModelCallOutput {
     pub parsed_decision: Option<Value>,
     pub validation_warning: Option<String>,
     pub entry_stage_trace: Option<Vec<Value>>,
+    pub entry_stage_prompt_inputs: Option<Vec<EntryStagePromptInputCapture>>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EntryStagePromptInputCapture {
+    pub stage: String,
+    pub prompt_input: Value,
+    pub stage_1_setup_scan_json: Option<Value>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -161,6 +169,7 @@ struct ProviderTrace {
     provider_finish_reason: Option<String>,
     provider_usage: Option<Value>,
     entry_stage_trace: Vec<Value>,
+    entry_stage_prompt_inputs: Vec<EntryStagePromptInputCapture>,
 }
 
 #[derive(Debug)]
@@ -189,11 +198,35 @@ impl ProviderTrace {
         self
     }
 
+    fn push_entry_stage_prompt_input(&mut self, capture: EntryStagePromptInputCapture) {
+        self.entry_stage_prompt_inputs.push(capture);
+    }
+
+    fn prepend_entry_stage_prompt_inputs(
+        mut self,
+        captures: &[EntryStagePromptInputCapture],
+    ) -> Self {
+        if !captures.is_empty() {
+            let mut combined = captures.to_vec();
+            combined.extend(self.entry_stage_prompt_inputs);
+            self.entry_stage_prompt_inputs = combined;
+        }
+        self
+    }
+
     fn output_entry_stage_trace(&self) -> Option<Vec<Value>> {
         if self.entry_stage_trace.is_empty() {
             None
         } else {
             Some(self.entry_stage_trace.clone())
+        }
+    }
+
+    fn output_entry_stage_prompt_inputs(&self) -> Option<Vec<EntryStagePromptInputCapture>> {
+        if self.entry_stage_prompt_inputs.is_empty() {
+            None
+        } else {
+            Some(self.entry_stage_prompt_inputs.clone())
         }
     }
 }
@@ -218,6 +251,18 @@ fn build_entry_scan_trace_event(
     })
 }
 
+fn build_entry_finalize_skipped_trace_event(reason: &str, scan_value: &Value) -> Value {
+    json!({
+        "stage": "finalize_skipped",
+        "reason": reason,
+        "scan_decision": scan_value.get("decision").and_then(Value::as_str).unwrap_or("UNKNOWN"),
+    })
+}
+
+// Codes that are injected at serialization time and are never present in input.indicators.
+// Exclude these from the "missing" report so the model does not think they are unavailable.
+const INJECTED_INDICATOR_CODES: &[&str] = &["pre_computed_v", "pre_computed_management_state"];
+
 fn build_entry_finalize_trace_event(input: &ModelInvocationInput, prior_scan: &Value) -> Value {
     let indicators = input.indicators.as_object();
     let selected_indicator_codes = finalize_indicator_codes_for_scan(prior_scan)
@@ -227,6 +272,9 @@ fn build_entry_finalize_trace_event(input: &ModelInvocationInput, prior_scan: &V
     let missing_selected_indicator_codes = selected_indicator_codes
         .iter()
         .filter(|code| {
+            if INJECTED_INDICATOR_CODES.contains(&code.as_str()) {
+                return false; // always injected at serialization time — never truly missing
+            }
             indicators
                 .map(|obj| !obj.contains_key(code.as_str()))
                 .unwrap_or(true)
@@ -256,7 +304,10 @@ fn build_entry_finalize_trace_event(input: &ModelInvocationInput, prior_scan: &V
         "hypothesis": prior_scan.pointer("/scan/hypothesis").cloned().unwrap_or(Value::Null),
         "entry_style": prior_scan.pointer("/scan/entry_style").cloned().unwrap_or(Value::Null),
         "candidate_zone": prior_scan.pointer("/scan/candidate_zone").cloned().unwrap_or(Value::Null),
+        "entry_ladder": prior_scan.pointer("/scan/entry_ladder").cloned().unwrap_or(Value::Null),
         "target_zone": prior_scan.pointer("/scan/target_zone").cloned().unwrap_or(Value::Null),
+        "target_ladder": prior_scan.pointer("/scan/target_ladder").cloned().unwrap_or(Value::Null),
+        "stop_ladder": prior_scan.pointer("/scan/stop_ladder").cloned().unwrap_or(Value::Null),
         "invalidation_basis": invalidation_basis,
         "invalidation": prior_scan.pointer("/scan/invalidation").cloned().unwrap_or(Value::Null),
         "stop_model_hint": prior_scan.pointer("/scan/stop_model_hint").cloned().unwrap_or(Value::Null),
@@ -270,13 +321,32 @@ fn is_entry_mode(input: &ModelInvocationInput) -> bool {
     !input.management_mode && !input.pending_order_mode
 }
 
+fn provider_trace_with_prompt_input_capture(
+    capture: Option<EntryStagePromptInputCapture>,
+) -> ProviderTrace {
+    let mut trace = ProviderTrace::default();
+    if let Some(capture) = capture {
+        trace.push_entry_stage_prompt_input(capture);
+    }
+    trace
+}
+
+struct BuiltPromptPair {
+    system: String,
+    user: String,
+    prompt_input_capture: Option<EntryStagePromptInputCapture>,
+}
+
 fn build_prompt_pair(
     input: &ModelInvocationInput,
     prompt_template: &str,
     entry_stage: prompt::EntryPromptStage,
     prior_scan: Option<&Value>,
-) -> Result<(String, String), ProviderFailure> {
+) -> Result<BuiltPromptPair, ProviderFailure> {
     let input_json = serialize_prompt_input_minified(input, entry_stage, prior_scan)
+        .map_err(provider_failure_plain)?;
+    let prompt_input = serde_json::from_str::<Value>(&input_json)
+        .context("parse serialized prompt input json")
         .map_err(provider_failure_plain)?;
     let system = prompt::system_prompt(
         input.management_mode,
@@ -301,7 +371,24 @@ fn build_prompt_pair(
         user.push_str("\n\nSTAGE_1_SETUP_SCAN_JSON:\n");
         user.push_str(&scan_json);
     }
-    Ok((system, user))
+    let prompt_input_capture = if is_entry_mode(input) {
+        Some(EntryStagePromptInputCapture {
+            stage: entry_stage_name(entry_stage).to_string(),
+            prompt_input,
+            stage_1_setup_scan_json: if matches!(entry_stage, prompt::EntryPromptStage::Finalize) {
+                prior_scan.cloned()
+            } else {
+                None
+            },
+        })
+    } else {
+        None
+    };
+    Ok(BuiltPromptPair {
+        system,
+        user,
+        prompt_input_capture,
+    })
 }
 
 fn serialize_prompt_input_minified(
@@ -320,9 +407,15 @@ fn serialize_entry_finalize_input_minified(
     input: &ModelInvocationInput,
     prior_scan: &Value,
 ) -> Result<String> {
-    let indicators = input
-        .indicators
-        .as_object()
+    // Build a mutable copy of the full input value so we can inject pre-computed fields
+    // before selecting the finalize subset. inject_precomputed_v writes into this value,
+    // not into `input.indicators` directly, so we must run injection here too.
+    let mut full_value = serde_json::to_value(input).context("serialize finalize full value")?;
+    inject_precomputed_v(&mut full_value);
+
+    let indicators = full_value
+        .pointer("/indicators")
+        .and_then(|v| v.as_object())
         .ok_or_else(|| anyhow!("entry finalize indicators must be an object"))?;
     let selected_codes = finalize_indicator_codes_for_scan(prior_scan);
     let reduced = selected_codes
@@ -368,6 +461,70 @@ fn extract_scan_primary_strategy(scan: &Value) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+fn is_scan_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn scan_references_indicator_code(scan_text: &str, code: &str) -> bool {
+    let haystack = scan_text.to_ascii_lowercase();
+    let needle = code.to_ascii_lowercase();
+
+    haystack.match_indices(&needle).any(|(idx, _)| {
+        let before = haystack[..idx].chars().next_back();
+        let after = haystack[idx + needle.len()..].chars().next();
+        let before_ok = before.map_or(true, |ch| !is_scan_identifier_char(ch));
+        let after_ok = after.map_or(true, |ch| !is_scan_identifier_char(ch));
+        before_ok && after_ok
+    })
+}
+
+fn scan_stop_model_hint(scan: &Value) -> Option<&str> {
+    scan.pointer("/scan/stop_model_hint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn referenced_finalize_indicator_codes(scan: &Value) -> Vec<&'static str> {
+    let scan_text = match serde_json::to_string(scan) {
+        Ok(text) => text,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut codes = vec![];
+    for code in [
+        "orderbook_depth",
+        "liquidation_density",
+        "absorption",
+        "bullish_absorption",
+        "bearish_absorption",
+        "buying_exhaustion",
+        "selling_exhaustion",
+        "fvg",
+        "divergence",
+        "whale_trades",
+        "high_volume_pulse",
+        "ema_trend_regime",
+        "initiation",
+        "bullish_initiation",
+        "bearish_initiation",
+        "vpin",
+    ] {
+        if scan_references_indicator_code(&scan_text, code) {
+            codes.push(code);
+        }
+    }
+
+    if matches!(
+        scan_stop_model_hint(scan),
+        Some("Limit Order Penetration Stop")
+    ) {
+        codes.push("orderbook_depth");
+    }
+
+    codes
+}
+
 fn finalize_indicator_codes_for_scan(scan: &Value) -> Vec<&'static str> {
     let mut codes = vec![
         "core_price_anchors",
@@ -376,6 +533,9 @@ fn finalize_indicator_codes_for_scan(scan: &Value) -> Vec<&'static str> {
         "cvd_pack",
         "avwap",
         "kline_history",
+        "pre_computed_v", // always included: required for V-based geometry checks in finalize
+        "tpo_market_profile",
+        "rvwap_sigma_bands",
     ];
 
     match extract_scan_primary_strategy(scan).unwrap_or("UNKNOWN") {
@@ -385,34 +545,22 @@ fn finalize_indicator_codes_for_scan(scan: &Value) -> Vec<&'static str> {
             "absorption",
             "liquidation_density",
             "fvg",
-            "vpin",
         ]),
         "Delta Divergence Reversal" => {
-            codes.extend(["divergence", "whale_trades", "vpin", "liquidation_density"])
+            codes.extend(["divergence", "whale_trades", "liquidation_density"])
         }
-        "DOM Liquidity Wall" => codes.extend(["orderbook_depth", "liquidation_density", "vpin"]),
-        "Unfinished Auction Target" => {
-            codes.extend(["tpo_market_profile", "liquidation_density", "fvg"])
-        }
+        "DOM Liquidity Wall" => codes.extend(["orderbook_depth", "liquidation_density"]),
+        "Unfinished Auction Target" => codes.extend(["liquidation_density", "fvg"]),
         "Trapped Traders Squeeze" => codes.extend([
             "buying_exhaustion",
             "selling_exhaustion",
             "whale_trades",
             "liquidation_density",
-            "vpin",
         ]),
-        "Value Area Re-fill" => codes.extend([
-            "tpo_market_profile",
-            "rvwap_sigma_bands",
-            "vpin",
-            "liquidation_density",
-        ]),
-        "Spot-Led Flow Continuation" => codes.extend([
-            "whale_trades",
-            "ema_trend_regime",
-            "high_volume_pulse",
-            "vpin",
-        ]),
+        "Value Area Re-fill" => codes.extend(["liquidation_density"]),
+        "Spot-Led Flow Continuation" => {
+            codes.extend(["whale_trades", "ema_trend_regime", "high_volume_pulse"])
+        }
         "Spot-Confirmed Hidden Divergence" => codes.extend([
             "divergence",
             "whale_trades",
@@ -430,35 +578,26 @@ fn finalize_indicator_codes_for_scan(scan: &Value) -> Vec<&'static str> {
             "selling_exhaustion",
             "high_volume_pulse",
             "whale_trades",
-            "vpin",
         ]),
-        "Dual-Market AVWAP Z-Score" => codes.extend([
-            "rvwap_sigma_bands",
-            "tpo_market_profile",
-            "ema_trend_regime",
-            "vpin",
-            "fvg",
-        ]),
+        "Dual-Market AVWAP Z-Score" => codes.extend(["ema_trend_regime", "fvg"]),
         "NO_SETUP" | "UNKNOWN" => codes.extend([
             "liquidation_density",
             "orderbook_depth",
             "divergence",
             "whale_trades",
-            "vpin",
         ]),
         _ => codes.extend([
             "liquidation_density",
             "orderbook_depth",
             "divergence",
             "whale_trades",
-            "vpin",
             "fvg",
             "ema_trend_regime",
-            "tpo_market_profile",
-            "rvwap_sigma_bands",
             "high_volume_pulse",
         ]),
     }
+
+    codes.extend(referenced_finalize_indicator_codes(scan));
 
     let mut seen = std::collections::BTreeSet::new();
     codes.retain(|code| seen.insert(*code));
@@ -475,6 +614,69 @@ fn parse_entry_scan_output(
         .ok_or_else(|| provider_failure_plain(anyhow!("entry scan output is not valid JSON")))?;
     validate_entry_scan_output(&value, prompt_template).map_err(provider_failure_plain)?;
     Ok(value)
+}
+
+fn entry_scan_decision(scan: &Value) -> Option<&str> {
+    scan.get("decision")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn scan_requires_entry_finalize(scan: &Value) -> bool {
+    !matches!(
+        entry_scan_decision(scan),
+        Some(decision) if decision.eq_ignore_ascii_case(prompt::DECISION_NO_TRADE)
+    )
+}
+
+fn build_entry_finalize_skipped_no_trade_raw(scan: &Value) -> String {
+    let scan_reason = scan
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let reason = match scan_reason {
+        Some(reason) => format!(
+            "Stage 1 returned NO_TRADE, so finalize was skipped. {}",
+            reason
+        ),
+        None => "Stage 1 returned NO_TRADE, so finalize was skipped.".to_string(),
+    };
+    json!({
+        "decision": prompt::DECISION_NO_TRADE,
+        "params": {
+            "entry": Value::Null,
+            "tp": Value::Null,
+            "sl": Value::Null,
+            "leverage": Value::Null,
+            "rr": Value::Null,
+            "horizon": Value::Null,
+        },
+        "reason": reason,
+    })
+    .to_string()
+}
+
+fn maybe_short_circuit_entry_finalize(
+    provider: &str,
+    scan: &ProviderSuccess,
+    scan_value: &Value,
+) -> Option<ProviderSuccess> {
+    if scan_requires_entry_finalize(scan_value) {
+        return None;
+    }
+
+    let scan_event = build_entry_scan_trace_event(provider, &scan.raw_text, Some(scan_value));
+    let finalize_skipped_event =
+        build_entry_finalize_skipped_trace_event("scan_decision_no_trade", scan_value);
+    Some(ProviderSuccess {
+        raw_text: build_entry_finalize_skipped_no_trade_raw(scan_value),
+        trace: scan
+            .trace
+            .clone()
+            .prepend_entry_stage_events(&[scan_event, finalize_skipped_event]),
+    })
 }
 
 fn validate_entry_scan_output(value: &Value, prompt_template: &str) -> Result<()> {
@@ -504,7 +706,10 @@ fn validate_entry_scan_output(value: &Value, prompt_template: &str) -> Result<()
             "conviction",
             "entry_style",
             "candidate_zone",
+            "entry_ladder",
             "target_zone",
+            "target_ladder",
+            "stop_ladder",
             "invalidation",
         ]
     } else {
@@ -514,7 +719,10 @@ fn validate_entry_scan_output(value: &Value, prompt_template: &str) -> Result<()
             "order_flow_bias",
             "entry_style",
             "candidate_zone",
+            "entry_ladder",
             "target_zone",
+            "target_ladder",
+            "stop_ladder",
             "invalidation_basis",
             "stop_model_hint",
             "key_signals",
@@ -524,6 +732,72 @@ fn validate_entry_scan_output(value: &Value, prompt_template: &str) -> Result<()
     for key in required_keys {
         if !scan.contains_key(*key) {
             return Err(anyhow!("entry scan.scan.{} is missing", key));
+        }
+    }
+    for key in ["entry_ladder", "target_ladder", "stop_ladder"] {
+        validate_entry_scan_ladder(
+            scan.get(key)
+                .ok_or_else(|| anyhow!("entry scan.scan.{} is missing", key))?,
+            key,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_entry_scan_ladder(value: &Value, field_name: &str) -> Result<()> {
+    let ladder = value
+        .as_array()
+        .ok_or_else(|| anyhow!("entry scan.scan.{} must be an array", field_name))?;
+    for (idx, item) in ladder.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow!("entry scan.scan.{}[{}] must be an object", field_name, idx))?;
+        for key in ["price", "label", "anchor_field", "role", "skip_reason"] {
+            if !obj.contains_key(key) {
+                return Err(anyhow!(
+                    "entry scan.scan.{}[{}].{} is missing",
+                    field_name,
+                    idx,
+                    key
+                ));
+            }
+        }
+        let price = obj
+            .get("price")
+            .ok_or_else(|| anyhow!("entry scan.scan.{}[{}].price is missing", field_name, idx))?;
+        if !(price.is_null() || price.is_number()) {
+            return Err(anyhow!(
+                "entry scan.scan.{}[{}].price must be number|null",
+                field_name,
+                idx
+            ));
+        }
+        for key in ["label", "anchor_field", "role"] {
+            let field = obj.get(key).ok_or_else(|| {
+                anyhow!("entry scan.scan.{}[{}].{} is missing", field_name, idx, key)
+            })?;
+            if !field.is_string() {
+                return Err(anyhow!(
+                    "entry scan.scan.{}[{}].{} must be string",
+                    field_name,
+                    idx,
+                    key
+                ));
+            }
+        }
+        let skip_reason = obj.get("skip_reason").ok_or_else(|| {
+            anyhow!(
+                "entry scan.scan.{}[{}].skip_reason is missing",
+                field_name,
+                idx
+            )
+        })?;
+        if !(skip_reason.is_null() || skip_reason.is_string()) {
+            return Err(anyhow!(
+                "entry scan.scan.{}[{}].skip_reason must be string|null",
+                field_name,
+                idx
+            ));
         }
     }
     Ok(())
@@ -603,6 +877,7 @@ pub async fn invoke_models(
             parsed_decision: None,
             validation_warning: None,
             entry_stage_trace: None,
+            entry_stage_prompt_inputs: None,
             error: Some("no enabled model matches llm.default_model".to_string()),
         }];
     }
@@ -709,6 +984,7 @@ async fn invoke_one_model(
                     }
                 });
             let entry_stage_trace = trace.output_entry_stage_trace();
+            let entry_stage_prompt_inputs = trace.output_entry_stage_prompt_inputs();
             ModelCallOutput {
                 model_name,
                 provider,
@@ -722,12 +998,14 @@ async fn invoke_one_model(
                 parsed_decision,
                 validation_warning,
                 entry_stage_trace,
+                entry_stage_prompt_inputs,
                 error: None,
             }
         }
         Err(failure) => {
             let ProviderFailure { error, trace } = failure;
             let entry_stage_trace = trace.output_entry_stage_trace();
+            let entry_stage_prompt_inputs = trace.output_entry_stage_prompt_inputs();
             ModelCallOutput {
                 model_name,
                 provider,
@@ -741,6 +1019,7 @@ async fn invoke_one_model(
                 parsed_decision: None,
                 validation_warning: None,
                 entry_stage_trace,
+                entry_stage_prompt_inputs,
                 error: Some(format!("{:#}", error)),
             }
         }
@@ -800,7 +1079,14 @@ async fn invoke_qwen_entry_two_stage(
                 trace,
             }
         })?;
+    if let Some(short_circuit) = maybe_short_circuit_entry_finalize("qwen", &scan, &scan_value) {
+        return Ok(short_circuit);
+    }
     let scan_event = build_entry_scan_trace_event("qwen", &scan.raw_text, Some(&scan_value));
+    let scan_prompt_inputs = scan
+        .trace
+        .output_entry_stage_prompt_inputs()
+        .unwrap_or_default();
     let finalize_event = build_entry_finalize_trace_event(input, &scan_value);
     let finalize = invoke_qwen_stage(
         http_client,
@@ -816,14 +1102,16 @@ async fn invoke_qwen_entry_two_stage(
         error: failure.error,
         trace: failure
             .trace
-            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()]),
+            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()])
+            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })?;
 
     Ok(ProviderSuccess {
         raw_text: finalize.raw_text,
         trace: finalize
             .trace
-            .prepend_entry_stage_events(&[scan_event, finalize_event]),
+            .prepend_entry_stage_events(&[scan_event, finalize_event])
+            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })
 }
 
@@ -848,9 +1136,13 @@ async fn invoke_qwen_stage(
         entry_stage,
         prompt_template,
     );
-    let (mut system_prompt, user_prompt) =
-        build_prompt_pair(input, prompt_template, entry_stage, prior_scan)?;
-    system_prompt.push_str(&qwen_output_contract(
+    let BuiltPromptPair {
+        mut system,
+        user,
+        prompt_input_capture,
+    } = build_prompt_pair(input, prompt_template, entry_stage, prior_scan)?;
+    let trace = provider_trace_with_prompt_input_capture(prompt_input_capture);
+    system.push_str(&qwen_output_contract(
         input.management_mode,
         input.pending_order_mode,
         entry_stage,
@@ -863,11 +1155,11 @@ async fn invoke_qwen_stage(
         messages: vec![
             QwenChatMessage {
                 role: "system".to_string(),
-                content: system_prompt,
+                content: system,
             },
             QwenChatMessage {
                 role: "user".to_string(),
-                content: user_prompt,
+                content: user,
             },
         ],
         response_format,
@@ -894,23 +1186,32 @@ async fn invoke_qwen_stage(
         .send()
         .await
         .context("call qwen chat completions api")
-        .map_err(provider_failure_plain)?;
+        .map_err(|error| ProviderFailure {
+            error,
+            trace: trace.clone(),
+        })?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(provider_failure_plain(anyhow!(
-            "qwen chat completions failed status={} body={}",
-            status,
-            body
-        )));
+        return Err(ProviderFailure {
+            error: anyhow!(
+                "qwen chat completions failed status={} body={}",
+                status,
+                body
+            ),
+            trace,
+        });
     }
 
     let body: QwenChatCompletionsResponse = response
         .json()
         .await
         .context("decode qwen chat completions response body")
-        .map_err(provider_failure_plain)?;
+        .map_err(|error| ProviderFailure {
+            error,
+            trace: trace.clone(),
+        })?;
 
     let text = body
         .choices
@@ -918,14 +1219,15 @@ async fn invoke_qwen_stage(
         .map(|c| c.message.content.trim().to_string())
         .unwrap_or_default();
     if text.is_empty() {
-        return Err(provider_failure_plain(anyhow!(
-            "qwen chat completions response text is empty"
-        )));
+        return Err(ProviderFailure {
+            error: anyhow!("qwen chat completions response text is empty"),
+            trace,
+        });
     }
 
     Ok(ProviderSuccess {
         raw_text: text,
-        trace: ProviderTrace::default(),
+        trace,
     })
 }
 
@@ -988,7 +1290,16 @@ async fn invoke_custom_llm_entry_two_stage(
                 trace,
             }
         })?;
+    if let Some(short_circuit) =
+        maybe_short_circuit_entry_finalize("custom_llm", &scan, &scan_value)
+    {
+        return Ok(short_circuit);
+    }
     let scan_event = build_entry_scan_trace_event("custom_llm", &scan.raw_text, Some(&scan_value));
+    let scan_prompt_inputs = scan
+        .trace
+        .output_entry_stage_prompt_inputs()
+        .unwrap_or_default();
     let finalize_event = build_entry_finalize_trace_event(input, &scan_value);
     let finalize = invoke_custom_llm_stage(
         http_client,
@@ -1004,14 +1315,16 @@ async fn invoke_custom_llm_entry_two_stage(
         error: failure.error,
         trace: failure
             .trace
-            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()]),
+            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()])
+            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })?;
 
     Ok(ProviderSuccess {
         raw_text: finalize.raw_text,
         trace: finalize
             .trace
-            .prepend_entry_stage_events(&[scan_event, finalize_event]),
+            .prepend_entry_stage_events(&[scan_event, finalize_event])
+            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })
 }
 
@@ -1029,8 +1342,12 @@ async fn invoke_custom_llm_stage(
     } else {
         model.model.clone()
     };
-    let (system_prompt, user_prompt) =
-        build_prompt_pair(input, prompt_template, entry_stage, prior_scan)?;
+    let BuiltPromptPair {
+        system,
+        user,
+        prompt_input_capture,
+    } = build_prompt_pair(input, prompt_template, entry_stage, prior_scan)?;
+    let trace = provider_trace_with_prompt_input_capture(prompt_input_capture);
     let req = QwenChatCompletionsRequest {
         model: resolved_model,
         temperature: model.temperature,
@@ -1038,11 +1355,11 @@ async fn invoke_custom_llm_stage(
         messages: vec![
             QwenChatMessage {
                 role: "system".to_string(),
-                content: system_prompt,
+                content: system,
             },
             QwenChatMessage {
                 role: "user".to_string(),
-                content: user_prompt,
+                content: user,
             },
         ],
         response_format: Some(custom_llm_json_schema_response_format(
@@ -1064,23 +1381,32 @@ async fn invoke_custom_llm_stage(
         .send()
         .await
         .context("call custom_llm chat completions api")
-        .map_err(provider_failure_plain)?;
+        .map_err(|error| ProviderFailure {
+            error,
+            trace: trace.clone(),
+        })?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(provider_failure_plain(anyhow!(
-            "custom_llm chat completions failed status={} body={}",
-            status,
-            body
-        )));
+        return Err(ProviderFailure {
+            error: anyhow!(
+                "custom_llm chat completions failed status={} body={}",
+                status,
+                body
+            ),
+            trace,
+        });
     }
 
     let body: QwenChatCompletionsResponse = response
         .json()
         .await
         .context("decode custom_llm chat completions response body")
-        .map_err(provider_failure_plain)?;
+        .map_err(|error| ProviderFailure {
+            error,
+            trace: trace.clone(),
+        })?;
 
     let text = body
         .choices
@@ -1088,14 +1414,15 @@ async fn invoke_custom_llm_stage(
         .map(|c| c.message.content.trim().to_string())
         .unwrap_or_default();
     if text.is_empty() {
-        return Err(provider_failure_plain(anyhow!(
-            "custom_llm chat completions response text is empty"
-        )));
+        return Err(ProviderFailure {
+            error: anyhow!("custom_llm chat completions response text is empty"),
+            trace,
+        });
     }
 
     Ok(ProviderSuccess {
         raw_text: text,
-        trace: ProviderTrace::default(),
+        trace,
     })
 }
 
@@ -1228,6 +1555,49 @@ fn is_medium_large(prompt_template: &str) -> bool {
         .eq_ignore_ascii_case("medium_large_opportunity")
 }
 
+fn scan_target_ladder_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["price", "label", "anchor_field", "role", "skip_reason"],
+            "properties": {
+                "price": { "type": ["number", "null"] },
+                "label": { "type": "string" },
+                "anchor_field": { "type": "string" },
+                "role": { "type": "string" },
+                "skip_reason": { "type": ["string", "null"] }
+            }
+        }
+    })
+}
+
+fn scan_ladder_schema() -> Value {
+    scan_target_ladder_schema()
+}
+
+fn gemini_scan_target_ladder_schema() -> Value {
+    json!({
+        "type": "ARRAY",
+        "items": {
+            "type": "OBJECT",
+            "properties": {
+                "price": { "type": "NUMBER", "nullable": true },
+                "label": { "type": "STRING" },
+                "anchor_field": { "type": "STRING" },
+                "role": { "type": "STRING" },
+                "skip_reason": { "type": "STRING", "nullable": true }
+            },
+            "required": ["price", "label", "anchor_field", "role", "skip_reason"]
+        }
+    })
+}
+
+fn gemini_scan_ladder_schema() -> Value {
+    gemini_scan_target_ladder_schema()
+}
+
 fn qwen_output_contract(
     management_mode: bool,
     pending_order_mode: bool,
@@ -1240,9 +1610,9 @@ fn qwen_output_contract(
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must be `decision`, `reason`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- Allowed management decisions: CLOSE, ADD, REDUCE, HOLD, MODIFY_TPSL.\n".to_string()
     } else if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
         if is_medium_large(prompt_template) {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string.\n- Top-level keys must be `decision`, `reason`, and `scan`.\n- Allowed entry scan decisions: LONG, SHORT, NO_TRADE.\n- `scan` must include: primary_strategy, market_story, hypothesis, conviction, entry_style, candidate_zone, target_zone, invalidation.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string.\n- Top-level keys must be `decision`, `reason`, and `scan`.\n- Allowed entry scan decisions: LONG, SHORT, NO_TRADE.\n- `scan` must include: primary_strategy, market_story, hypothesis, conviction, entry_style, candidate_zone, entry_ladder, target_zone, target_ladder, stop_ladder, invalidation.\n".to_string()
         } else {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string.\n- Top-level keys must be `decision`, `reason`, and `scan`.\n- Allowed entry scan decisions: LONG, SHORT, NO_TRADE.\n- `scan` must include: primary_strategy, setup_quality, order_flow_bias, entry_style, candidate_zone, target_zone, invalidation_basis, stop_model_hint, key_signals, risk_flags.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string.\n- Top-level keys must be `decision`, `reason`, and `scan`.\n- Allowed entry scan decisions: LONG, SHORT, NO_TRADE.\n- `scan` must include: primary_strategy, setup_quality, order_flow_bias, entry_style, candidate_zone, entry_ladder, target_zone, target_ladder, stop_ladder, invalidation_basis, stop_model_hint, key_signals, risk_flags.\n".to_string()
         }
     } else {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must be `decision`, `reason`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, `rr`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, `params.rr`, and `params.horizon` to null.\n".to_string()
@@ -1392,12 +1762,20 @@ fn qwen_entry_scan_response_schema() -> Value {
                     "order_flow_bias",
                     "entry_style",
                     "candidate_zone",
+                    "entry_ladder",
                     "target_zone",
+                    "target_ladder",
+                    "stop_ladder",
                     "invalidation_basis",
                     "stop_model_hint",
                     "key_signals",
                     "risk_flags"
-                ]
+                ],
+                "properties": {
+                    "entry_ladder": scan_ladder_schema(),
+                    "target_ladder": scan_ladder_schema(),
+                    "stop_ladder": scan_ladder_schema()
+                }
             }
         }
     })
@@ -1456,7 +1834,10 @@ fn custom_llm_entry_scan_response_schema() -> Value {
                     "order_flow_bias",
                     "entry_style",
                     "candidate_zone",
+                    "entry_ladder",
                     "target_zone",
+                    "target_ladder",
+                    "stop_ladder",
                     "invalidation_basis",
                     "stop_model_hint",
                     "key_signals",
@@ -1468,7 +1849,10 @@ fn custom_llm_entry_scan_response_schema() -> Value {
                     "order_flow_bias": {"type": "string"},
                     "entry_style": {"type": ["string", "null"]},
                     "candidate_zone": {"type": ["string", "null"]},
+                    "entry_ladder": scan_ladder_schema(),
                     "target_zone": {"type": ["string", "null"]},
+                    "target_ladder": scan_ladder_schema(),
+                    "stop_ladder": scan_ladder_schema(),
                     "invalidation_basis": {"type": ["string", "null"]},
                     "stop_model_hint": {"type": ["string", "null"]},
                     "key_signals": {"type": "string"},
@@ -1716,7 +2100,14 @@ async fn invoke_gemini_entry_two_stage(
                 trace,
             }
         })?;
+    if let Some(short_circuit) = maybe_short_circuit_entry_finalize("gemini", &scan, &scan_value) {
+        return Ok(short_circuit);
+    }
     let scan_event = build_entry_scan_trace_event("gemini", &scan.raw_text, Some(&scan_value));
+    let scan_prompt_inputs = scan
+        .trace
+        .output_entry_stage_prompt_inputs()
+        .unwrap_or_default();
     let finalize_event = build_entry_finalize_trace_event(input, &scan_value);
     let finalize = if model.should_use_openrouter() {
         invoke_gemini_via_openrouter(
@@ -1745,14 +2136,16 @@ async fn invoke_gemini_entry_two_stage(
         error: failure.error,
         trace: failure
             .trace
-            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()]),
+            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()])
+            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })?;
 
     Ok(ProviderSuccess {
         raw_text: finalize.raw_text,
         trace: finalize
             .trace
-            .prepend_entry_stage_events(&[scan_event, finalize_event]),
+            .prepend_entry_stage_events(&[scan_event, finalize_event])
+            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })
 }
 
@@ -1765,7 +2158,12 @@ async fn invoke_gemini_direct(
     entry_stage: prompt::EntryPromptStage,
     prior_scan: Option<&Value>,
 ) -> Result<ProviderSuccess, ProviderFailure> {
-    let (system, user) = build_prompt_pair(input, prompt_template, entry_stage, prior_scan)?;
+    let BuiltPromptPair {
+        system,
+        user,
+        prompt_input_capture,
+    } = build_prompt_pair(input, prompt_template, entry_stage, prior_scan)?;
+    let mut trace = provider_trace_with_prompt_input_capture(prompt_input_capture);
 
     let model_id = if model.model.trim().is_empty() {
         gemini_cfg.model.clone()
@@ -1777,7 +2175,10 @@ async fn invoke_gemini_direct(
     let endpoint = format!("{}/{}:generateContent", base, gemini_model_path(&model_id));
     let mut url = reqwest::Url::parse(&endpoint)
         .context("parse gemini generateContent url")
-        .map_err(provider_failure_plain)?;
+        .map_err(|error| ProviderFailure {
+            error,
+            trace: trace.clone(),
+        })?;
     url.query_pairs_mut()
         .append_pair("key", &gemini_cfg.resolved_api_key());
 
@@ -1808,23 +2209,32 @@ async fn invoke_gemini_direct(
         .send()
         .await
         .context("call gemini generateContent api")
-        .map_err(provider_failure_plain)?;
+        .map_err(|error| ProviderFailure {
+            error,
+            trace: trace.clone(),
+        })?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(provider_failure_plain(anyhow!(
-            "gemini generateContent failed status={} body={}",
-            status,
-            body
-        )));
+        return Err(ProviderFailure {
+            error: anyhow!(
+                "gemini generateContent failed status={} body={}",
+                status,
+                body
+            ),
+            trace,
+        });
     }
 
     let body: GeminiGenerateContentResponse = response
         .json()
         .await
         .context("decode gemini generateContent response body")
-        .map_err(provider_failure_plain)?;
+        .map_err(|error| ProviderFailure {
+            error,
+            trace: trace.clone(),
+        })?;
 
     let finish_reason = body
         .candidates
@@ -1842,18 +2252,17 @@ async fn invoke_gemini_direct(
         .collect::<Vec<_>>()
         .join("\n");
     if text.is_empty() {
-        return Err(provider_failure_plain(anyhow!(
-            "gemini generateContent response text is empty"
-        )));
+        return Err(ProviderFailure {
+            error: anyhow!("gemini generateContent response text is empty"),
+            trace,
+        });
     }
 
+    trace.provider_finish_reason = finish_reason;
+    trace.provider_usage = body.usage_metadata;
     Ok(ProviderSuccess {
         raw_text: text,
-        trace: ProviderTrace {
-            provider_finish_reason: finish_reason,
-            provider_usage: body.usage_metadata,
-            ..ProviderTrace::default()
-        },
+        trace,
     })
 }
 
@@ -1866,8 +2275,12 @@ async fn invoke_gemini_via_openrouter(
     entry_stage: prompt::EntryPromptStage,
     prior_scan: Option<&Value>,
 ) -> Result<ProviderSuccess, ProviderFailure> {
-    let (system_prompt, user_prompt) =
-        build_prompt_pair(input, prompt_template, entry_stage, prior_scan)?;
+    let BuiltPromptPair {
+        system,
+        user,
+        prompt_input_capture,
+    } = build_prompt_pair(input, prompt_template, entry_stage, prior_scan)?;
+    let mut trace = provider_trace_with_prompt_input_capture(prompt_input_capture);
     let req = OpenRouterChatCompletionsRequest {
         model: openrouter_gemini_model_name(&model.model),
         temperature: model.temperature,
@@ -1880,13 +2293,13 @@ async fn invoke_gemini_via_openrouter(
                 // ideal candidate for provider-side prompt caching (≥1024 tokens threshold).
                 content: json!([{
                     "type": "text",
-                    "text": system_prompt,
+                    "text": system,
                     "cache_control": {"type": "ephemeral"}
                 }]),
             },
             OpenRouterChatMessage {
                 role: "user".to_string(),
-                content: Value::String(user_prompt),
+                content: Value::String(user),
             },
         ],
         reasoning: Some(OpenRouterReasoning { enabled: true }),
@@ -1910,23 +2323,32 @@ async fn invoke_gemini_via_openrouter(
         .send()
         .await
         .context("call openrouter chat completions api")
-        .map_err(provider_failure_plain)?;
+        .map_err(|error| ProviderFailure {
+            error,
+            trace: trace.clone(),
+        })?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(provider_failure_plain(anyhow!(
-            "openrouter chat completions failed status={} body={}",
-            status,
-            body
-        )));
+        return Err(ProviderFailure {
+            error: anyhow!(
+                "openrouter chat completions failed status={} body={}",
+                status,
+                body
+            ),
+            trace,
+        });
     }
 
     let body: OpenRouterChatCompletionsResponse = response
         .json()
         .await
         .context("decode openrouter chat completions response body")
-        .map_err(provider_failure_plain)?;
+        .map_err(|error| ProviderFailure {
+            error,
+            trace: trace.clone(),
+        })?;
 
     let finish_reason = body
         .choices
@@ -1941,18 +2363,17 @@ async fn invoke_gemini_via_openrouter(
         .collect::<Vec<_>>()
         .join("\n");
     if text.trim().is_empty() {
-        return Err(provider_failure_plain(anyhow!(
-            "openrouter chat completions response text is empty"
-        )));
+        return Err(ProviderFailure {
+            error: anyhow!("openrouter chat completions response text is empty"),
+            trace,
+        });
     }
 
+    trace.provider_finish_reason = finish_reason;
+    trace.provider_usage = body.usage;
     Ok(ProviderSuccess {
         raw_text: text,
-        trace: ProviderTrace {
-            provider_finish_reason: finish_reason,
-            provider_usage: body.usage,
-            ..ProviderTrace::default()
-        },
+        trace,
     })
 }
 
@@ -2009,7 +2430,14 @@ async fn invoke_grok_entry_two_stage(
                 trace,
             }
         })?;
+    if let Some(short_circuit) = maybe_short_circuit_entry_finalize("grok", &scan, &scan_value) {
+        return Ok(short_circuit);
+    }
     let scan_event = build_entry_scan_trace_event("grok", &scan.raw_text, Some(&scan_value));
+    let scan_prompt_inputs = scan
+        .trace
+        .output_entry_stage_prompt_inputs()
+        .unwrap_or_default();
     let finalize_event = build_entry_finalize_trace_event(input, &scan_value);
     let finalize = invoke_grok_stage(
         http_client,
@@ -2025,14 +2453,16 @@ async fn invoke_grok_entry_two_stage(
         error: failure.error,
         trace: failure
             .trace
-            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()]),
+            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()])
+            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })?;
 
     Ok(ProviderSuccess {
         raw_text: finalize.raw_text,
         trace: finalize
             .trace
-            .prepend_entry_stage_events(&[scan_event, finalize_event]),
+            .prepend_entry_stage_events(&[scan_event, finalize_event])
+            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })
 }
 
@@ -2045,8 +2475,12 @@ async fn invoke_grok_stage(
     entry_stage: prompt::EntryPromptStage,
     prior_scan: Option<&Value>,
 ) -> Result<ProviderSuccess, ProviderFailure> {
-    let (system_prompt, user_prompt) =
-        build_prompt_pair(input, prompt_template, entry_stage, prior_scan)?;
+    let BuiltPromptPair {
+        system,
+        user,
+        prompt_input_capture,
+    } = build_prompt_pair(input, prompt_template, entry_stage, prior_scan)?;
+    let mut trace = provider_trace_with_prompt_input_capture(prompt_input_capture);
     let req = GrokResponsesRequest {
         model: if model.model.trim().is_empty() {
             grok_cfg.model.clone()
@@ -2059,11 +2493,11 @@ async fn invoke_grok_stage(
         input: vec![
             GrokResponsesInputMessage {
                 role: "system".to_string(),
-                content: system_prompt,
+                content: system,
             },
             GrokResponsesInputMessage {
                 role: "user".to_string(),
-                content: user_prompt,
+                content: user,
             },
         ],
         text: grok_text_config(
@@ -2083,48 +2517,53 @@ async fn invoke_grok_stage(
         .send()
         .await
         .context("call grok responses api")
-        .map_err(provider_failure_plain)?;
+        .map_err(|error| ProviderFailure {
+            error,
+            trace: trace.clone(),
+        })?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(provider_failure_plain(anyhow!(
-            "grok responses api failed status={} body={}",
-            status,
-            body
-        )));
+        return Err(ProviderFailure {
+            error: anyhow!("grok responses api failed status={} body={}", status, body),
+            trace,
+        });
     }
 
     let body: GrokResponsesApiResponse = response
         .json()
         .await
         .context("decode grok responses api response body")
-        .map_err(provider_failure_plain)?;
+        .map_err(|error| ProviderFailure {
+            error,
+            trace: trace.clone(),
+        })?;
 
     let finish_reason = body.status.clone();
-    let text = extract_grok_response_text(&body).ok_or_else(|| {
-        provider_failure_plain(anyhow!(
+    let text = extract_grok_response_text(&body).ok_or_else(|| ProviderFailure {
+        error: anyhow!(
             "grok responses api response text is empty status={} incomplete_details={}",
             body.status.as_deref().unwrap_or("-"),
             body.incomplete_details
                 .as_ref()
                 .map(Value::to_string)
                 .unwrap_or_else(|| "null".to_string())
-        ))
+        ),
+        trace: trace.clone(),
     })?;
     if text.trim().is_empty() {
-        return Err(provider_failure_plain(anyhow!(
-            "grok responses api response text is empty"
-        )));
+        return Err(ProviderFailure {
+            error: anyhow!("grok responses api response text is empty"),
+            trace,
+        });
     }
 
+    trace.provider_finish_reason = finish_reason;
+    trace.provider_usage = body.usage;
     Ok(ProviderSuccess {
         raw_text: text,
-        trace: ProviderTrace {
-            provider_finish_reason: finish_reason,
-            provider_usage: body.usage,
-            ..ProviderTrace::default()
-        },
+        trace,
     })
 }
 
@@ -2215,7 +2654,10 @@ fn grok_entry_scan_response_schema() -> Value {
                     "order_flow_bias",
                     "entry_style",
                     "candidate_zone",
+                    "entry_ladder",
                     "target_zone",
+                    "target_ladder",
+                    "stop_ladder",
                     "invalidation_basis",
                     "stop_model_hint",
                     "key_signals",
@@ -2227,7 +2669,10 @@ fn grok_entry_scan_response_schema() -> Value {
                     "order_flow_bias": { "type": "string" },
                     "entry_style": { "type": ["string", "null"] },
                     "candidate_zone": { "type": ["string", "null"] },
+                    "entry_ladder": scan_ladder_schema(),
                     "target_zone": { "type": ["string", "null"] },
+                    "target_ladder": scan_ladder_schema(),
+                    "stop_ladder": scan_ladder_schema(),
                     "invalidation_basis": { "type": ["string", "null"] },
                     "stop_model_hint": { "type": ["string", "null"] },
                     "key_signals": { "type": "string" },
@@ -2454,7 +2899,7 @@ fn ml_grok_entry_scan_schema() -> Value {
                 "additionalProperties": false,
                 "required": [
                     "primary_strategy", "market_story", "hypothesis", "conviction",
-                    "entry_style", "candidate_zone", "target_zone", "invalidation"
+                    "entry_style", "candidate_zone", "entry_ladder", "target_zone", "target_ladder", "stop_ladder", "invalidation"
                 ],
                 "properties": {
                     "primary_strategy": { "type": "string" },
@@ -2463,7 +2908,10 @@ fn ml_grok_entry_scan_schema() -> Value {
                     "conviction": { "type": "string" },
                     "entry_style": { "type": ["string", "null"] },
                     "candidate_zone": { "type": ["string", "null"] },
+                    "entry_ladder": scan_ladder_schema(),
                     "target_zone": { "type": ["string", "null"] },
+                    "target_ladder": scan_ladder_schema(),
+                    "stop_ladder": scan_ladder_schema(),
                     "invalidation": { "type": "string" }
                 }
             }
@@ -2572,12 +3020,15 @@ fn ml_gemini_entry_scan_schema() -> Value {
                     "conviction": { "type": "STRING" },
                     "entry_style": { "type": "STRING", "nullable": true },
                     "candidate_zone": { "type": "STRING", "nullable": true },
+                    "entry_ladder": gemini_scan_ladder_schema(),
                     "target_zone": { "type": "STRING", "nullable": true },
+                    "target_ladder": gemini_scan_ladder_schema(),
+                    "stop_ladder": gemini_scan_ladder_schema(),
                     "invalidation": { "type": "STRING" }
                 },
                 "required": [
                     "primary_strategy", "market_story", "hypothesis", "conviction",
-                    "entry_style", "candidate_zone", "target_zone", "invalidation"
+                    "entry_style", "candidate_zone", "entry_ladder", "target_zone", "target_ladder", "stop_ladder", "invalidation"
                 ]
             }
         },
@@ -2675,8 +3126,13 @@ fn ml_qwen_entry_scan_schema() -> Value {
                 "additionalProperties": true,
                 "required": [
                     "primary_strategy", "market_story", "hypothesis", "conviction",
-                    "entry_style", "candidate_zone", "target_zone", "invalidation"
-                ]
+                    "entry_style", "candidate_zone", "entry_ladder", "target_zone", "target_ladder", "stop_ladder", "invalidation"
+                ],
+                "properties": {
+                    "entry_ladder": scan_ladder_schema(),
+                    "target_ladder": scan_ladder_schema(),
+                    "stop_ladder": scan_ladder_schema()
+                }
             }
         }
     })
@@ -2723,7 +3179,7 @@ fn ml_custom_llm_entry_scan_schema() -> Value {
                 "additionalProperties": false,
                 "required": [
                     "primary_strategy", "market_story", "hypothesis", "conviction",
-                    "entry_style", "candidate_zone", "target_zone", "invalidation"
+                    "entry_style", "candidate_zone", "entry_ladder", "target_zone", "target_ladder", "stop_ladder", "invalidation"
                 ],
                 "properties": {
                     "primary_strategy": { "type": "string" },
@@ -2732,7 +3188,10 @@ fn ml_custom_llm_entry_scan_schema() -> Value {
                     "conviction": { "type": "string" },
                     "entry_style": { "type": ["string", "null"] },
                     "candidate_zone": { "type": ["string", "null"] },
+                    "entry_ladder": scan_ladder_schema(),
                     "target_zone": { "type": ["string", "null"] },
+                    "target_ladder": scan_ladder_schema(),
+                    "stop_ladder": scan_ladder_schema(),
                     "invalidation": { "type": "string" }
                 }
             }
@@ -2835,7 +3294,10 @@ fn gemini_entry_scan_response_schema() -> Value {
                     "order_flow_bias": { "type": "STRING" },
                     "entry_style": { "type": "STRING", "nullable": true },
                     "candidate_zone": { "type": "STRING", "nullable": true },
+                    "entry_ladder": gemini_scan_ladder_schema(),
                     "target_zone": { "type": "STRING", "nullable": true },
+                    "target_ladder": gemini_scan_ladder_schema(),
+                    "stop_ladder": gemini_scan_ladder_schema(),
                     "invalidation_basis": { "type": "STRING", "nullable": true },
                     "stop_model_hint": { "type": "STRING", "nullable": true },
                     "key_signals": { "type": "STRING" },
@@ -2847,7 +3309,10 @@ fn gemini_entry_scan_response_schema() -> Value {
                     "order_flow_bias",
                     "entry_style",
                     "candidate_zone",
+                    "entry_ladder",
                     "target_zone",
+                    "target_ladder",
+                    "stop_ladder",
                     "invalidation_basis",
                     "stop_model_hint",
                     "key_signals",
@@ -3106,7 +3571,14 @@ async fn invoke_claude_entry_two_stage(
                 trace,
             }
         })?;
+    if let Some(short_circuit) = maybe_short_circuit_entry_finalize("claude", &scan, &scan_value) {
+        return Ok(short_circuit);
+    }
     let scan_event = build_entry_scan_trace_event("claude", &scan.raw_text, Some(&scan_value));
+    let scan_prompt_inputs = scan
+        .trace
+        .output_entry_stage_prompt_inputs()
+        .unwrap_or_default();
     let finalize_event = build_entry_finalize_trace_event(input, &scan_value);
     let finalize = invoke_claude_batch(
         http_client,
@@ -3122,14 +3594,16 @@ async fn invoke_claude_entry_two_stage(
         error: failure.error,
         trace: failure
             .trace
-            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()]),
+            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()])
+            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })?;
 
     Ok(ProviderSuccess {
         raw_text: finalize.raw_text,
         trace: finalize
             .trace
-            .prepend_entry_stage_events(&[scan_event, finalize_event]),
+            .prepend_entry_stage_events(&[scan_event, finalize_event])
+            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })
 }
 
@@ -3142,9 +3616,13 @@ async fn invoke_claude_batch(
     entry_stage: prompt::EntryPromptStage,
     prior_scan: Option<&Value>,
 ) -> Result<ProviderSuccess, ProviderFailure> {
-    let (system_prompt, user_prompt) =
-        build_prompt_pair(input, prompt_template, entry_stage, prior_scan)?;
-    let system = vec![ClaudeTextBlock::cacheable(system_prompt, "1h")];
+    let BuiltPromptPair {
+        system,
+        user,
+        prompt_input_capture,
+    } = build_prompt_pair(input, prompt_template, entry_stage, prior_scan)?;
+    let mut trace = provider_trace_with_prompt_input_capture(prompt_input_capture);
+    let system = vec![ClaudeTextBlock::cacheable(system, "1h")];
     let messages = vec![ClaudeInputMessage {
         role: "user".to_string(),
         content: vec![
@@ -3158,13 +3636,12 @@ async fn invoke_claude_batch(
                 "1h",
             ),
             ClaudeTextBlock::plain(
-                user_prompt
-                    .trim_start_matches(prompt::user_prompt_prefix(
-                        input.management_mode,
-                        input.pending_order_mode,
-                        entry_stage,
-                    ))
-                    .to_string(),
+                user.trim_start_matches(prompt::user_prompt_prefix(
+                    input.management_mode,
+                    input.pending_order_mode,
+                    entry_stage,
+                ))
+                .to_string(),
             ),
         ],
     }];
@@ -3200,30 +3677,32 @@ async fn invoke_claude_batch(
         .send()
         .await
         .context("call claude messages batch create api")
-        .map_err(provider_failure_plain)?;
+        .map_err(|error| ProviderFailure {
+            error,
+            trace: trace.clone(),
+        })?;
 
     let status = create_response.status();
     if !status.is_success() {
         let body = create_response.text().await.unwrap_or_default();
-        return Err(provider_failure_plain(anyhow!(
-            "claude batch create failed status={} body={}",
-            status,
-            body
-        )));
+        return Err(ProviderFailure {
+            error: anyhow!("claude batch create failed status={} body={}", status, body),
+            trace,
+        });
     }
 
     let mut batch: ClaudeBatchEnvelope = create_response
         .json()
         .await
         .context("decode claude batch create response body")
-        .map_err(provider_failure_plain)?;
+        .map_err(|error| ProviderFailure {
+            error,
+            trace: trace.clone(),
+        })?;
 
     let batch_id = batch.id.clone();
-    let mut trace = ProviderTrace {
-        batch_id: Some(batch_id.clone()),
-        batch_status: Some(batch.processing_status.clone()),
-        ..ProviderTrace::default()
-    };
+    trace.batch_id = Some(batch_id.clone());
+    trace.batch_status = Some(batch.processing_status.clone());
     let started = Instant::now();
     let poll_every = Duration::from_secs(claude_cfg.batch_poll_interval_secs);
     let wait_timeout = Duration::from_secs(claude_cfg.batch_wait_timeout_secs);
@@ -3534,7 +4013,11 @@ fn compute_v_for_timeframe(value: &Value, timeframe: &str) -> Option<(f64, Strin
     // After reverse_timeseries_newest_first, bars[0] is the most-recent bar.
     let closed_ranges: Vec<(String, f64)> = bars
         .iter()
-        .filter(|bar| bar.get("is_closed").and_then(|v| v.as_bool()).unwrap_or(false))
+        .filter(|bar| {
+            bar.get("is_closed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        })
         .filter_map(|bar| {
             let high = bar.get("high").and_then(|v| v.as_f64())?;
             let low = bar.get("low").and_then(|v| v.as_f64())?;
@@ -3605,10 +4088,7 @@ fn inject_precomputed_v(value: &mut Value) {
         .pointer_mut("/indicators")
         .and_then(|v| v.as_object_mut())
     {
-        indicators.insert(
-            "pre_computed_v".to_string(),
-            Value::Object(pre_computed_v),
-        );
+        indicators.insert("pre_computed_v".to_string(), Value::Object(pre_computed_v));
     }
 }
 
@@ -3616,11 +4096,12 @@ fn inject_precomputed_v(value: &mut Value) {
 /// instead of excavating nested JSON and doing arithmetic itself.
 fn inject_precomputed_management_state(value: &mut Value) {
     // ── helpers ──────────────────────────────────────────────────────────────
-    let f64_at = |ptr: &str| -> Option<f64> {
-        value.pointer(ptr).and_then(|v| v.as_f64())
-    };
+    let f64_at = |ptr: &str| -> Option<f64> { value.pointer(ptr).and_then(|v| v.as_f64()) };
     let str_at = |ptr: &str| -> Option<String> {
-        value.pointer(ptr).and_then(|v| v.as_str()).map(String::from)
+        value
+            .pointer(ptr)
+            .and_then(|v| v.as_str())
+            .map(String::from)
     };
 
     // ── source values ────────────────────────────────────────────────────────
@@ -3648,7 +4129,8 @@ fn inject_precomputed_management_state(value: &mut Value) {
 
     // Entry context
     let entry_v = f64_at("/management_snapshot/position_context/entry_context/entry_v");
-    let entry_strategy = str_at("/management_snapshot/position_context/entry_context/entry_strategy");
+    let entry_strategy =
+        str_at("/management_snapshot/position_context/entry_context/entry_strategy");
 
     // V: priority — entry_v → v_1d → v_4h
     let v_1d = f64_at("/indicators/pre_computed_v/v_1d");
@@ -3677,7 +4159,11 @@ fn inject_precomputed_management_state(value: &mut Value) {
             (Some(mp), Some(ep), Some(sl)) => {
                 let buf = (mp - sl).abs();
                 let risk = (ep - sl).abs();
-                let pct = if risk > 0.0 { buf / risk * 100.0 } else { f64::INFINITY };
+                let pct = if risk > 0.0 {
+                    buf / risk * 100.0
+                } else {
+                    f64::INFINITY
+                };
                 let state = if pct >= 60.0 {
                     "safe"
                 } else if pct >= 25.0 {
@@ -3697,16 +4183,25 @@ fn inject_precomputed_management_state(value: &mut Value) {
 
     // SL trail trigger prices (in trade direction)
     let sl_trail_1_5v = v.zip(entry_price).map(|(v_val, ep)| {
-        if is_long { ep + 1.5 * v_val } else { ep - 1.5 * v_val }
+        if is_long {
+            ep + 1.5 * v_val
+        } else {
+            ep - 1.5 * v_val
+        }
     });
     let sl_trail_2_5v = v.zip(entry_price).map(|(v_val, ep)| {
-        if is_long { ep + 2.5 * v_val } else { ep - 2.5 * v_val }
+        if is_long {
+            ep + 2.5 * v_val
+        } else {
+            ep - 2.5 * v_val
+        }
     });
 
     // M: distance from current mark to operative TP, in V units
-    let m_in_v = v.zip(mark_price).zip(tp_operative).map(|((v_val, mp), tp)| {
-        (tp - mp).abs() / v_val
-    });
+    let m_in_v = v
+        .zip(mark_price)
+        .zip(tp_operative)
+        .map(|((v_val, mp), tp)| (tp - mp).abs() / v_val);
     let add_gate = m_in_v.map(|m| {
         if m < 1.0 {
             "blocked (<1.0V)"
@@ -3741,8 +4236,16 @@ fn inject_precomputed_management_state(value: &mut Value) {
     insert_f(&mut obj, "current_pct_of_original", current_pct);
     insert_s(&mut obj, "entry_strategy", entry_strategy);
     insert_f(&mut obj, "entry_v", entry_v);
-    obj.insert("risk_state".to_string(), Value::String(risk_state.to_string()));
+    obj.insert(
+        "risk_state".to_string(),
+        Value::String(risk_state.to_string()),
+    );
     insert_f(&mut obj, "buffer_pct", buffer_pct);
+    insert_f(
+        &mut obj,
+        "buffer_in_v",
+        remaining_buffer.zip(v).map(|(b, v_val)| b / v_val),
+    );
     insert_f(&mut obj, "remaining_buffer", remaining_buffer);
     insert_f(&mut obj, "original_risk", original_risk);
     insert_f(&mut obj, "V", v);
@@ -3753,7 +4256,9 @@ fn inject_precomputed_management_state(value: &mut Value) {
     insert_f(&mut obj, "M_current_in_v", m_in_v);
     obj.insert(
         "add_gate_status".to_string(),
-        add_gate.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null),
+        add_gate
+            .map(|s| Value::String(s.to_string()))
+            .unwrap_or(Value::Null),
     );
 
     if let Some(indicators) = value
@@ -4852,9 +5357,11 @@ fn trim_trailing_comma(out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_grok_response_text, finalize_indicator_codes_for_scan, parse_json_from_text,
-        serialize_entry_finalize_input_minified, serialize_llm_input_minified,
-        GrokResponsesApiResponse, ModelInvocationInput,
+        build_entry_finalize_skipped_no_trade_raw, extract_grok_response_text,
+        finalize_indicator_codes_for_scan, maybe_short_circuit_entry_finalize,
+        parse_json_from_text, serialize_entry_finalize_input_minified,
+        serialize_llm_input_minified, EntryStagePromptInputCapture, GrokResponsesApiResponse,
+        ModelInvocationInput, ProviderSuccess, ProviderTrace,
     };
     use chrono::Utc;
     use serde_json::{json, Value};
@@ -5019,6 +5526,95 @@ mod tests {
     }
 
     #[test]
+    fn build_entry_finalize_skipped_no_trade_raw_returns_valid_entry_decision_json() {
+        let scan = json!({
+            "decision": "NO_TRADE",
+            "reason": "No directional edge while price is pinned to value.",
+            "scan": {
+                "primary_strategy": "NO_SETUP"
+            }
+        });
+
+        let raw = build_entry_finalize_skipped_no_trade_raw(&scan);
+        let value: Value = serde_json::from_str(&raw).expect("parse synthesized no-trade");
+
+        assert_eq!(
+            value.get("decision").and_then(Value::as_str),
+            Some("NO_TRADE")
+        );
+        assert_eq!(value.pointer("/params/entry"), Some(&Value::Null));
+        assert_eq!(value.pointer("/params/tp"), Some(&Value::Null));
+        assert_eq!(value.pointer("/params/sl"), Some(&Value::Null));
+        assert_eq!(value.pointer("/params/leverage"), Some(&Value::Null));
+        assert_eq!(value.pointer("/params/rr"), Some(&Value::Null));
+        assert_eq!(value.pointer("/params/horizon"), Some(&Value::Null));
+        assert!(value
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason.contains("finalize was skipped")));
+        crate::llm::decision::trade_intent_from_value(&value).expect("valid no-trade intent");
+    }
+
+    #[test]
+    fn maybe_short_circuit_entry_finalize_skips_stage_two_for_scan_no_trade() {
+        let scan_value = json!({
+            "decision": "NO_TRADE",
+            "reason": "No setup.",
+            "scan": {
+                "primary_strategy": "NO_SETUP",
+                "candidate_zone": null,
+                "entry_ladder": [],
+                "target_ladder": [],
+                "stop_ladder": []
+            }
+        });
+        let scan = ProviderSuccess {
+            raw_text: "{\"decision\":\"NO_TRADE\"}".to_string(),
+            trace: ProviderTrace {
+                entry_stage_prompt_inputs: vec![EntryStagePromptInputCapture {
+                    stage: "scan".to_string(),
+                    prompt_input: json!({"symbol": "ETHUSDT"}),
+                    stage_1_setup_scan_json: None,
+                }],
+                ..ProviderTrace::default()
+            },
+        };
+
+        let short_circuit =
+            maybe_short_circuit_entry_finalize("custom_llm", &scan, &scan_value).expect("skip");
+        let value: Value =
+            serde_json::from_str(&short_circuit.raw_text).expect("parse short-circuit json");
+
+        assert_eq!(
+            value.get("decision").and_then(Value::as_str),
+            Some("NO_TRADE")
+        );
+        let stage_trace = short_circuit
+            .trace
+            .output_entry_stage_trace()
+            .expect("scan trace should exist");
+        assert_eq!(stage_trace.len(), 2);
+        assert_eq!(
+            stage_trace[0].get("stage").and_then(Value::as_str),
+            Some("scan")
+        );
+        assert_eq!(
+            stage_trace[1].get("stage").and_then(Value::as_str),
+            Some("finalize_skipped")
+        );
+        assert_eq!(
+            stage_trace[1].get("reason").and_then(Value::as_str),
+            Some("scan_decision_no_trade")
+        );
+        let prompt_inputs = short_circuit
+            .trace
+            .output_entry_stage_prompt_inputs()
+            .expect("scan prompt input should be kept");
+        assert_eq!(prompt_inputs.len(), 1);
+        assert_eq!(prompt_inputs[0].stage, "scan");
+    }
+
+    #[test]
     fn openai_compatible_request_omits_enable_thinking_when_none() {
         let req = super::QwenChatCompletionsRequest {
             model: "qwen3.5-plus".to_string(),
@@ -5123,7 +5719,41 @@ mod tests {
                 "conviction": "medium",
                 "entry_style": "post_sweep_reclaim",
                 "candidate_zone": "reclaim zone",
+                "entry_ladder": [
+                    {
+                        "price": 2045.71,
+                        "label": "sweep reclaim trigger",
+                        "anchor_field": "core_price_anchors.payload.reference_price",
+                        "role": "preferred_entry",
+                        "skip_reason": null
+                    }
+                ],
                 "target_zone": "value-area refill",
+                "target_ladder": [
+                    {
+                        "price": 2052.08,
+                        "label": "first barrier",
+                        "anchor_field": "price_volume_structure.by_window.4h.vah",
+                        "role": "first_barrier",
+                        "skip_reason": "too close to satisfy 1.0V"
+                    },
+                    {
+                        "price": 2084.98,
+                        "label": "1d rvwap +2sigma",
+                        "anchor_field": "rvwap_sigma_bands.by_window.1d.rvwap_band_plus_2",
+                        "role": "candidate_tp",
+                        "skip_reason": null
+                    }
+                ],
+                "stop_ladder": [
+                    {
+                        "price": 2038.2,
+                        "label": "sweep low invalidation",
+                        "anchor_field": "footprint.payload.by_window.4h.buy_imbalance_zone_nearest_below",
+                        "role": "structural_invalidation",
+                        "skip_reason": null
+                    }
+                ],
                 "invalidation": "lose the sweep reclaim"
             }
         });
@@ -5145,6 +5775,24 @@ mod tests {
             event.get("invalidation_basis").and_then(Value::as_str),
             Some("lose the sweep reclaim")
         );
+        assert_eq!(
+            event
+                .pointer("/target_ladder/0/price")
+                .and_then(Value::as_f64),
+            Some(2052.08)
+        );
+        assert_eq!(
+            event
+                .pointer("/entry_ladder/0/price")
+                .and_then(Value::as_f64),
+            Some(2045.71)
+        );
+        assert_eq!(
+            event
+                .pointer("/stop_ladder/0/price")
+                .and_then(Value::as_f64),
+            Some(2038.2)
+        );
     }
 
     #[test]
@@ -5158,7 +5806,34 @@ mod tests {
                 "order_flow_bias": "bullish",
                 "entry_style": "patient_retest",
                 "candidate_zone": "bid wall",
+                "entry_ladder": [
+                    {
+                        "price": 1998.0,
+                        "label": "bid wall retest",
+                        "anchor_field": "orderbook_depth.payload.top_bid_walls[0].price",
+                        "role": "preferred_entry",
+                        "skip_reason": null
+                    }
+                ],
                 "target_zone": "ask wall",
+                "target_ladder": [
+                    {
+                        "price": 2024.5,
+                        "label": "ask wall",
+                        "anchor_field": "orderbook_depth.payload.top_ask_walls[0].price",
+                        "role": "candidate_tp",
+                        "skip_reason": null
+                    }
+                ],
+                "stop_ladder": [
+                    {
+                        "price": 1992.0,
+                        "label": "wall failure",
+                        "anchor_field": "orderbook_depth.payload.top_bid_walls[0].price",
+                        "role": "structural_invalidation",
+                        "skip_reason": null
+                    }
+                ],
                 "invalidation_basis": "wall fails",
                 "stop_model_hint": "Limit Order Penetration Stop",
                 "key_signals": "dom wall + obi",
@@ -5169,7 +5844,39 @@ mod tests {
         assert!(codes.contains(&"core_price_anchors"));
         assert!(codes.contains(&"orderbook_depth"));
         assert!(codes.contains(&"kline_history"));
-        assert!(!codes.contains(&"rvwap_sigma_bands"));
+        assert!(codes.contains(&"tpo_market_profile"));
+        assert!(codes.contains(&"rvwap_sigma_bands"));
+    }
+
+    #[test]
+    fn finalize_indicator_codes_include_scan_referenced_raw_indicators() {
+        let scan = json!({
+            "decision": "NO_TRADE",
+            "reason": "x",
+            "scan": {
+                "primary_strategy": "NO_SETUP",
+                "market_story": "ema_trend_regime still bull, but absorption at 2100.73, buying_exhaustion at 2113.77, and no active 4h/1d FVG keep the auction rotational.",
+                "hypothesis": "No trade unless selling_exhaustion absorbs the next dip and whale_trades stop pressing lower.",
+                "conviction": "low",
+                "entry_style": null,
+                "candidate_zone": null,
+                "entry_ladder": [],
+                "target_zone": null,
+                "target_ladder": [],
+                "stop_ladder": [],
+                "invalidation": "Stand aside until orderbook_depth improves and divergence resolves."
+            }
+        });
+
+        let codes = finalize_indicator_codes_for_scan(&scan);
+        assert!(codes.contains(&"ema_trend_regime"));
+        assert!(codes.contains(&"absorption"));
+        assert!(codes.contains(&"buying_exhaustion"));
+        assert!(codes.contains(&"selling_exhaustion"));
+        assert!(codes.contains(&"whale_trades"));
+        assert!(codes.contains(&"orderbook_depth"));
+        assert!(codes.contains(&"divergence"));
+        assert!(codes.contains(&"fvg"));
     }
 
     #[test]
@@ -5179,7 +5886,7 @@ mod tests {
             symbol: "ETHUSDT".to_string(),
             ts_bucket: now,
             window_code: "15m".to_string(),
-            indicator_count: 10,
+            indicator_count: 11,
             source_routing_key: "llm_indicator_minute".to_string(),
             source_published_at: None,
             received_at: now,
@@ -5192,6 +5899,7 @@ mod tests {
                 "kline_history": {"payload": {"intervals": {"1d": {"futures": {"bars": []}}}}},
                 "orderbook_depth": {"payload": {"obi_k_dw_twa_fut": 0.7}},
                 "liquidation_density": {"payload": {"peak_levels": []}},
+                "tpo_market_profile": {"payload": {"by_window": {"4h": {"tpo_poc": 2004.0}}}},
                 "rvwap_sigma_bands": {"payload": {"by_window": {"1d": {"rvwap_w": 1998.0}}}},
                 "divergence": {"payload": {"signal": "none"}}
             }),
@@ -5210,7 +5918,34 @@ mod tests {
                 "order_flow_bias": "bullish",
                 "entry_style": "patient_retest",
                 "candidate_zone": "bid wall",
+                "entry_ladder": [
+                    {
+                        "price": 1998.0,
+                        "label": "bid wall retest",
+                        "anchor_field": "orderbook_depth.payload.top_bid_walls[0].price",
+                        "role": "preferred_entry",
+                        "skip_reason": null
+                    }
+                ],
                 "target_zone": "ask wall",
+                "target_ladder": [
+                    {
+                        "price": 2024.5,
+                        "label": "ask wall",
+                        "anchor_field": "orderbook_depth.payload.top_ask_walls[0].price",
+                        "role": "candidate_tp",
+                        "skip_reason": null
+                    }
+                ],
+                "stop_ladder": [
+                    {
+                        "price": 1992.0,
+                        "label": "wall failure",
+                        "anchor_field": "orderbook_depth.payload.top_bid_walls[0].price",
+                        "role": "structural_invalidation",
+                        "skip_reason": null
+                    }
+                ],
                 "invalidation_basis": "wall fails",
                 "stop_model_hint": "Limit Order Penetration Stop",
                 "key_signals": "dom wall + obi",
@@ -5224,12 +5959,296 @@ mod tests {
 
         assert!(value.pointer("/indicators/orderbook_depth").is_some());
         assert!(value.pointer("/indicators/core_price_anchors").is_some());
-        assert!(value.pointer("/indicators/rvwap_sigma_bands").is_none());
+        assert!(value
+            .pointer("/indicators/price_volume_structure")
+            .is_some());
+        assert!(value.pointer("/indicators/footprint").is_some());
+        assert!(value.pointer("/indicators/avwap").is_some());
+        assert!(value.pointer("/indicators/kline_history").is_some());
+        assert!(value.pointer("/indicators/pre_computed_v").is_some());
+        assert!(value.pointer("/indicators/tpo_market_profile").is_some());
+        assert!(value.pointer("/indicators/rvwap_sigma_bands").is_some());
         assert_eq!(
             value
                 .pointer("/finalize_focus/primary_strategy")
                 .and_then(|v| v.as_str()),
             Some("DOM Liquidity Wall")
+        );
+    }
+
+    #[test]
+    fn serialize_entry_finalize_input_keeps_scan_referenced_supporting_indicators() {
+        let now = Utc::now();
+        let input = ModelInvocationInput {
+            symbol: "ETHUSDT".to_string(),
+            ts_bucket: now,
+            window_code: "15m".to_string(),
+            indicator_count: 14,
+            source_routing_key: "llm_indicator_minute".to_string(),
+            source_published_at: None,
+            received_at: now,
+            indicators: json!({
+                "core_price_anchors": {"payload": {"reference_price": 2105.08}},
+                "price_volume_structure": {"payload": {"by_window": {"4h": {"val": 2103.04}}}},
+                "footprint": {"payload": {"by_window": {"4h": {"buy_imbalance_zone_nearest_below": 2100.5}}}},
+                "cvd_pack": {"payload": {"delta_fut": 863.89}},
+                "avwap": {"payload": {"avwap_fut": 2046.49}},
+                "kline_history": {"payload": {"intervals": {"4h": {"futures": {"bars": []}}}}},
+                "tpo_market_profile": {"payload": {"tpo_val": 2108.16, "tpo_poc": 2110.92}},
+                "rvwap_sigma_bands": {"payload": {"by_window": {"15m": {"rvwap_w": 2107.5}}}},
+                "absorption": {"payload": {"latest_7d": {"price_low": 2100.73}}},
+                "buying_exhaustion": {"payload": {"latest_7d": {"pivot_price": 2113.77}}},
+                "selling_exhaustion": {"payload": {"latest_7d": {"pivot_price": 2103.46}}},
+                "ema_trend_regime": {"payload": {"trend_regime_by_tf": {"4h": "bull", "1d": "bull"}}},
+                "fvg": {"payload": {"by_window": {"4h": {"active_bear_fvgs": [], "active_bull_fvgs": []}}}},
+                "orderbook_depth": {"payload": {"by_window": {"15m": {"ofi_norm_fut": -0.53}}}},
+                "whale_trades": {"payload": {"by_window": {"15m": {"fut_whale_delta_notional": -906355.57}}}}
+            }),
+            missing_indicator_codes: vec![],
+            management_mode: false,
+            pending_order_mode: false,
+            trading_state: None,
+            management_snapshot: None,
+        };
+        let scan = json!({
+            "decision": "NO_TRADE",
+            "reason": "x",
+            "scan": {
+                "primary_strategy": "NO_SETUP",
+                "market_story": "ema_trend_regime is still bull, but buying_exhaustion at 2113.77, absorption at 2100.73, and no active 4h/1d FVG keep the auction rotational.",
+                "hypothesis": "Stand aside unless selling_exhaustion stops pressing and whale_trades stop leaning short.",
+                "conviction": "low",
+                "entry_style": null,
+                "candidate_zone": null,
+                "entry_ladder": [],
+                "target_zone": null,
+                "target_ladder": [],
+                "stop_ladder": [],
+                "invalidation": "No directional edge while orderbook_depth stays weak."
+            }
+        });
+
+        let serialized =
+            serialize_entry_finalize_input_minified(&input, &scan).expect("serialize finalize");
+        let value: Value = serde_json::from_str(&serialized).expect("parse finalize input");
+
+        assert!(value.pointer("/indicators/ema_trend_regime").is_some());
+        assert!(value.pointer("/indicators/absorption").is_some());
+        assert!(value.pointer("/indicators/buying_exhaustion").is_some());
+        assert!(value.pointer("/indicators/selling_exhaustion").is_some());
+        assert!(value.pointer("/indicators/fvg").is_some());
+        assert!(value.pointer("/indicators/orderbook_depth").is_some());
+        assert!(value.pointer("/indicators/whale_trades").is_some());
+        assert!(value.pointer("/indicators/tpo_market_profile").is_some());
+        assert!(value.pointer("/indicators/rvwap_sigma_bands").is_some());
+    }
+
+    #[test]
+    fn serialize_entry_finalize_input_keeps_tp_relevant_htf_indicators_for_value_area_refill() {
+        let now = Utc::now();
+        let input = ModelInvocationInput {
+            symbol: "ETHUSDT".to_string(),
+            ts_bucket: now,
+            window_code: "15m".to_string(),
+            indicator_count: 12,
+            source_routing_key: "llm_indicator_minute".to_string(),
+            source_published_at: None,
+            received_at: now,
+            indicators: json!({
+                "core_price_anchors": {"payload": {"reference_price": 2000.0}},
+                "price_volume_structure": {"payload": {"val": 1990.0, "vah": 2010.0, "hvn_levels": []}},
+                "footprint": {"payload": {"by_window": {"1d": {"buy_imbalance_zones_top": [2084.98]}}}},
+                "cvd_pack": {"payload": {"delta_fut": 1000.0}},
+                "avwap": {"payload": {"fut_last_price": 2001.0}},
+                "kline_history": {"payload": {"intervals": {"1d": {"futures": {"bars": []}}}}},
+                "rvwap_sigma_bands": {"payload": {"by_window": {"1d": {"rvwap_band_plus_2": 2084.98}}}},
+                "tpo_market_profile": {"payload": {"by_window": {"1d": {"tpo_vah": 2078.16}}}},
+                "liquidation_density": {"payload": {"by_window": {"1d": {"peak_levels": [{"price": 2088.29}]}}}},
+                "vpin": {"payload": {"z_vpin_fut": 0.4}},
+                "orderbook_depth": {"payload": {"obi_k_dw_twa_fut": 0.1}},
+                "fvg": {"payload": {"by_window": {"1d": {"active_bull_fvgs": []}}}}
+            }),
+            missing_indicator_codes: vec![],
+            management_mode: false,
+            pending_order_mode: false,
+            trading_state: None,
+            management_snapshot: None,
+        };
+        let scan = json!({
+            "decision": "LONG",
+            "reason": "x",
+            "scan": {
+                "primary_strategy": "Value Area Re-fill",
+                "setup_quality": "high",
+                "order_flow_bias": "bullish",
+                "entry_style": "patient_retest",
+                "candidate_zone": "value area low",
+                "entry_ladder": [
+                    {
+                        "price": 1994.5,
+                        "label": "value area low retest",
+                        "anchor_field": "price_volume_structure.payload.val",
+                        "role": "preferred_entry",
+                        "skip_reason": null
+                    }
+                ],
+                "target_zone": "value area high",
+                "target_ladder": [
+                    {
+                        "price": 2078.16,
+                        "label": "1d vah",
+                        "anchor_field": "tpo_market_profile.payload.by_window.1d.tpo_vah",
+                        "role": "first_barrier",
+                        "skip_reason": "below 1.0V"
+                    },
+                    {
+                        "price": 2084.98,
+                        "label": "1d rvwap +2sigma",
+                        "anchor_field": "rvwap_sigma_bands.payload.by_window.1d.rvwap_band_plus_2",
+                        "role": "candidate_tp",
+                        "skip_reason": null
+                    }
+                ],
+                "stop_ladder": [
+                    {
+                        "price": 1989.0,
+                        "label": "value area low loss",
+                        "anchor_field": "price_volume_structure.payload.val",
+                        "role": "structural_invalidation",
+                        "skip_reason": null
+                    }
+                ],
+                "invalidation_basis": "lose value area low",
+                "stop_model_hint": "Value Area Invalidation Stop",
+                "key_signals": "value migration",
+                "risk_flags": "none"
+            }
+        });
+
+        let serialized =
+            serialize_entry_finalize_input_minified(&input, &scan).expect("serialize finalize");
+        let value: Value = serde_json::from_str(&serialized).expect("parse finalize input");
+
+        assert!(value.pointer("/indicators/rvwap_sigma_bands").is_some());
+        assert!(value.pointer("/indicators/tpo_market_profile").is_some());
+        assert!(value.pointer("/indicators/liquidation_density").is_some());
+        assert!(value
+            .pointer("/indicators/price_volume_structure")
+            .is_some());
+        assert!(value.pointer("/indicators/footprint").is_some());
+        assert!(value.pointer("/indicators/avwap").is_some());
+        assert!(value.pointer("/indicators/kline_history").is_some());
+        assert!(value.pointer("/indicators/pre_computed_v").is_some());
+    }
+
+    #[test]
+    fn build_prompt_pair_captures_finalize_prompt_input_and_stage1_scan() {
+        let now = Utc::now();
+        let input = ModelInvocationInput {
+            symbol: "ETHUSDT".to_string(),
+            ts_bucket: now,
+            window_code: "15m".to_string(),
+            indicator_count: 3,
+            source_routing_key: "llm_indicator_minute".to_string(),
+            source_published_at: None,
+            received_at: now,
+            indicators: json!({
+                "core_price_anchors": {"payload": {"reference_price": 2000.0}},
+                "price_volume_structure": {"payload": {"val": 1990.0, "vah": 2010.0}},
+                "kline_history": {"payload": {"intervals": {"4h": {"futures": {"bars": []}}}}}
+            }),
+            missing_indicator_codes: vec![],
+            management_mode: false,
+            pending_order_mode: false,
+            trading_state: None,
+            management_snapshot: None,
+        };
+        let scan = json!({
+            "decision": "LONG",
+            "reason": "x",
+            "scan": {
+                "primary_strategy": "Value Area Re-fill",
+                "setup_quality": "high",
+                "order_flow_bias": "bullish",
+                "entry_style": "patient_retest",
+                "candidate_zone": "value area low",
+                "entry_ladder": [
+                    {
+                        "price": 1994.5,
+                        "label": "value area low retest",
+                        "anchor_field": "price_volume_structure.payload.val",
+                        "role": "preferred_entry",
+                        "skip_reason": null
+                    }
+                ],
+                "target_zone": "value area high",
+                "target_ladder": [
+                    {
+                        "price": 2010.0,
+                        "label": "1d vah",
+                        "anchor_field": "price_volume_structure.payload.by_window.1d.vah",
+                        "role": "candidate_tp",
+                        "skip_reason": null
+                    }
+                ],
+                "stop_ladder": [
+                    {
+                        "price": 1989.0,
+                        "label": "value area loss",
+                        "anchor_field": "price_volume_structure.payload.val",
+                        "role": "structural_invalidation",
+                        "skip_reason": null
+                    }
+                ],
+                "invalidation_basis": "lose value area low",
+                "stop_model_hint": "Value Area Invalidation Stop",
+                "key_signals": "value migration",
+                "risk_flags": "none"
+            }
+        });
+
+        let prompt = super::build_prompt_pair(
+            &input,
+            "big_opportunity",
+            super::prompt::EntryPromptStage::Finalize,
+            Some(&scan),
+        )
+        .expect("build finalize prompt pair");
+
+        let capture = prompt
+            .prompt_input_capture
+            .expect("capture should exist for entry finalize");
+        assert_eq!(capture.stage, "finalize");
+        assert_eq!(
+            capture
+                .stage_1_setup_scan_json
+                .as_ref()
+                .and_then(|value| value.pointer("/scan/target_ladder/0/price"))
+                .and_then(Value::as_f64),
+            Some(2010.0)
+        );
+        assert_eq!(
+            capture
+                .stage_1_setup_scan_json
+                .as_ref()
+                .and_then(|value| value.pointer("/scan/entry_ladder/0/price"))
+                .and_then(Value::as_f64),
+            Some(1994.5)
+        );
+        assert_eq!(
+            capture
+                .stage_1_setup_scan_json
+                .as_ref()
+                .and_then(|value| value.pointer("/scan/stop_ladder/0/price"))
+                .and_then(Value::as_f64),
+            Some(1989.0)
+        );
+        assert_eq!(
+            capture
+                .prompt_input
+                .pointer("/finalize_focus/primary_strategy")
+                .and_then(Value::as_str),
+            Some("Value Area Re-fill")
         );
     }
 

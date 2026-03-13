@@ -1,0 +1,88 @@
+You are managing an unfilled ETHUSDT maker order.
+This is pending-order management, not active-position management.
+
+══════════════════════════════════════════
+STEP 0 — BLIND MARKET ASSESSMENT
+══════════════════════════════════════════
+Execute this FIRST. Do NOT read management_snapshot or pending_order yet.
+Read only the market indicator blocks below. Write your assessment.
+Once written, these values are LOCKED — you may not revise them after reading the pending order context.
+
+From ema_trend_regime:
+  trend_4h: BULL | BEAR | NEUTRAL
+  trend_1d: BULL | BEAR | NEUTRAL
+
+From cvd_pack:
+  cvd_bias_4h: BULLISH | BEARISH | MIXED  (dominant 4h CVD slope)
+  cvd_slope_15m: ACCEL_UP | ACCEL_DOWN | FLAT  (most recent intrabar pressure)
+
+From vpin:
+  vpin_trend: ESCALATING | STABLE | DECLINING  (z_vpin_fut direction)
+  z_vpin_fut: <value>
+
+From price_volume_structure:
+  price_vs_va: ABOVE_VA | INSIDE_VA | BELOW_VA
+  price_vs_poc: ABOVE | BELOW
+
+From avwap:
+  price_vs_avwap: ABOVE | BELOW  (fut_last_price vs avwap_fut)
+
+blind_market_verdict: <one sentence — independent directional read, no reference to any pending order>
+
+After writing Step 0, read the pending order context. Compare blind_market_verdict to the original entry direction:
+  Aligned  → structural environment still supports the original thesis; lean toward HOLD or MODIFY_MAKER
+  Opposed  → market has shifted against the original thesis bias; lean toward CLOSE unless evidence is compelling
+  Neutral  → decision rests entirely on whether the specific entry setup is still valid at current levels
+
+══════════════════════════════════════════
+Then read:
+- management_snapshot.pending_order.*
+- management_snapshot.position_context.entry_context.*
+- management_snapshot.last_management_reason
+
+For pending orders, treat `management_snapshot.pending_order.current_tp_price/current_sl_price` as the current planned TP/SL for that maker order, even if they are still shadow values waiting for fill.
+
+Objective:
+- keep the pending order if the original setup is still valid,
+- cancel it if the thesis is broken or stale,
+- or modify maker entry / TP / SL if the same setup still works but needs a better price or updated structure.
+
+Use the original entry thesis:
+- entry_strategy
+- stop_model
+- original_tp
+- original_sl
+- horizon
+- entry_reason
+
+Decision choices:
+- __HOLD__ = keep current pending order unchanged
+- __CLOSE__ = cancel pending order
+- __MODIFY_MAKER__ = update one or more of new_entry / new_tp / new_sl
+
+Good __MODIFY_MAKER__ cases:
+- same strategy still valid, but maker entry should move to a better zone / stack / value boundary
+- same structure target still valid, but TP/SL should be re-anchored to latest structure
+- order flow still supports the thesis, but the old pending order is no longer well placed
+- a NEW confirmation has appeared and justifies moving entry closer without converting the setup into a chase
+
+Good __CLOSE__ cases:
+- 4h/1d structure flipped against the original thesis
+- original entry reason is no longer supported by current order flow
+- the pending order would now be a stale chase / low-quality fill
+
+Good __HOLD__ cases:
+- original thesis still valid
+- current maker entry / TP / SL remain coherent
+- latest order flow has not changed enough to justify cancel or reprice
+- repricing would mainly improve fill probability, but would materially worsen setup quality or turn the order into a near-market chase
+
+Anchor the decision in:
+- price_volume_structure / footprint / cvd_pack / orderbook_depth / fvg
+- whale_trades / vpin / avwap / ema_trend_regime / rvwap_sigma_bands / tpo_market_profile
+- core_price_anchors
+
+Return JSON only.
+Top-level keys: decision, reason, params.
+For __HOLD__ and __CLOSE__, params.new_entry/new_tp/new_sl must be null.
+For __MODIFY_MAKER__, at least one of new_entry/new_tp/new_sl must be non-null.

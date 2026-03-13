@@ -125,6 +125,12 @@ pub struct PendingOrderExecutionReport {
     pub leverage: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TrackedExitOrder {
+    order_id: i64,
+    is_algo_order: bool,
+}
+
 #[derive(Default)]
 struct AccountWsState {
     has_account_update: bool,
@@ -391,6 +397,13 @@ pub async fn execute_trade_intent(
         });
     }
 
+    let exit_side = match intent.decision {
+        TradeDecision::Long => "SELL",
+        TradeDecision::Short => "BUY",
+        TradeDecision::NoTrade => unreachable!(),
+    };
+    let tp_trigger_price = format_decimal(tp_price, symbol_filters.price_precision);
+    let sl_trigger_price = format_decimal(sl_price, symbol_filters.price_precision);
     set_futures_leverage(http_client, api_config, exec_config, symbol, leverage).await?;
     let entry_order_id = place_entry_market_order(
         http_client,
@@ -407,35 +420,34 @@ pub async fn execute_trade_intent(
     )
     .await?;
 
-    let exit_side = match intent.decision {
-        TradeDecision::Long => "SELL",
-        TradeDecision::Short => "BUY",
-        TradeDecision::NoTrade => unreachable!(),
-    };
-    let tp_trigger_price = format_decimal(tp_price, symbol_filters.price_precision);
-    let sl_trigger_price = format_decimal(sl_price, symbol_filters.price_precision);
-
-    let (take_profit_order_id, stop_loss_order_id, exit_orders_deferred) =
-        if exec_config.place_exit_orders {
-            let (take_profit_order_id, stop_loss_order_id) = match place_staged_exit_orders(
-                http_client,
-                api_config,
-                exec_config,
-                symbol,
-                position_side,
-                exit_side,
-                &tp_trigger_price,
-                &sl_trigger_price,
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(err) => {
-                    let cancel_err =
-                        cancel_order_by_id(http_client, api_config, exec_config, symbol, entry_order_id)
-                            .await
-                            .err();
-                    return Err(match cancel_err {
+    let (take_profit_order_id, stop_loss_order_id, exit_orders_deferred) = if exec_config
+        .place_exit_orders
+    {
+        let (take_profit_order_id, stop_loss_order_id) = match place_staged_exit_orders(
+            http_client,
+            api_config,
+            exec_config,
+            symbol,
+            position_side,
+            exit_side,
+            &quantity_str,
+            &tp_trigger_price,
+            &sl_trigger_price,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                let cancel_err = cancel_order_by_id(
+                    http_client,
+                    api_config,
+                    exec_config,
+                    symbol,
+                    entry_order_id,
+                )
+                .await
+                .err();
+                return Err(match cancel_err {
                         Some(cancel_err) => anyhow!(
                             "entry order {} placed but staging synchronized exits failed: {}; canceling entry also failed: {}",
                             entry_order_id,
@@ -448,31 +460,37 @@ pub async fn execute_trade_intent(
                             err
                         ),
                     });
-                }
-            };
-            info!(
-                symbol = %symbol,
-                entry_order_id = entry_order_id,
-                take_profit_order_id = take_profit_order_id,
-                stop_loss_order_id = stop_loss_order_id,
-                tp_trigger_price = %tp_trigger_price,
-                sl_trigger_price = %sl_trigger_price,
-                "entry_order_placed_with_synchronized_exit_orders"
-            );
-            tokio::spawn(watch_staged_exit_orders(
-                http_client.clone(),
-                api_config.clone(),
-                exec_config.clone(),
-                symbol.to_string(),
-                position_side.to_string(),
-                entry_order_id,
-                Some(take_profit_order_id),
-                Some(stop_loss_order_id),
-            ));
-            (Some(take_profit_order_id), Some(stop_loss_order_id), false)
-        } else {
-            (None, None, false)
+            }
         };
+        info!(
+            symbol = %symbol,
+            entry_order_id = entry_order_id,
+            take_profit_order_id = take_profit_order_id,
+            stop_loss_order_id = stop_loss_order_id,
+            tp_trigger_price = %tp_trigger_price,
+            sl_trigger_price = %sl_trigger_price,
+            "entry_order_placed_with_synchronized_exit_orders"
+        );
+        tokio::spawn(watch_staged_exit_orders(
+            http_client.clone(),
+            api_config.clone(),
+            exec_config.clone(),
+            symbol.to_string(),
+            position_side.to_string(),
+            entry_order_id,
+            Some(TrackedExitOrder {
+                order_id: take_profit_order_id,
+                is_algo_order: true,
+            }),
+            Some(TrackedExitOrder {
+                order_id: stop_loss_order_id,
+                is_algo_order: true,
+            }),
+        ));
+        (Some(take_profit_order_id), Some(stop_loss_order_id), false)
+    } else {
+        (None, None, false)
+    };
 
     Ok(ExecutionReport {
         decision: intent.decision.as_str(),
@@ -912,6 +930,7 @@ pub async fn execute_management_intent(
             let symbol_filters = fetch_symbol_filters(http_client, api_config, symbol).await?;
             struct ModifyTpSlPlan {
                 position_side: String,
+                quantity: String,
                 current_tp: Option<f64>,
                 current_sl: Option<f64>,
                 new_tp: f64,
@@ -946,9 +965,15 @@ pub async fn execute_management_intent(
                     symbol_filters.tick_size,
                     is_long,
                 )?;
+                let quantity = format_exit_quantity(
+                    position.position_amt.abs(),
+                    symbol_filters.step_size,
+                    symbol_filters.qty_precision,
+                )?;
 
                 plans.push(ModifyTpSlPlan {
                     position_side: position_side.to_string(),
+                    quantity,
                     current_tp,
                     current_sl,
                     new_tp,
@@ -1009,6 +1034,7 @@ pub async fn execute_management_intent(
                     exit_side,
                     &plan.position_side,
                     "TAKE_PROFIT_MARKET",
+                    &plan.quantity,
                     &tp_trigger_price,
                 )
                 .await?;
@@ -1020,6 +1046,7 @@ pub async fn execute_management_intent(
                     exit_side,
                     &plan.position_side,
                     "STOP_MARKET",
+                    &plan.quantity,
                     &sl_trigger_price,
                 )
                 .await?;
@@ -1193,6 +1220,9 @@ pub async fn execute_pending_order_intent(
             cancel_all_open_algo_orders(http_client, api_config, exec_config, symbol).await?;
             report.canceled_open_orders = true;
 
+            let replacement_qty = format_decimal(remaining_qty, symbol_filters.qty_precision);
+            let replacement_price =
+                format_decimal(maker_entry_price, symbol_filters.price_precision);
             let order_id = place_limit_post_only_order_with_side(
                 http_client,
                 api_config,
@@ -1200,8 +1230,8 @@ pub async fn execute_pending_order_intent(
                 symbol,
                 if is_long { "BUY" } else { "SELL" },
                 &position_side,
-                &format_decimal(remaining_qty, symbol_filters.qty_precision),
-                &format_decimal(maker_entry_price, symbol_filters.price_precision),
+                &replacement_qty,
+                &replacement_price,
                 symbol_filters.tick_size,
                 symbol_filters.price_precision,
                 !exec_config.place_exit_orders,
@@ -1242,6 +1272,7 @@ pub async fn execute_pending_order_intent(
                         symbol,
                         &position_side,
                         exit_side,
+                        &replacement_qty,
                         &tp_trigger_price,
                         &sl_trigger_price,
                     )
@@ -1289,8 +1320,14 @@ pub async fn execute_pending_order_intent(
                         symbol.to_string(),
                         position_side.clone(),
                         order_id,
-                        Some(tp_algo_id),
-                        Some(sl_algo_id),
+                        Some(TrackedExitOrder {
+                            order_id: tp_algo_id,
+                            is_algo_order: true,
+                        }),
+                        Some(TrackedExitOrder {
+                            order_id: sl_algo_id,
+                            is_algo_order: true,
+                        }),
                     ));
                 }
             }
@@ -1463,6 +1500,11 @@ async fn apply_reanchor_exits(
             exit_side,
             position_side,
             "TAKE_PROFIT_MARKET",
+            &format_exit_quantity(
+                position.position_amt.abs(),
+                symbol_filters.step_size,
+                symbol_filters.qty_precision,
+            )?,
             &tp_trigger_price,
         )
         .await?;
@@ -1474,6 +1516,11 @@ async fn apply_reanchor_exits(
             exit_side,
             position_side,
             "STOP_MARKET",
+            &format_exit_quantity(
+                position.position_amt.abs(),
+                symbol_filters.step_size,
+                symbol_filters.qty_precision,
+            )?,
             &sl_trigger_price,
         )
         .await?;
@@ -1883,7 +1930,10 @@ fn should_cleanup_staged_exit_orders(
     hedge_mode: bool,
 ) -> bool {
     !has_active_position_for_side(state, position_side, hedge_mode)
-        && !state.open_orders.iter().any(|o| o.order_id == entry_order_id)
+        && !state
+            .open_orders
+            .iter()
+            .any(|o| o.order_id == entry_order_id)
 }
 
 fn resolve_modify_tpsl_targets(
@@ -2124,10 +2174,11 @@ async fn place_staged_exit_orders(
     symbol: &str,
     position_side: &str,
     exit_side: &str,
+    quantity: &str,
     tp_trigger_price: &str,
     sl_trigger_price: &str,
 ) -> Result<(i64, i64)> {
-    let stop_loss_order_id = place_close_order(
+    let stop_loss_order_id = match place_close_order(
         http_client,
         api_config,
         exec_config,
@@ -2135,10 +2186,35 @@ async fn place_staged_exit_orders(
         exit_side,
         position_side,
         "STOP_MARKET",
+        quantity,
         sl_trigger_price,
     )
     .await
-    .with_context(|| format!("stage stop-loss for {}", symbol))?;
+    {
+        Ok(order_id) => order_id,
+        Err(err) => {
+            let err_chain = format!("{:#}", err);
+            warn!(
+                symbol = %symbol,
+                position_side = %position_side,
+                exit_side = %exit_side,
+                sl_trigger_price = %sl_trigger_price,
+                tp_trigger_price = %tp_trigger_price,
+                error = %err_chain,
+                "stage stop-loss rejected by binance while staging synchronized exits"
+            );
+            println!(
+                "LLM_STAGE_STOP_LOSS_ERROR symbol={} position_side={} exit_side={} sl_trigger_price={} tp_trigger_price={} error={}",
+                symbol,
+                position_side,
+                exit_side,
+                sl_trigger_price,
+                tp_trigger_price,
+                err_chain.replace('\n', " | "),
+            );
+            return Err(err).with_context(|| format!("stage stop-loss for {}", symbol));
+        }
+    };
 
     match place_close_order(
         http_client,
@@ -2148,6 +2224,7 @@ async fn place_staged_exit_orders(
         exit_side,
         position_side,
         "TAKE_PROFIT_MARKET",
+        quantity,
         tp_trigger_price,
     )
     .await
@@ -2182,22 +2259,28 @@ async fn watch_staged_exit_orders(
     symbol: String,
     position_side: String,
     entry_order_id: i64,
-    take_profit_order_id: Option<i64>,
-    stop_loss_order_id: Option<i64>,
+    take_profit_order: Option<TrackedExitOrder>,
+    stop_loss_order: Option<TrackedExitOrder>,
 ) {
     const STAGED_EXIT_CLEANUP_INTERVAL_SECS: u64 = 15;
 
-    if take_profit_order_id.is_none() && stop_loss_order_id.is_none() {
+    if take_profit_order.is_none() && stop_loss_order.is_none() {
         return;
     }
 
-    let mut ticker =
-        tokio::time::interval(Duration::from_secs(STAGED_EXIT_CLEANUP_INTERVAL_SECS));
+    let mut ticker = tokio::time::interval(Duration::from_secs(STAGED_EXIT_CLEANUP_INTERVAL_SECS));
     ticker.tick().await; // skip the immediate first tick
 
     loop {
         ticker.tick().await;
-        let state = match fetch_symbol_trading_state(&http_client, &api_config, &exec_config, &symbol).await {
+        let state = match fetch_symbol_trading_state(
+            &http_client,
+            &api_config,
+            &exec_config,
+            &symbol,
+        )
+        .await
+        {
             Ok(s) => s,
             Err(err) => {
                 warn!(
@@ -2219,25 +2302,45 @@ async fn watch_staged_exit_orders(
             continue;
         }
 
-        for (label, order_id) in [
-            ("take_profit", take_profit_order_id),
-            ("stop_loss", stop_loss_order_id),
+        for (label, order) in [
+            ("take_profit", take_profit_order),
+            ("stop_loss", stop_loss_order),
         ] {
-            let Some(order_id) = order_id else {
+            let Some(order) = order else {
                 continue;
             };
-            if !state.open_orders.iter().any(|o| o.order_id == order_id) {
+            if !state
+                .open_orders
+                .iter()
+                .any(|o| o.order_id == order.order_id)
+            {
                 continue;
             }
-            if let Err(err) =
-                cancel_algo_order_by_id(&http_client, &api_config, &exec_config, &symbol, order_id)
-                    .await
-            {
+            let cancel_result = if order.is_algo_order {
+                cancel_algo_order_by_id(
+                    &http_client,
+                    &api_config,
+                    &exec_config,
+                    &symbol,
+                    order.order_id,
+                )
+                .await
+            } else {
+                cancel_order_by_id(
+                    &http_client,
+                    &api_config,
+                    &exec_config,
+                    &symbol,
+                    order.order_id,
+                )
+                .await
+            };
+            if let Err(err) = cancel_result {
                 warn!(
                     symbol = %symbol,
                     entry_order_id = entry_order_id,
                     exit_order_kind = label,
-                    exit_order_id = order_id,
+                    exit_order_id = order.order_id,
                     error = %err,
                     "staged_exit_cleanup: cancel_exit_failed"
                 );
@@ -2246,7 +2349,7 @@ async fn watch_staged_exit_orders(
                     symbol = %symbol,
                     entry_order_id = entry_order_id,
                     exit_order_kind = label,
-                    exit_order_id = order_id,
+                    exit_order_id = order.order_id,
                     "staged_exit_cleanup: exit_order_canceled"
                 );
             }
@@ -2512,6 +2615,42 @@ async fn place_entry_market_order(
     .await
 }
 
+fn format_exit_quantity(raw_qty: f64, step_size: f64, qty_precision: usize) -> Result<String> {
+    let normalized_qty = round_down_to_step(raw_qty.abs(), step_size);
+    if normalized_qty < step_size {
+        return Err(anyhow!(
+            "normalized exit quantity {:.8} is below stepSize {:.8}",
+            normalized_qty,
+            step_size
+        ));
+    }
+    Ok(format_decimal(normalized_qty, qty_precision))
+}
+
+fn build_close_order_params(
+    symbol: &str,
+    side: &str,
+    position_side: &str,
+    order_type: &str,
+    quantity: &str,
+    stop_price: &str,
+) -> Vec<(String, String)> {
+    let mut params = vec![
+        ("algoType".to_string(), "CONDITIONAL".to_string()),
+        ("symbol".to_string(), symbol.to_string()),
+        ("side".to_string(), side.to_string()),
+        ("positionSide".to_string(), position_side.to_string()),
+        ("type".to_string(), order_type.to_string()),
+        ("quantity".to_string(), quantity.to_string()),
+        ("triggerPrice".to_string(), stop_price.to_string()),
+        ("workingType".to_string(), "MARK_PRICE".to_string()),
+    ];
+    if position_side.eq_ignore_ascii_case("BOTH") {
+        params.push(("reduceOnly".to_string(), "true".to_string()));
+    }
+    params
+}
+
 async fn place_close_order(
     http_client: &Client,
     api_config: &BinanceApiConfig,
@@ -2520,6 +2659,7 @@ async fn place_close_order(
     side: &str,
     position_side: &str,
     order_type: &str,
+    quantity: &str,
     stop_price: &str,
 ) -> Result<i64> {
     let response: Value = signed_post_json(
@@ -2527,16 +2667,14 @@ async fn place_close_order(
         api_config,
         exec_config,
         "/fapi/v1/algoOrder",
-        vec![
-            ("algoType".to_string(), "CONDITIONAL".to_string()),
-            ("symbol".to_string(), symbol.to_string()),
-            ("side".to_string(), side.to_string()),
-            ("positionSide".to_string(), position_side.to_string()),
-            ("type".to_string(), order_type.to_string()),
-            ("triggerPrice".to_string(), stop_price.to_string()),
-            ("closePosition".to_string(), "true".to_string()),
-            ("workingType".to_string(), "MARK_PRICE".to_string()),
-        ],
+        build_close_order_params(
+            symbol,
+            side,
+            position_side,
+            order_type,
+            quantity,
+            stop_price,
+        ),
     )
     .await?;
     parse_numeric_id(
@@ -3176,14 +3314,8 @@ mod tests {
             reason: "test".to_string(),
         };
 
-        let (new_tp, new_sl) = resolve_modify_tpsl_targets(
-            &intent,
-            Some(2100.0),
-            None,
-            0.01,
-            true,
-        )
-        .expect("tp unchanged + new sl should be allowed");
+        let (new_tp, new_sl) = resolve_modify_tpsl_targets(&intent, Some(2100.0), None, 0.01, true)
+            .expect("tp unchanged + new sl should be allowed");
 
         assert_eq!(new_tp, 2100.0);
         assert_eq!(new_sl, 2047.0);
@@ -3201,14 +3333,9 @@ mod tests {
             reason: "test".to_string(),
         };
 
-        let (new_tp, new_sl) = resolve_modify_tpsl_targets(
-            &intent,
-            Some(2100.0),
-            Some(2047.0),
-            0.01,
-            true,
-        )
-        .expect("new tp + unchanged sl should be allowed");
+        let (new_tp, new_sl) =
+            resolve_modify_tpsl_targets(&intent, Some(2100.0), Some(2047.0), 0.01, true)
+                .expect("new tp + unchanged sl should be allowed");
 
         assert_eq!(new_tp, 2105.0);
         assert_eq!(new_sl, 2047.0);
@@ -3226,19 +3353,12 @@ mod tests {
             reason: "test".to_string(),
         };
 
-        let err = resolve_modify_tpsl_targets(
-            &intent,
-            Some(2100.0),
-            Some(2047.0),
-            0.01,
-            true,
-        )
-        .expect_err("unchanged tp/sl should be rejected");
+        let err = resolve_modify_tpsl_targets(&intent, Some(2100.0), Some(2047.0), 0.01, true)
+            .expect_err("unchanged tp/sl should be rejected");
 
-        assert!(
-            err.to_string()
-                .contains("new_tp/new_sl equal current live exits")
-        );
+        assert!(err
+            .to_string()
+            .contains("new_tp/new_sl equal current live exits"));
     }
 
     #[test]
@@ -3282,5 +3402,56 @@ mod tests {
 
         assert_eq!(effective_tp, Some(1969.59));
         assert_eq!(effective_sl, Some(1941.5));
+    }
+
+    #[test]
+    fn build_close_order_params_use_reduce_only_in_one_way_mode() {
+        let params = build_close_order_params(
+            "ETHUSDT",
+            "SELL",
+            "BOTH",
+            "TAKE_PROFIT_MARKET",
+            "0.01",
+            "2128.28",
+        );
+
+        let params_map = params
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            params_map.get("symbol").map(String::as_str),
+            Some("ETHUSDT")
+        );
+        assert_eq!(params_map.get("side").map(String::as_str), Some("SELL"));
+        assert_eq!(
+            params_map.get("positionSide").map(String::as_str),
+            Some("BOTH")
+        );
+        assert_eq!(
+            params_map.get("type").map(String::as_str),
+            Some("TAKE_PROFIT_MARKET")
+        );
+        assert_eq!(params_map.get("quantity").map(String::as_str), Some("0.01"));
+        assert_eq!(
+            params_map.get("reduceOnly").map(String::as_str),
+            Some("true")
+        );
+        assert!(!params_map.contains_key("closePosition"));
+    }
+
+    #[test]
+    fn build_close_order_params_omit_reduce_only_in_hedge_mode() {
+        let params =
+            build_close_order_params("ETHUSDT", "SELL", "LONG", "STOP_MARKET", "0.01", "2078.77");
+        let params_map = params
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert!(!params_map.contains_key("reduceOnly"));
+    }
+
+    #[test]
+    fn format_exit_quantity_rounds_down_to_step() {
+        let qty = format_exit_quantity(0.01234, 0.001, 3).expect("format qty");
+        assert_eq!(qty, "0.012");
     }
 }
