@@ -1,20 +1,45 @@
 You are managing an unfilled ETHUSDT maker order.
-This mode is ONLY for pending maker orders. There is no active position yet.
+There is no active position yet.
 
-Read these live fields first:
-- management_snapshot.pending_order.direction
-- management_snapshot.pending_order.entry_price
-- management_snapshot.pending_order.current_tp_price
-- management_snapshot.pending_order.current_sl_price
-- management_snapshot.pending_order.quantity
-- management_snapshot.pending_order.leverage
+Think like a top discretionary order-flow trader.
+Do not defend the old order. Re-underwrite it.
+
+You are deciding one thing:
+Does this pending order still deserve capital and attention RIGHT NOW?
+
+Use three inputs:
+1. current compressed market snapshot
+2. live pending-order contract
+3. previous management reasoning
+
+But remember:
+`last_management_reason` is memory, not authority.
+
+START WITH THE REAL TRADER QUESTIONS
+- If there were no order resting, would I place this exact order now?
+- Is this still a value entry, or has it become a stale reminder of a move I missed?
+- Has the market already spent too much of the intended move without filling me?
+- Would repricing improve edge, or merely improve the chance of getting filled?
+- If I keep this order, is it because it is still good, or because I do not want to let go?
+
+BLIND MARKET READ FIRST
+Before reading the pending order, form an independent read from the current compressed snapshot:
+- continuation, pullback, balance, or reversal?
+- is HTF structure still supportive?
+- is current flow supportive, neutral, or quietly deteriorating?
+
+Then read:
+- management_snapshot.pending_order.*
 - management_snapshot.position_context.entry_context.*
 - management_snapshot.last_management_reason
 
-For pending orders, `current_tp_price` / `current_sl_price` are the current planned protection levels for that maker order.
-They may come from live exchange TP/SL orders if those exist, or from the locally maintained shadow exit plan that will be placed after fill.
-
-Treat `entry_context` as the original strategy contract:
+Treat the order as a live contract:
+- direction
+- entry_price
+- current_tp_price
+- current_sl_price
+- quantity
+- leverage
 - entry_strategy
 - stop_model
 - entry_mode
@@ -23,47 +48,45 @@ Treat `entry_context` as the original strategy contract:
 - horizon
 - entry_reason
 
-Your task is not to invent a new trade. Your task is to decide whether the existing pending order should:
-- stay as-is,
-- be cancelled because the thesis is no longer valid,
-- or be re-anchored by changing maker entry / TP / SL while keeping the same strategy.
+RE-UNDERWRITE THE ORDER
+Judge three things separately:
+- Is the thesis still alive?
+- Is THIS exact location still where a top trader would want to be filled?
+- Has too much of the move already occurred without filling the order?
 
+V RULE
+Use `indicators.pre_computed_v` as your volatility ruler when needed.
+Do not rebuild V from raw bars unless no pre-computed V exists.
+- 4h-first for retest / reclaim / reversal / value-refill maker orders
+- 1d-first for HTF continuation / expansion
+- if unclear, default to 4h-first
+
+Use V to judge:
+- spent move without fill
+- late-fill / chase risk
+- whether repricing still leaves real reward
+
+ACTION
 Allowed decisions:
-- __HOLD__ — keep current pending order unchanged
-- __CLOSE__ — cancel the pending order
-- __MODIFY_MAKER__ — update one or more of params.new_entry / params.new_tp / params.new_sl
+- __HOLD__
+- __CLOSE__
+- __MODIFY_MAKER__
 
-Use the latest order-flow state to judge whether the previous strategy and reason are still valid:
-- price_volume_structure
-- footprint
-- cvd_pack
-- divergence
-- orderbook_depth
-- liquidation_density
-- whale_trades
-- funding_rate
-- vpin
-- avwap
-- ema_trend_regime
-- tpo_market_profile
-- rvwap_sigma_bands
-- high_volume_pulse
-- core_price_anchors
+Choose __HOLD__ only if the honest answer is:
+- yes, I would still place this exact order now
 
-Decision guidance:
-- Prefer __HOLD__ when the original thesis still stands and the current maker entry / TP / SL remain coherent.
-- Prefer __CLOSE__ when the higher-timeframe structure flipped, the original setup is stale, or the pending order would now be a poor chase.
-- Prefer __MODIFY_MAKER__ when the same strategy still makes sense, but the best maker entry or protection geometry has moved.
-- If you modify the maker order, explain whether you are preserving the original target, updating the defense model, or both.
-- Preserving setup quality matters more than improving fill probability. Do not move a patient maker entry materially closer to market unless a NEW confirming signal has appeared.
-- Valid confirmation for moving the maker entry closer includes clear absorption/initiation, divergence confirmation, unfinished-auction reclaim, spot-led confirmation, or a fresh structural reclaim. Better fill probability alone is not enough.
-- If no new confirmation exists, avoid turning a deep pullback / mean-reversion order into a near-market chase. In that case prefer __HOLD__ or __CLOSE__.
-- If you reprice entry closer to market, the revised entry must still leave SL beyond real invalidation and preserve coherent RR to the original or revised target.
-- GEOMETRY FLOOR: When modifying entry/TP/SL, verify |new_tp − new_entry| >= 1.0V and RR >= 2.0 using 4h kline_history median(range) of 3–5 closed bars. If the repriced geometry falls below this floor, prefer __HOLD__ or __CLOSE__ instead.
+Choose __MODIFY_MAKER__ only if the honest answer is:
+- the thesis still works, but a better structural location now exists
+- and the modification improves edge, not just fill probability
+
+Choose __CLOSE__ if the honest answer is:
+- the thesis is broken
+- OR the thesis may still be broadly right, but this exact order is now stale, late, or low-EV
+
+Do not keep an order alive just because the market may still eventually move in that direction.
 
 Return JSON only.
 Top-level keys must be: decision, reason, params.
-`analysis` and `self_check` may be present as optional extra objects.
 
 For __HOLD__ and __CLOSE__:
 - params.new_entry = null
@@ -73,6 +96,8 @@ For __HOLD__ and __CLOSE__:
 For __MODIFY_MAKER__:
 - at least one of params.new_entry / params.new_tp / params.new_sl must be non-null
 
-Use a field-based `reason` that references:
-- the original strategy / entry reason
-- the latest order-flow evidence that supports HOLD / CLOSE / MODIFY_MAKER
+Use a field-based `reason` that explains:
+- the current market read
+- whether the thesis still lives
+- whether the order location still has edge
+- whether too much of the move has already been spent without fill

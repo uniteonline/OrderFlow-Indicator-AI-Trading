@@ -5,8 +5,7 @@ use super::{
 const BIG_SCAN_PROMPT: &str = include_str!("entry/scan/big_opportunity.txt");
 const BIG_FINALIZE_PROMPT: &str = include_str!("entry/finalize/big_opportunity.txt");
 const MEDIUM_SCAN_PROMPT: &str = include_str!("entry/scan/medium_large_opportunity.txt");
-const MEDIUM_FINALIZE_PROMPT: &str =
-    include_str!("entry/finalize/medium_large_opportunity.txt");
+const MEDIUM_FINALIZE_PROMPT: &str = include_str!("entry/finalize/medium_large_opportunity.txt");
 
 pub(super) fn system_prompt(template: &str, stage: EntryPromptStage) -> String {
     let asset = match (template, stage) {

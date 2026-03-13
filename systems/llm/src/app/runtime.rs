@@ -763,6 +763,104 @@ fn primary_pending_order_key(
     Some((key, remaining_qty, entry_price))
 }
 
+fn directional_context_key(symbol: &str, direction: &str) -> Option<String> {
+    let direction = direction.trim();
+    if direction.eq_ignore_ascii_case("LONG") || direction.eq_ignore_ascii_case("SHORT") {
+        Some(format!(
+            "{}:{}",
+            symbol.to_ascii_uppercase(),
+            direction.to_ascii_uppercase()
+        ))
+    } else {
+        None
+    }
+}
+
+fn directional_context_key_from_trade_decision(
+    symbol: &str,
+    decision: TradeDecision,
+) -> Option<String> {
+    match decision {
+        TradeDecision::Long => directional_context_key(symbol, "LONG"),
+        TradeDecision::Short => directional_context_key(symbol, "SHORT"),
+        TradeDecision::NoTrade => None,
+    }
+}
+
+fn both_context_alias_for_directional_key(key: &str) -> Option<String> {
+    let (symbol, suffix) = key.rsplit_once(':')?;
+    if suffix.eq_ignore_ascii_case("LONG") || suffix.eq_ignore_ascii_case("SHORT") {
+        Some(format!("{}:BOTH", symbol.to_ascii_uppercase()))
+    } else {
+        None
+    }
+}
+
+fn execution_context_keys_for_report(
+    symbol: &str,
+    position_side: &str,
+    decision: TradeDecision,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    let raw = position_side.trim();
+    if !raw.is_empty() && raw != "-" {
+        keys.push(format!(
+            "{}:{}",
+            symbol.to_ascii_uppercase(),
+            raw.to_ascii_uppercase()
+        ));
+    }
+    if raw.is_empty() || raw == "-" || raw.eq_ignore_ascii_case("BOTH") {
+        if let Some(key) = directional_context_key_from_trade_decision(symbol, decision) {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+fn execution_context_keys_for_journal_restore(
+    symbol: &str,
+    position_side: Option<&str>,
+    decision: Option<&str>,
+    active_key: Option<&String>,
+    pending_key: Option<&String>,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(key) = active_key {
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+    if let Some(key) = pending_key {
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+    let raw = position_side.unwrap_or_default().trim();
+    if !raw.is_empty() && raw != "-" {
+        let key = format!(
+            "{}:{}",
+            symbol.to_ascii_uppercase(),
+            raw.to_ascii_uppercase()
+        );
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    if raw.is_empty() || raw == "-" || raw.eq_ignore_ascii_case("BOTH") {
+        if let Some(direction) = decision {
+            if let Some(key) = directional_context_key(symbol, direction) {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+        }
+    }
+    keys
+}
+
 fn remap_trade_entry_and_stop_loss(
     _provider: &str,
     execution_config: &crate::app::config::LlmExecutionConfig,
@@ -878,7 +976,26 @@ async fn sync_and_build_position_context_snapshot(
         return None;
     }
     let mut guard = context_state.lock().await;
+    let fallback_both_context = both_context_alias_for_directional_key(&key)
+        .and_then(|alias_key| guard.get(&alias_key).cloned());
     let entry = guard.entry(key).or_default();
+    if let Some(fallback) = fallback_both_context.as_ref() {
+        if entry.effective_entry_price.is_none() {
+            entry.effective_entry_price = fallback.effective_entry_price;
+        }
+        if entry.effective_take_profit.is_none() {
+            entry.effective_take_profit = fallback.effective_take_profit;
+        }
+        if entry.effective_stop_loss.is_none() {
+            entry.effective_stop_loss = fallback.effective_stop_loss;
+        }
+        if entry.entry_context.is_none() {
+            entry.entry_context = fallback.entry_context.clone();
+        }
+        if entry.effective_leverage.is_none() {
+            entry.effective_leverage = fallback.effective_leverage;
+        }
+    }
     if entry.original_qty <= f64::EPSILON {
         entry.original_qty = current_qty;
     } else if current_qty > entry.original_qty {
@@ -1078,36 +1195,21 @@ async fn restore_position_context_from_journal_for_live_state(
             .map(|s| s.to_string());
         match event_type {
             "llm_order_execution" => {
-                let Some(key) = active_key.as_ref() else {
+                let keys = execution_context_keys_for_journal_restore(
+                    &symbol,
+                    value.get("position_side").and_then(Value::as_str),
+                    value.get("decision").and_then(Value::as_str),
+                    active_key.as_ref(),
+                    pending_key.as_ref(),
+                );
+                if keys.is_empty() {
                     continue;
-                };
-                let entry = guard.entry(key.clone()).or_default();
-                entry.last_management_reason =
-                    reason.clone().or(entry.last_management_reason.clone());
-                entry.effective_entry_price = value
-                    .get("maker_entry_price")
-                    .and_then(Value::as_f64)
-                    .or(entry.effective_entry_price);
-                entry.effective_take_profit = value
-                    .get("effective_take_profit")
-                    .and_then(Value::as_f64)
-                    .or(entry.effective_take_profit);
-                entry.effective_stop_loss = value
-                    .get("effective_stop_loss")
-                    .and_then(Value::as_f64)
-                    .or(entry.effective_stop_loss);
-                entry.effective_leverage = value
-                    .get("leverage")
-                    .and_then(Value::as_u64)
-                    .map(|v| v as u32)
-                    .or(entry.effective_leverage);
-                // Restore entry_context if present (written since the fix was applied)
+                }
                 let has_entry_context = value.get("entry_strategy").is_some()
                     || value.get("stop_model").is_some()
                     || value.get("horizon").is_some();
-                if has_entry_context && entry.entry_context.is_none() {
-                    let entry_reason = reason.clone().unwrap_or_default();
-                    entry.entry_context = Some(EntryContextForState {
+                let restored_entry_context = if has_entry_context {
+                    Some(EntryContextForState {
                         entry_strategy: value
                             .get("entry_strategy")
                             .and_then(Value::as_str)
@@ -1127,9 +1229,36 @@ async fn restore_position_context_from_journal_for_live_state(
                             .get("horizon")
                             .and_then(Value::as_str)
                             .map(str::to_string),
-                        entry_reason,
+                        entry_reason: reason.clone().unwrap_or_default(),
                         entry_v: value.get("entry_v").and_then(Value::as_f64),
-                    });
+                    })
+                } else {
+                    None
+                };
+                for key in keys {
+                    let entry = guard.entry(key).or_default();
+                    entry.last_management_reason =
+                        reason.clone().or(entry.last_management_reason.clone());
+                    entry.effective_entry_price = value
+                        .get("maker_entry_price")
+                        .and_then(Value::as_f64)
+                        .or(entry.effective_entry_price);
+                    entry.effective_take_profit = value
+                        .get("effective_take_profit")
+                        .and_then(Value::as_f64)
+                        .or(entry.effective_take_profit);
+                    entry.effective_stop_loss = value
+                        .get("effective_stop_loss")
+                        .and_then(Value::as_f64)
+                        .or(entry.effective_stop_loss);
+                    entry.effective_leverage = value
+                        .get("leverage")
+                        .and_then(Value::as_u64)
+                        .map(|v| v as u32)
+                        .or(entry.effective_leverage);
+                    if entry.entry_context.is_none() {
+                        entry.entry_context = restored_entry_context.clone();
+                    }
                 }
             }
             "llm_management_execution" | "llm_management_execution_error" => {
@@ -1416,6 +1545,8 @@ async fn update_position_context_after_pending_order_action(
     };
 
     let mut guard = context_state.lock().await;
+    let fallback_both_context = both_context_alias_for_directional_key(&key)
+        .and_then(|alias_key| guard.get(&alias_key).cloned());
     if matches!(
         intent.decision,
         crate::llm::decision::PendingOrderManagementDecision::Close
@@ -1425,6 +1556,23 @@ async fn update_position_context_after_pending_order_action(
     }
 
     let entry = guard.entry(key).or_default();
+    if let Some(fallback) = fallback_both_context.as_ref() {
+        if entry.effective_entry_price.is_none() {
+            entry.effective_entry_price = fallback.effective_entry_price;
+        }
+        if entry.effective_take_profit.is_none() {
+            entry.effective_take_profit = fallback.effective_take_profit;
+        }
+        if entry.effective_stop_loss.is_none() {
+            entry.effective_stop_loss = fallback.effective_stop_loss;
+        }
+        if entry.entry_context.is_none() {
+            entry.entry_context = fallback.entry_context.clone();
+        }
+        if entry.effective_leverage.is_none() {
+            entry.effective_leverage = fallback.effective_leverage;
+        }
+    }
     if entry.original_qty <= f64::EPSILON {
         entry.original_qty = current_qty;
     } else if current_qty > entry.original_qty {
@@ -3213,20 +3361,13 @@ async fn invoke_bundle_models(
                     )
                     .await;
                     // Capture entry context so management cycles can continue the strategy.
-                    let position_side = report.position_side.to_ascii_uppercase();
-                    if !position_side.is_empty() && position_side != "-" {
-                        let key = format!(
-                            "{}:{}",
-                            bundle.raw.symbol.to_ascii_uppercase(),
-                            position_side
-                        );
-                        let mut guard = position_context_state.lock().await;
-                        let ctx_entry = guard.entry(key).or_default();
-                        ctx_entry.effective_entry_price = Some(report.maker_entry_price);
-                        ctx_entry.effective_stop_loss = Some(report.actual_stop_loss);
-                        ctx_entry.effective_take_profit = Some(report.actual_take_profit);
-                        ctx_entry.effective_leverage = Some(report.leverage);
-                        ctx_entry.entry_context = Some(EntryContextForState {
+                    let context_keys = execution_context_keys_for_report(
+                        &bundle.raw.symbol,
+                        &report.position_side,
+                        intent.decision,
+                    );
+                    if !context_keys.is_empty() {
+                        let captured_entry_context = EntryContextForState {
                             entry_strategy: extract_nested_str(
                                 parsed_decision,
                                 &["analysis", "entry_strategy"],
@@ -3251,7 +3392,16 @@ async fn invoke_bundle_models(
                                 parsed_decision,
                                 &["analysis", "volatility_unit_v"],
                             ),
-                        });
+                        };
+                        let mut guard = position_context_state.lock().await;
+                        for key in context_keys {
+                            let ctx_entry = guard.entry(key).or_default();
+                            ctx_entry.effective_entry_price = Some(report.maker_entry_price);
+                            ctx_entry.effective_stop_loss = Some(report.actual_stop_loss);
+                            ctx_entry.effective_take_profit = Some(report.actual_take_profit);
+                            ctx_entry.effective_leverage = Some(report.leverage);
+                            ctx_entry.entry_context = Some(captured_entry_context.clone());
+                        }
                     }
                 }
                 Err(err) => {
@@ -6560,6 +6710,96 @@ mod tests {
         assert_eq!(pending.leverage, Some(20));
         assert!(snapshot.positions.is_empty());
         assert!(snapshot.position_context.is_some());
+    }
+
+    #[test]
+    fn execution_context_keys_for_report_include_directional_alias_for_both() {
+        let keys = execution_context_keys_for_report("ETHUSDT", "BOTH", TradeDecision::Long);
+        assert_eq!(
+            keys,
+            vec!["ETHUSDT:BOTH".to_string(), "ETHUSDT:LONG".to_string()]
+        );
+    }
+
+    #[test]
+    fn sync_snapshot_backfills_pending_entry_context_from_both_alias() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        runtime.block_on(async {
+            let state = TradingStateSnapshot {
+                symbol: "ETHUSDT".to_string(),
+                has_active_context: false,
+                has_active_positions: false,
+                has_open_orders: true,
+                active_positions: vec![],
+                open_orders: vec![OpenOrderSnapshot {
+                    order_id: 1,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "LIMIT".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.05,
+                    executed_qty: 0.0,
+                    price: 2109.94,
+                    stop_price: 0.0,
+                    close_position: false,
+                    reduce_only: false,
+                }],
+                total_wallet_balance: 1000.0,
+                available_balance: 800.0,
+            };
+
+            let context_state =
+                Arc::new(Mutex::new(HashMap::<String, PositionContextState>::new()));
+            {
+                let mut guard = context_state.lock().await;
+                guard.insert(
+                    "ETHUSDT:BOTH".to_string(),
+                    PositionContextState {
+                        original_qty: 0.05,
+                        last_management_action: None,
+                        last_management_reason: Some("keep pending".to_string()),
+                        reduction_history: vec![],
+                        effective_entry_price: Some(2109.94),
+                        effective_stop_loss: Some(2098.55),
+                        effective_take_profit: Some(2148.0),
+                        effective_leverage: Some(42),
+                        entry_context: Some(EntryContextForState {
+                            entry_strategy: Some("Break-Retest".to_string()),
+                            stop_model: None,
+                            entry_mode: Some("patient_retest".to_string()),
+                            original_tp: Some(2148.0),
+                            original_sl: Some(2106.91),
+                            sweep_wick_extreme: None,
+                            horizon: Some("4h".to_string()),
+                            entry_reason: "original entry contract".to_string(),
+                            entry_v: Some(39.13),
+                        }),
+                    },
+                );
+            }
+
+            let snapshot = sync_and_build_position_context_snapshot(
+                Some(&state),
+                &context_state,
+                Some("keep pending".to_string()),
+            )
+            .await
+            .expect("position context snapshot");
+
+            let entry_context = snapshot.entry_context.expect("backfilled entry_context");
+            assert_eq!(
+                entry_context.entry_strategy.as_deref(),
+                Some("Break-Retest")
+            );
+            assert_eq!(entry_context.horizon.as_deref(), Some("4h"));
+            assert_eq!(snapshot.effective_entry_price, Some(2109.94));
+            assert_eq!(snapshot.effective_take_profit, Some(2148.0));
+            assert_eq!(snapshot.effective_stop_loss, Some(2098.55));
+            assert_eq!(snapshot.effective_leverage, Some(42));
+        });
     }
 
     #[test]
