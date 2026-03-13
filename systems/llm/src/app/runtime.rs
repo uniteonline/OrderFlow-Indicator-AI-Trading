@@ -418,6 +418,8 @@ fn build_invocation_input(
     last_management_reason: Option<String>,
     position_context: Option<PositionContextForLlm>,
 ) -> ModelInvocationInput {
+    let mut indicators = bundle.filtered_indicators.clone();
+    inject_precomputed_v_into_runtime_indicators(&mut indicators);
     let management_snapshot = build_management_snapshot_for_llm(
         trading_state.as_ref(),
         last_management_reason,
@@ -431,7 +433,7 @@ fn build_invocation_input(
         source_routing_key: bundle.raw.routing_key.clone(),
         source_published_at: bundle.raw.published_at,
         received_at: bundle.received_at,
-        indicators: bundle.filtered_indicators.clone(),
+        indicators,
         missing_indicator_codes: bundle.missing_indicator_codes.clone(),
         management_mode,
         pending_order_mode,
@@ -1599,6 +1601,20 @@ fn summarize_reason(reason: &str) -> String {
     compact.chars().take(80).collect()
 }
 
+fn resolve_invoke_management_reason(
+    active_position_count: usize,
+    open_order_count: usize,
+    global_reason: Option<String>,
+    position_context: Option<&PositionContextForLlm>,
+) -> Option<String> {
+    if active_position_count == 0 && open_order_count == 0 {
+        return None;
+    }
+    position_context
+        .and_then(|ctx| ctx.last_management_reason.clone())
+        .or(global_reason)
+}
+
 fn queue_latest_bundle_invoke(
     ctx: &AppContext,
     latest_bundle: &Option<LatestBundle>,
@@ -1764,9 +1780,13 @@ async fn invoke_bundle_models(
             },
         )
         .unwrap_or("NO_ACTIVE_CONTEXT");
-    let previous_management_reason = {
+    let global_management_reason = {
         let guard = last_management_reason.lock().await;
-        guard.clone()
+        if active_position_count == 0 && open_order_count == 0 {
+            None
+        } else {
+            guard.clone()
+        }
     };
     hydrate_position_context_from_live_state(
         &http_client,
@@ -1791,9 +1811,15 @@ async fn invoke_bundle_models(
     let position_context = sync_and_build_position_context_snapshot(
         trading_state.as_ref(),
         &position_context_state,
-        previous_management_reason.clone(),
+        global_management_reason.clone(),
     )
     .await;
+    let invoke_management_reason = resolve_invoke_management_reason(
+        active_position_count,
+        open_order_count,
+        global_management_reason.clone(),
+        position_context.as_ref(),
+    );
     println!(
         "LLM_INVOKE_CONTEXT ts_bucket={} trigger={} symbol={} management_mode={} pending_order_mode={} context_state={} active_position_count={} open_order_count={} default_model={} prompt_template={} last_management_reason={}",
         bundle.raw.ts_bucket,
@@ -1806,7 +1832,7 @@ async fn invoke_bundle_models(
         open_order_count,
         config.active_default_model(),
         config.llm.prompt_template,
-        previous_management_reason.as_deref().unwrap_or("-"),
+        invoke_management_reason.as_deref().unwrap_or("-"),
     );
     if let Some(state) = trading_state.as_ref() {
         let total_unrealized_pnl: f64 = state
@@ -1827,7 +1853,7 @@ async fn invoke_bundle_models(
             "open_order_count": open_order_count,
             "default_model": config.active_default_model(),
             "prompt_template": config.llm.prompt_template,
-            "last_management_reason": previous_management_reason.clone(),
+            "last_management_reason": invoke_management_reason.clone(),
             "total_wallet_balance": state.total_wallet_balance,
             "available_balance": state.available_balance,
             "total_unrealized_pnl": total_unrealized_pnl,
@@ -1841,7 +1867,7 @@ async fn invoke_bundle_models(
         management_mode,
         pending_order_mode,
         trading_state.clone(),
-        previous_management_reason,
+        invoke_management_reason,
         position_context,
     );
 
@@ -3298,6 +3324,13 @@ async fn invoke_bundle_models(
                         report.exit_orders_deferred,
                         intent.reason.replace('\n', " "),
                     );
+                    let captured_entry_context = build_entry_context_from_fallbacks(
+                        parsed_decision,
+                        out.entry_stage_trace.as_deref(),
+                        &input,
+                        intent.horizon.as_deref(),
+                        &intent.reason,
+                    );
                     let event = json!({
                         "event_type": "llm_order_execution",
                         "event_ts": Utc::now().to_rfc3339(),
@@ -3327,14 +3360,14 @@ async fn invoke_bundle_models(
                         "exit_orders_deferred": report.exit_orders_deferred,
                         "reason": intent.reason,
                         // entry_context fields — persisted for service-restart restoration
-                        "entry_strategy": extract_nested_str(parsed_decision, &["analysis", "entry_strategy"]),
-                        "stop_model": extract_nested_str(parsed_decision, &["analysis", "stop_model"]),
-                        "entry_mode": extract_nested_str(parsed_decision, &["params", "entry_mode"]),
-                        "entry_original_tp": extract_nested_f64(parsed_decision, &["params", "tp"]),
-                        "entry_original_sl": extract_nested_f64(parsed_decision, &["params", "sl"]),
-                        "sweep_wick_extreme": extract_nested_f64(parsed_decision, &["params", "sweep_wick_extreme"]),
-                        "horizon": intent.horizon,
-                        "entry_v": extract_nested_f64(parsed_decision, &["analysis", "volatility_unit_v"]),
+                        "entry_strategy": captured_entry_context.entry_strategy.clone(),
+                        "stop_model": captured_entry_context.stop_model.clone(),
+                        "entry_mode": captured_entry_context.entry_mode.clone(),
+                        "entry_original_tp": captured_entry_context.original_tp,
+                        "entry_original_sl": captured_entry_context.original_sl,
+                        "sweep_wick_extreme": captured_entry_context.sweep_wick_extreme,
+                        "horizon": captured_entry_context.horizon.clone(),
+                        "entry_v": captured_entry_context.entry_v,
                     });
                     if let Err(err) = append_journal_event(event) {
                         warn!(error = %err, "append llm_order_execution journal failed");
@@ -3360,6 +3393,10 @@ async fn invoke_bundle_models(
                         },
                     )
                     .await;
+                    {
+                        let mut guard = last_management_reason.lock().await;
+                        *guard = Some(intent.reason.clone());
+                    }
                     // Capture entry context so management cycles can continue the strategy.
                     let context_keys = execution_context_keys_for_report(
                         &bundle.raw.symbol,
@@ -3367,32 +3404,6 @@ async fn invoke_bundle_models(
                         intent.decision,
                     );
                     if !context_keys.is_empty() {
-                        let captured_entry_context = EntryContextForState {
-                            entry_strategy: extract_nested_str(
-                                parsed_decision,
-                                &["analysis", "entry_strategy"],
-                            ),
-                            stop_model: extract_nested_str(
-                                parsed_decision,
-                                &["analysis", "stop_model"],
-                            ),
-                            entry_mode: extract_nested_str(
-                                parsed_decision,
-                                &["params", "entry_mode"],
-                            ),
-                            original_tp: extract_nested_f64(parsed_decision, &["params", "tp"]),
-                            original_sl: extract_nested_f64(parsed_decision, &["params", "sl"]),
-                            sweep_wick_extreme: extract_nested_f64(
-                                parsed_decision,
-                                &["params", "sweep_wick_extreme"],
-                            ),
-                            horizon: intent.horizon.clone(),
-                            entry_reason: intent.reason.clone(),
-                            entry_v: extract_nested_f64(
-                                parsed_decision,
-                                &["analysis", "volatility_unit_v"],
-                            ),
-                        };
                         let mut guard = position_context_state.lock().await;
                         for key in context_keys {
                             let ctx_entry = guard.entry(key).or_default();
@@ -6136,6 +6147,229 @@ fn extract_nested_str(value: &Value, path: &[&str]) -> Option<String> {
     current.as_str().map(|s| s.to_string())
 }
 
+fn entry_stage_event<'a>(trace: Option<&'a [Value]>, stage: &str) -> Option<&'a Value> {
+    trace?.iter().rev().find(|event| {
+        event
+            .get("stage")
+            .and_then(Value::as_str)
+            .map(|value| value.eq_ignore_ascii_case(stage))
+            .unwrap_or(false)
+    })
+}
+
+fn entry_stage_trace_str(
+    trace: Option<&[Value]>,
+    finalize_pointer: &str,
+    scan_pointer: &str,
+) -> Option<String> {
+    entry_stage_event(trace, "finalize")
+        .and_then(|event| event.pointer(finalize_pointer))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            entry_stage_event(trace, "scan")
+                .and_then(|event| event.pointer(scan_pointer))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+}
+
+fn entry_stage_trace_primary_strategy(trace: Option<&[Value]>) -> Option<String> {
+    entry_stage_trace_str(
+        trace,
+        "/primary_strategy",
+        "/parsed_scan/scan/primary_strategy",
+    )
+}
+
+fn entry_stage_trace_entry_style(trace: Option<&[Value]>) -> Option<String> {
+    entry_stage_trace_str(trace, "/entry_style", "/parsed_scan/scan/entry_style")
+}
+
+fn entry_stage_trace_stop_model_hint(trace: Option<&[Value]>) -> Option<String> {
+    entry_stage_trace_str(
+        trace,
+        "/stop_model_hint",
+        "/parsed_scan/scan/stop_model_hint",
+    )
+}
+
+fn compute_v_for_timeframe_from_indicators(
+    indicators: &Value,
+    timeframe: &str,
+) -> Option<(f64, String)> {
+    let base = format!("/kline_history/payload/intervals/{timeframe}");
+    let bars = indicators
+        .pointer(&format!("{base}/futures/bars"))
+        .or_else(|| indicators.pointer(&format!("{base}/markets/futures/bars")))?
+        .as_array()?;
+
+    let closed_ranges: Vec<(String, f64)> = bars
+        .iter()
+        .filter(|bar| {
+            bar.get("is_closed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter_map(|bar| {
+            let high = bar.get("high").and_then(Value::as_f64)?;
+            let low = bar.get("low").and_then(Value::as_f64)?;
+            let open_time = bar
+                .get("open_time")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            Some((open_time, high - low))
+        })
+        .take(5)
+        .collect();
+
+    if closed_ranges.len() < 3 {
+        return None;
+    }
+
+    let mut sorted: Vec<f64> = closed_ranges.iter().map(|(_, range)| *range).collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = sorted[sorted.len() / 2];
+    let bars_desc = closed_ranges
+        .iter()
+        .map(|(time, range)| format!("{}:{:.4}", time, range))
+        .collect::<Vec<_>>()
+        .join(",");
+    let basis = format!(
+        "tf={}; n={}; bars=[{}]; sorted=[{}]; median={:.4}",
+        timeframe,
+        closed_ranges.len(),
+        bars_desc,
+        sorted
+            .iter()
+            .map(|range| format!("{:.4}", range))
+            .collect::<Vec<_>>()
+            .join(","),
+        median
+    );
+    Some((median, basis))
+}
+
+fn inject_precomputed_v_into_runtime_indicators(indicators: &mut Value) {
+    if indicators.pointer("/pre_computed_v").is_some() {
+        return;
+    }
+
+    let v_4h = compute_v_for_timeframe_from_indicators(indicators, "4h");
+    let v_1d = compute_v_for_timeframe_from_indicators(indicators, "1d");
+    let status = match (v_4h.is_some(), v_1d.is_some()) {
+        (true, true) => "ok",
+        (true, false) => "v_4h_only",
+        (false, true) => "v_1d_only",
+        (false, false) => "unavailable",
+    };
+
+    let Some(indicators_obj) = indicators.as_object_mut() else {
+        return;
+    };
+
+    let mut pre_computed_v = Map::new();
+    pre_computed_v.insert("status".to_string(), Value::String(status.to_string()));
+    if let Some((value, basis)) = v_4h {
+        pre_computed_v.insert("v_4h".to_string(), json!(value));
+        pre_computed_v.insert("v_4h_basis".to_string(), Value::String(basis));
+    }
+    if let Some((value, basis)) = v_1d {
+        pre_computed_v.insert("v_1d".to_string(), json!(value));
+        pre_computed_v.insert("v_1d_basis".to_string(), Value::String(basis));
+    }
+    indicators_obj.insert("pre_computed_v".to_string(), Value::Object(pre_computed_v));
+}
+
+fn normalize_entry_style(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+}
+
+fn preferred_v_timeframe(entry_style: Option<&str>, horizon: Option<&str>) -> &'static str {
+    if let Some(style) = entry_style {
+        match normalize_entry_style(style).as_str() {
+            "patient_retest" | "post_sweep_reclaim" | "market_after_flip" | "reversal"
+            | "mean_reversion" | "value_area_refill" | "reversal_sequence" => return "4h",
+            "trend_continuation"
+            | "spot_led_continuation"
+            | "hidden_divergence_continuation"
+            | "htf_expansion" => return "1d",
+            _ => {}
+        }
+    }
+
+    match horizon.map(|value| value.to_ascii_lowercase()) {
+        Some(value) if value.contains("1d") || value.contains("3d") => "1d",
+        _ => "4h",
+    }
+}
+
+fn resolve_entry_v_from_sources(
+    parsed_decision: &Value,
+    trace: Option<&[Value]>,
+    input: &ModelInvocationInput,
+    horizon: Option<&str>,
+) -> Option<f64> {
+    if let Some(entry_v) = extract_nested_f64(parsed_decision, &["analysis", "volatility_unit_v"]) {
+        return Some(entry_v);
+    }
+
+    let entry_style = entry_stage_trace_entry_style(trace);
+    let preferred = preferred_v_timeframe(entry_style.as_deref(), horizon);
+    let v_4h = input
+        .indicators
+        .pointer("/pre_computed_v/v_4h")
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            compute_v_for_timeframe_from_indicators(&input.indicators, "4h").map(|(value, _)| value)
+        });
+    let v_1d = input
+        .indicators
+        .pointer("/pre_computed_v/v_1d")
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            compute_v_for_timeframe_from_indicators(&input.indicators, "1d").map(|(value, _)| value)
+        });
+
+    match preferred {
+        "1d" => v_1d.or(v_4h),
+        _ => v_4h.or(v_1d),
+    }
+}
+
+fn build_entry_context_from_fallbacks(
+    parsed_decision: &Value,
+    trace: Option<&[Value]>,
+    input: &ModelInvocationInput,
+    horizon: Option<&str>,
+    entry_reason: &str,
+) -> EntryContextForState {
+    EntryContextForState {
+        entry_strategy: extract_nested_str(parsed_decision, &["analysis", "entry_strategy"])
+            .or_else(|| entry_stage_trace_primary_strategy(trace)),
+        stop_model: extract_nested_str(parsed_decision, &["analysis", "stop_model"])
+            .or_else(|| entry_stage_trace_stop_model_hint(trace)),
+        entry_mode: extract_nested_str(parsed_decision, &["params", "entry_mode"])
+            .or_else(|| entry_stage_trace_entry_style(trace)),
+        original_tp: extract_nested_f64(parsed_decision, &["params", "tp"]),
+        original_sl: extract_nested_f64(parsed_decision, &["params", "sl"]),
+        sweep_wick_extreme: extract_nested_f64(parsed_decision, &["params", "sweep_wick_extreme"]),
+        horizon: horizon.map(str::to_string),
+        entry_reason: entry_reason.to_string(),
+        entry_v: resolve_entry_v_from_sources(parsed_decision, trace, input, horizon),
+    }
+}
+
 async fn send_trade_signal_notifications(
     telegram_operator: Option<&TelegramOperator>,
     x_operator: Option<&XOperator>,
@@ -6351,6 +6585,24 @@ mod tests {
         ActivePositionSnapshot, OpenOrderSnapshot, TradingStateSnapshot,
     };
     use crate::llm::decision::{TradeDecision, TradeIntent};
+
+    fn sample_model_input(indicators: Value) -> ModelInvocationInput {
+        ModelInvocationInput {
+            symbol: "ETHUSDT".to_string(),
+            ts_bucket: Utc::now(),
+            window_code: "1m".to_string(),
+            indicator_count: indicators.as_object().map(|obj| obj.len()).unwrap_or(0),
+            source_routing_key: "test.route".to_string(),
+            source_published_at: None,
+            received_at: Utc::now(),
+            indicators,
+            missing_indicator_codes: vec![],
+            management_mode: false,
+            pending_order_mode: false,
+            trading_state: None,
+            management_snapshot: None,
+        }
+    }
 
     #[test]
     fn compact_sample_input_size_snapshot() {
@@ -6718,6 +6970,235 @@ mod tests {
         assert_eq!(
             keys,
             vec!["ETHUSDT:BOTH".to_string(), "ETHUSDT:LONG".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_invoke_management_reason_drops_stale_global_reason_when_flat() {
+        let resolved =
+            resolve_invoke_management_reason(0, 0, Some("stale old reason".to_string()), None);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_invoke_management_reason_prefers_position_context_reason() {
+        let position_context = PositionContextForLlm {
+            original_qty: 0.11,
+            current_qty: 0.11,
+            current_pct_of_original: 100.0,
+            effective_leverage: Some(42),
+            effective_entry_price: Some(2122.33),
+            effective_take_profit: Some(2148.0),
+            effective_stop_loss: Some(2109.63),
+            reduction_history: vec![],
+            times_reduced_at_current_level: 0,
+            last_management_action: Some("HOLD".to_string()),
+            last_management_reason: Some("current context reason".to_string()),
+            entry_context: None,
+        };
+        let resolved = resolve_invoke_management_reason(
+            0,
+            3,
+            Some("stale old reason".to_string()),
+            Some(&position_context),
+        );
+        assert_eq!(resolved.as_deref(), Some("current context reason"));
+    }
+
+    #[test]
+    fn build_entry_context_from_fallbacks_uses_stage_trace_and_precomputed_v() {
+        let parsed_decision = json!({
+            "decision": "LONG",
+            "params": {
+                "tp": 2148.0,
+                "sl": 2106.91
+            }
+        });
+        let stage_trace = vec![
+            json!({
+                "stage": "scan",
+                "parsed_scan": {
+                    "scan": {
+                        "primary_strategy": "Absorption Re-test Continuation",
+                        "entry_style": "patient_retest",
+                        "stop_model_hint": "Value Area Invalidation Stop"
+                    }
+                }
+            }),
+            json!({
+                "stage": "finalize",
+                "primary_strategy": "Absorption Re-test Continuation",
+                "entry_style": "patient_retest",
+                "stop_model_hint": "Value Area Invalidation Stop"
+            }),
+        ];
+        let input = sample_model_input(json!({
+            "pre_computed_v": {
+                "v_4h": 18.73,
+                "v_1d": 72.83
+            }
+        }));
+
+        let captured = build_entry_context_from_fallbacks(
+            &parsed_decision,
+            Some(&stage_trace),
+            &input,
+            Some("4h"),
+            "fallback reason",
+        );
+
+        assert_eq!(
+            captured.entry_strategy.as_deref(),
+            Some("Absorption Re-test Continuation")
+        );
+        assert_eq!(captured.entry_mode.as_deref(), Some("patient_retest"));
+        assert_eq!(
+            captured.stop_model.as_deref(),
+            Some("Value Area Invalidation Stop")
+        );
+        assert_eq!(captured.original_tp, Some(2148.0));
+        assert_eq!(captured.original_sl, Some(2106.91));
+        assert_eq!(captured.entry_v, Some(18.73));
+        assert_eq!(captured.horizon.as_deref(), Some("4h"));
+    }
+
+    #[test]
+    fn resolve_entry_v_from_sources_uses_entry_style_to_pick_1d_v() {
+        let parsed_decision = json!({
+            "decision": "LONG",
+            "params": {
+                "tp": 2148.0,
+                "sl": 2106.91
+            }
+        });
+        let stage_trace = vec![json!({
+            "stage": "scan",
+            "parsed_scan": {
+                "scan": {
+                    "entry_style": "trend_continuation"
+                }
+            }
+        })];
+        let input = sample_model_input(json!({
+            "pre_computed_v": {
+                "v_4h": 18.73,
+                "v_1d": 72.83
+            }
+        }));
+
+        let entry_v =
+            resolve_entry_v_from_sources(&parsed_decision, Some(&stage_trace), &input, Some("4h"));
+
+        assert_eq!(entry_v, Some(72.83));
+    }
+
+    #[test]
+    fn build_entry_context_from_fallbacks_preserves_model_values_when_present() {
+        let parsed_decision = json!({
+            "decision": "LONG",
+            "analysis": {
+                "entry_strategy": "Model Strategy",
+                "stop_model": "Model Stop",
+                "volatility_unit_v": 55.5
+            },
+            "params": {
+                "entry_mode": "market_after_flip",
+                "tp": 2148.0,
+                "sl": 2106.91
+            }
+        });
+        let stage_trace = vec![json!({
+            "stage": "finalize",
+            "primary_strategy": "Fallback Strategy",
+            "entry_style": "patient_retest",
+            "stop_model_hint": "Fallback Stop"
+        })];
+        let input = sample_model_input(json!({
+            "pre_computed_v": {
+                "v_4h": 18.73,
+                "v_1d": 72.83
+            }
+        }));
+
+        let captured = build_entry_context_from_fallbacks(
+            &parsed_decision,
+            Some(&stage_trace),
+            &input,
+            Some("4h"),
+            "model reason",
+        );
+
+        assert_eq!(captured.entry_strategy.as_deref(), Some("Model Strategy"));
+        assert_eq!(captured.stop_model.as_deref(), Some("Model Stop"));
+        assert_eq!(captured.entry_mode.as_deref(), Some("market_after_flip"));
+        assert_eq!(captured.entry_v, Some(55.5));
+    }
+
+    #[test]
+    fn build_invocation_input_injects_precomputed_v_into_runtime_indicators() {
+        let bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket: Utc::now(),
+                window_code: "1m".to_string(),
+                indicator_count: 1,
+                published_at: None,
+                indicators: json!({}),
+            },
+            filtered_indicators: json!({
+                "kline_history": {
+                    "payload": {
+                        "intervals": {
+                            "4h": {
+                                "futures": {
+                                    "bars": [
+                                        {"open_time": "2026-03-13T08:00:00Z", "high": 110.0, "low": 100.0, "is_closed": true},
+                                        {"open_time": "2026-03-13T04:00:00Z", "high": 108.0, "low": 100.0, "is_closed": true},
+                                        {"open_time": "2026-03-13T00:00:00Z", "high": 112.0, "low": 101.0, "is_closed": true}
+                                    ]
+                                }
+                            },
+                            "1d": {
+                                "futures": {
+                                    "bars": [
+                                        {"open_time": "2026-03-12T00:00:00Z", "high": 140.0, "low": 100.0, "is_closed": true},
+                                        {"open_time": "2026-03-11T00:00:00Z", "high": 138.0, "low": 102.0, "is_closed": true},
+                                        {"open_time": "2026-03-10T00:00:00Z", "high": 142.0, "low": 101.0, "is_closed": true}
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+            missing_indicator_codes: vec![],
+            received_at: Utc::now(),
+        };
+
+        let input = build_invocation_input(&bundle, false, false, None, None, None);
+
+        assert_eq!(
+            input
+                .indicators
+                .pointer("/pre_computed_v/status")
+                .and_then(Value::as_str),
+            Some("ok")
+        );
+        assert_eq!(
+            input
+                .indicators
+                .pointer("/pre_computed_v/v_4h")
+                .and_then(Value::as_f64),
+            Some(10.0)
+        );
+        assert_eq!(
+            input
+                .indicators
+                .pointer("/pre_computed_v/v_1d")
+                .and_then(Value::as_f64),
+            Some(40.0)
         );
     }
 
