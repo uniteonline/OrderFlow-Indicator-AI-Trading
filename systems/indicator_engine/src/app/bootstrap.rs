@@ -425,8 +425,6 @@ pub struct FvgConfig {
     pub windows: Vec<String>,
     #[serde(default = "default_fvg_fill_from_db")]
     pub fill_from_db: bool,
-    #[serde(default = "default_fvg_db_bars_1h")]
-    pub db_bars_1h: usize,
     #[serde(default = "default_fvg_db_bars_4h")]
     pub db_bars_4h: usize,
     #[serde(default = "default_fvg_db_bars_1d")]
@@ -454,7 +452,6 @@ impl Default for FvgConfig {
         Self {
             windows: default_fvg_windows(),
             fill_from_db: default_fvg_fill_from_db(),
-            db_bars_1h: default_fvg_db_bars_1h(),
             db_bars_4h: default_fvg_db_bars_4h(),
             db_bars_1d: default_fvg_db_bars_1d(),
             epsilon_gap_ticks: default_fvg_epsilon_gap_ticks(),
@@ -605,15 +602,16 @@ fn default_ema_db_bars_1d() -> usize {
 }
 
 fn default_fvg_windows() -> Vec<String> {
-    vec!["1h".to_string(), "4h".to_string(), "1d".to_string()]
+    vec![
+        "15m".to_string(),
+        "4h".to_string(),
+        "1d".to_string(),
+        "3d".to_string(),
+    ]
 }
 
 fn default_fvg_fill_from_db() -> bool {
     true
-}
-
-fn default_fvg_db_bars_1h() -> usize {
-    256
 }
 
 fn default_fvg_db_bars_4h() -> usize {
@@ -773,7 +771,6 @@ pub async fn bootstrap() -> Result<AppContext> {
         ema_db_bars_1d = config.indicator.ema_trend_regime.db_bars_1d,
         fvg_windows = ?config.indicator.fvg.windows,
         fvg_fill_from_db = config.indicator.fvg.fill_from_db,
-        fvg_db_bars_1h = config.indicator.fvg.db_bars_1h,
         fvg_db_bars_4h = config.indicator.fvg.db_bars_4h,
         fvg_db_bars_1d = config.indicator.fvg.db_bars_1d,
         fvg_epsilon_gap_ticks = config.indicator.fvg.epsilon_gap_ticks,
@@ -1357,7 +1354,7 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     for code in &cfg.indicator.fvg.windows {
         match code.as_str() {
-            "1h" | "4h" | "1d" => {}
+            "15m" | "4h" | "1d" | "3d" => {}
             other => {
                 return Err(anyhow!(
                     "unsupported indicator.fvg.windows value: {}",
@@ -1365,9 +1362,6 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
                 ));
             }
         }
-    }
-    if cfg.indicator.fvg.db_bars_1h == 0 {
-        return Err(anyhow!("indicator.fvg.db_bars_1h must be > 0"));
     }
     if cfg.indicator.fvg.db_bars_4h == 0 {
         return Err(anyhow!("indicator.fvg.db_bars_4h must be > 0"));

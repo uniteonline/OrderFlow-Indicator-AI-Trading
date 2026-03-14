@@ -37,7 +37,6 @@ pub struct IndicatorRuntimeOptions {
     pub kline_history_fill_1d_from_db: bool,
     pub fvg_windows: Vec<String>,
     pub fvg_fill_from_db: bool,
-    pub fvg_db_bars_1h: usize,
     pub fvg_db_bars_4h: usize,
     pub fvg_db_bars_1d: usize,
     pub fvg_epsilon_gap_ticks: i64,
@@ -99,7 +98,6 @@ pub struct IndicatorContext {
     pub kline_history_fill_1d_from_db: bool,
     pub fvg_windows: Vec<String>,
     pub fvg_fill_from_db: bool,
-    pub fvg_db_bars_1h: usize,
     pub fvg_db_bars_4h: usize,
     pub fvg_db_bars_1d: usize,
     pub fvg_epsilon_gap_ticks: i64,
@@ -110,7 +108,6 @@ pub struct IndicatorContext {
     pub fvg_max_gap_atr_ratio: f64,
     pub fvg_mitigated_fill_threshold: f64,
     pub fvg_invalid_close_bars: usize,
-    pub kline_history_futures_1h_db: Vec<KlineHistoryBar>,
     pub kline_history_futures_4h_db: Vec<KlineHistoryBar>,
     pub kline_history_futures_1d_db: Vec<KlineHistoryBar>,
     pub kline_history_spot_4h_db: Vec<KlineHistoryBar>,
@@ -157,7 +154,6 @@ pub struct KlineHistoryBar {
 
 #[derive(Debug, Clone, Default)]
 pub struct KlineHistorySupplement {
-    pub futures_1h_db: Vec<KlineHistoryBar>,
     pub futures_4h_db: Vec<KlineHistoryBar>,
     pub futures_1d_db: Vec<KlineHistoryBar>,
     pub spot_4h_db: Vec<KlineHistoryBar>,
@@ -195,7 +191,6 @@ impl IndicatorContext {
             kline_history_fill_1d_from_db: options.kline_history_fill_1d_from_db,
             fvg_windows: options.fvg_windows.clone(),
             fvg_fill_from_db: options.fvg_fill_from_db,
-            fvg_db_bars_1h: options.fvg_db_bars_1h,
             fvg_db_bars_4h: options.fvg_db_bars_4h,
             fvg_db_bars_1d: options.fvg_db_bars_1d,
             fvg_epsilon_gap_ticks: options.fvg_epsilon_gap_ticks,
@@ -206,7 +201,6 @@ impl IndicatorContext {
             fvg_max_gap_atr_ratio: options.fvg_max_gap_atr_ratio,
             fvg_mitigated_fill_threshold: options.fvg_mitigated_fill_threshold,
             fvg_invalid_close_bars: options.fvg_invalid_close_bars,
-            kline_history_futures_1h_db: kline_history_supplement.futures_1h_db,
             kline_history_futures_4h_db: kline_history_supplement.futures_4h_db,
             kline_history_futures_1d_db: kline_history_supplement.futures_1d_db,
             kline_history_spot_4h_db: kline_history_supplement.spot_4h_db,

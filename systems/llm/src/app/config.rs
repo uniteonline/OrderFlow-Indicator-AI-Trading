@@ -349,6 +349,8 @@ pub struct MqBinding {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmConfig {
+    #[serde(default = "default_llm_request_enabled")]
+    pub request_enabled: bool,
     #[serde(default = "default_llm_default_model")]
     pub default_model: String,
     #[serde(default = "default_llm_prompt_template")]
@@ -396,6 +398,7 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            request_enabled: default_llm_request_enabled(),
             default_model: default_llm_default_model(),
             prompt_template: default_llm_prompt_template(),
             symbol: default_symbol(),
@@ -446,6 +449,10 @@ pub struct LlmExecutionConfig {
     pub place_exit_orders: bool,
     #[serde(default)]
     pub entry_sl_remap: ExecutionEntrySlRemapConfig,
+    #[serde(default = "default_execution_min_distance_v")]
+    pub min_distance_v: f64,
+    #[serde(default = "default_execution_min_rr")]
+    pub min_rr: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -478,6 +485,8 @@ impl Default for LlmExecutionConfig {
             recv_window_ms: default_execution_recv_window_ms(),
             place_exit_orders: default_execution_place_exit_orders(),
             entry_sl_remap: ExecutionEntrySlRemapConfig::default(),
+            min_distance_v: default_execution_min_distance_v(),
+            min_rr: default_execution_min_rr(),
         }
     }
 }
@@ -512,6 +521,10 @@ fn default_queue_key() -> String {
 }
 
 fn default_llm_purge_queue_on_start() -> bool {
+    true
+}
+
+fn default_llm_request_enabled() -> bool {
     true
 }
 
@@ -698,12 +711,24 @@ fn default_indicator_codes() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::default_indicator_codes;
+    use super::{default_indicator_codes, LlmConfig};
 
     #[test]
     fn default_indicator_codes_include_fvg() {
         let codes = default_indicator_codes();
         assert!(codes.iter().any(|code| code == "fvg"));
+    }
+
+    #[test]
+    fn default_llm_request_enabled_is_true() {
+        assert!(LlmConfig::default().request_enabled);
+    }
+
+    #[test]
+    fn default_execution_trade_gates_are_expected_values() {
+        let execution = LlmConfig::default().execution;
+        assert!((execution.min_distance_v - 1.0).abs() < f64::EPSILON);
+        assert!((execution.min_rr - 2.0).abs() < f64::EPSILON);
     }
 }
 
@@ -751,6 +776,14 @@ fn default_execution_entry_sl_remap_enabled() -> bool {
 
 fn default_execution_entry_to_sl_distance_pct() -> f64 {
     100.0
+}
+
+fn default_execution_min_distance_v() -> f64 {
+    1.0
+}
+
+fn default_execution_min_rr() -> f64 {
+    2.0
 }
 
 pub fn load_config(path: &str) -> Result<RootConfig> {
@@ -883,9 +916,6 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
                 key
             ));
         }
-    }
-    if cfg.llm.indicator_codes.is_empty() {
-        return Err(anyhow!("llm.indicator_codes cannot be empty"));
     }
     validate_telegram_signal_decisions(&cfg.llm.telegram_signal_decisions)?;
     validate_x_signal_decisions(&cfg.llm.x_signal_decisions)?;
@@ -1050,6 +1080,18 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
         return Err(anyhow!(
             "llm.execution.entry_sl_remap.entry_to_sl_distance_pct must be between 0 and 100"
         ));
+    }
+    if !cfg.llm.execution.min_distance_v.is_finite() {
+        return Err(anyhow!("llm.execution.min_distance_v must be finite"));
+    }
+    if cfg.llm.execution.min_distance_v < 0.0 {
+        return Err(anyhow!("llm.execution.min_distance_v must be >= 0"));
+    }
+    if !cfg.llm.execution.min_rr.is_finite() {
+        return Err(anyhow!("llm.execution.min_rr must be finite"));
+    }
+    if cfg.llm.execution.min_rr <= 0.0 {
+        return Err(anyhow!("llm.execution.min_rr must be > 0"));
     }
 
     if cfg.llm.execution.enabled {

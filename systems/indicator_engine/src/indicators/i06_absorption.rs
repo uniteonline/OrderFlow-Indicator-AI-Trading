@@ -466,15 +466,11 @@ impl Indicator for I06Absorption {
                 indicator_code: self.code(),
                 window_code: "1m",
                 payload_json: json!({
-                    "event_count": window_view.current_events.len(),
-                    "events": window_view.current_events,
-                    "latest": window_view.latest_current,
                     "recent_7d": build_recent_7d_payload(
                         window_view.recent_events,
                         lookback_covered_minutes,
                         "in_memory_minute_history"
-                    ),
-                    "latest_7d": window_view.latest_recent
+                    )
                 }),
             }),
             ..Default::default()

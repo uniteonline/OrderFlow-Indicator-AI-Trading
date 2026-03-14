@@ -1,9 +1,12 @@
 use crate::indicators::context::{
     IndicatorComputation, IndicatorContext, IndicatorEventRow, IndicatorSnapshotRow,
 };
-use crate::indicators::i06_absorption::{absorption_event_json, detect_absorption_events};
+use crate::indicators::i06_absorption::{
+    absorption_event_json, detect_absorption_all_history, detect_absorption_events,
+};
 use crate::indicators::indicator_trait::Indicator;
 use crate::indicators::shared::event_ids::build_indicator_event_id;
+use crate::indicators::shared::event_views::{build_event_window_view, build_recent_7d_payload};
 use serde_json::json;
 
 pub struct I10BearishAbsorption;
@@ -14,6 +17,18 @@ impl Indicator for I10BearishAbsorption {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
+        let all_events = detect_absorption_all_history(ctx)
+            .into_iter()
+            .filter(|e| e.direction < 0)
+            .collect::<Vec<_>>();
+        let window_view = build_event_window_view(
+            ctx.ts_bucket,
+            all_events
+                .iter()
+                .map(|event| absorption_event_json(&ctx.symbol, self.code(), event))
+                .collect(),
+        );
+        let lookback_covered_minutes = ctx.history_futures.len().min(ctx.history_spot.len()) as i64;
         let events = detect_absorption_events(ctx)
             .into_iter()
             .filter(|e| e.direction < 0)
@@ -24,16 +39,11 @@ impl Indicator for I10BearishAbsorption {
                 indicator_code: self.code(),
                 window_code: "1m",
                 payload_json: json!({
-                    "event_count": events.len(),
-                    "events": events.iter().map(|e| {
-                        json!({
-                            "type": e.event_type,
-                            "start_ts": e.start_ts.to_rfc3339(),
-                            "end_ts": e.end_ts.to_rfc3339(),
-                            "confirm_ts": e.confirm_ts.to_rfc3339(),
-                            "score": e.score
-                        })
-                    }).collect::<Vec<_>>()
+                    "recent_7d": build_recent_7d_payload(
+                        window_view.recent_events,
+                        lookback_covered_minutes,
+                        "in_memory_minute_history"
+                    )
                 }),
             }),
             ..Default::default()

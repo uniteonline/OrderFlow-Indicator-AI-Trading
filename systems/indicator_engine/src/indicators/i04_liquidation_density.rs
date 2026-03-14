@@ -29,10 +29,8 @@ impl Indicator for I04LiquidationDensity {
     }
 
     fn evaluate(&self, ctx: &IndicatorContext) -> IndicatorComputation {
-        let (current_payload, current_rows) = build_window_view("1m", &ctx.futures.force_liq, 1, 1);
-
         let mut by_window = Map::new();
-        let mut liquidation_rows = current_rows;
+        let mut liquidation_rows = Vec::new();
         for (window_code, window_minutes) in WINDOW_SPECS {
             let minute_rows = window_rows(&ctx.history_futures, ctx.ts_bucket, window_minutes);
             let agg = aggregate_force_liq(&minute_rows);
@@ -42,10 +40,10 @@ impl Indicator for I04LiquidationDensity {
             liquidation_rows.extend(window_rows);
         }
 
-        let mut payload = current_payload;
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert("by_window".to_string(), Value::Object(by_window));
-        }
+        let payload = json!({
+            "recent_7d": build_recent_7d_history(&ctx.history_futures, ctx.ts_bucket),
+            "by_window": Value::Object(by_window),
+        });
 
         IndicatorComputation {
             snapshot: Some(IndicatorSnapshotRow {
@@ -152,6 +150,27 @@ fn build_window_view(
         }),
         liq_rows,
     )
+}
+
+fn build_recent_7d_history(
+    history: &[MinuteHistory],
+    ts_bucket: chrono::DateTime<chrono::Utc>,
+) -> Vec<Value> {
+    let cutoff = ts_bucket - Duration::days(7);
+    history
+        .iter()
+        .filter(|row| row.ts_bucket > cutoff && row.ts_bucket <= ts_bucket)
+        .map(|row| {
+            let (payload, _) = build_window_view("1m", &row.force_liq, 1, 1);
+            json!({
+                "ts_snapshot": row.ts_bucket.to_rfc3339(),
+                "levels_count": payload.get("levels_count").cloned().unwrap_or(Value::Null),
+                "long_total": payload.get("long_total").cloned().unwrap_or(Value::Null),
+                "short_total": payload.get("short_total").cloned().unwrap_or(Value::Null),
+                "peak_levels": payload.get("peak_levels").cloned().unwrap_or_else(|| json!([])),
+            })
+        })
+        .collect()
 }
 
 fn select_liquidation_audit_ticks(

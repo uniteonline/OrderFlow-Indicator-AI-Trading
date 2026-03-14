@@ -9,12 +9,15 @@ use crate::execution::binance::{
 use crate::llm::decision::{
     pending_order_management_intent_from_value_with_context,
     position_management_intent_from_value_with_context, trade_intent_from_value,
-    PendingOrderManagementDecision, PositionManagementDecision, TradeDecision, TradeIntent,
+    PendingOrderContext, PendingOrderManagementDecision, PositionManagementDecision, TradeDecision,
+    TradeIntent,
 };
+use crate::llm::filter::{core::CoreFilter, scan::ScanFilter};
+use crate::llm::helper::PreComputedVHelper;
 use crate::llm::provider::{
-    invoke_models, serialize_llm_input_minified, EntryContextForLlm, EntryStagePromptInputCapture,
-    ManagementSnapshotForLlm, ModelInvocationInput, PendingOrderSummaryForLlm,
-    PositionContextForLlm, PositionSummaryForLlm, ReductionHistoryItemForLlm,
+    invoke_models, EntryContextForLlm, EntryStagePromptInputCapture, ManagementSnapshotForLlm,
+    ModelInvocationInput, PendingOrderSummaryForLlm, PositionContextForLlm, PositionSummaryForLlm,
+    ReductionHistoryItemForLlm,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Timelike, Utc};
@@ -25,7 +28,7 @@ use lapin::{
 };
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -41,45 +44,7 @@ const TEMP_INDICATOR_DIR: &str = "systems/llm/temp_indicator";
 const TEMP_MODEL_INPUT_DIR: &str = "systems/llm/temp_model_input";
 const LLM_JOURNAL_DIR: &str = "systems/llm/journal";
 const LLM_JOURNAL_FILE: &str = "systems/llm/journal/llm_trade_journal.jsonl";
-const LLM_ALLOWED_WINDOWS: &[&str] = &["15m", "1h", "4h", "1d"];
-const LLM_FVG_ALLOWED_WINDOWS: &[&str] = &["1h", "4h", "1d"];
-const GEMINI_MAX_INPUT_TOKENS: usize = 1_048_576;
-const APPROX_BYTES_PER_TOKEN: usize = 4;
-const LLM_INPUT_INDICATORS_BUDGET_BYTES: usize = GEMINI_MAX_INPUT_TOKENS * APPROX_BYTES_PER_TOKEN;
-const LLM_ORDERBOOK_TOP_LEVELS: usize = 12;
-const LLM_ORDERBOOK_SIDE_LEVELS: usize = 8;
-const LLM_PROFILE_TOP_LEVELS: usize = 16;
-const LLM_VALUE_AREA_TOP_LEVELS: usize = 12;
-const LLM_FOOTPRINT_TOP_LEVELS: usize = 16;
-const LLM_PROFILE_TOP_LEVELS_15M: usize = 6;
-const LLM_PROFILE_TOP_LEVELS_1D: usize = 8;
-const LLM_PROFILE_TOP_LEVELS_4H: usize = 24;
-const LLM_VALUE_AREA_TOP_LEVELS_15M: usize = 6;
-const LLM_VALUE_AREA_TOP_LEVELS_1D: usize = 8;
-const LLM_VALUE_AREA_TOP_LEVELS_4H: usize = 20;
-const LLM_FOOTPRINT_TOP_LEVELS_15M: usize = 8;
-const LLM_FOOTPRINT_TOP_LEVELS_1D: usize = 12;
-const LLM_FOOTPRINT_TOP_LEVELS_4H: usize = 16;
-const LLM_FOOTPRINT_ZONE_STRENGTH_TOP_15M: usize = 12;
-const LLM_FOOTPRINT_ZONE_STRENGTH_TOP_1D: usize = 24;
-const LLM_FOOTPRINT_ZONE_STRENGTH_TOP_4H: usize = 120;
-const LLM_FOOTPRINT_ZONE_NEAR_TOP_15M: usize = 24;
-const LLM_FOOTPRINT_ZONE_NEAR_TOP_4H: usize = 120;
-const LLM_FOOTPRINT_STACK_TOP_15M: usize = 12;
-const LLM_FOOTPRINT_STACK_TOP_1D: usize = 16;
-const LLM_FOOTPRINT_STACK_TOP_4H: usize = 40;
-const LLM_LEVELS_NEAR_PRICE_PCT_4H: f64 = 0.003;
-const LLM_PRICE_BAND_MIN_SIZE: f64 = 0.25;
-const LLM_PRICE_BAND_RATIO: f64 = 0.00025;
-const LLM_PRICE_BAND_MAX_BANDS: usize = 120;
-const LLM_TIME_BUCKET_SPAN_SECS: i64 = 900;
-const LLM_TIME_BUCKET_RECENT_KEEP: usize = 8;
-const LLM_CVD_KEEP_15M: usize = 96;
-const LLM_CORE_ANCHOR_TOP_N: usize = 8;
-const LLM_KLINE_KEEP_1M: usize = 120;
-const LLM_KLINE_KEEP_15M: usize = 96;
-const LLM_KLINE_KEEP_4H: usize = 40;
-const LLM_KLINE_KEEP_1D: usize = 30;
+const MANAGEMENT_REDUCTION_LEVEL_THRESHOLD: f64 = 0.5;
 #[derive(Debug, Default)]
 struct InvokeThrottleState {
     last_invoke_at: Option<Instant>,
@@ -91,7 +56,6 @@ struct ReductionHistoryEntry {
     qty_ratio: f64,
     reason_summary: String,
     price: f64,
-    volatility_unit_v: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -112,6 +76,41 @@ struct PositionContextState {
     entry_context: Option<EntryContextForState>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct SymbolLifecycleState {
+    last_management_reason: Option<String>,
+    contexts: HashMap<String, PositionContextState>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeLifecycleStore {
+    symbols: HashMap<String, SymbolLifecycleState>,
+}
+
+impl RuntimeLifecycleStore {
+    fn symbol_state(&self, symbol: &str) -> Option<&SymbolLifecycleState> {
+        self.symbols.get(&symbol.to_ascii_uppercase())
+    }
+
+    fn symbol_state_mut(&mut self, symbol: &str) -> &mut SymbolLifecycleState {
+        self.symbols.entry(symbol.to_ascii_uppercase()).or_default()
+    }
+
+    fn last_management_reason(&self, symbol: &str) -> Option<String> {
+        self.symbol_state(symbol)
+            .and_then(|state| state.last_management_reason.clone())
+    }
+
+    fn set_last_management_reason(&mut self, symbol: &str, reason: Option<String>) {
+        let key = symbol.to_ascii_uppercase();
+        let state = self.symbols.entry(key.clone()).or_default();
+        state.last_management_reason = reason;
+        if state.last_management_reason.is_none() && state.contexts.is_empty() {
+            self.symbols.remove(&key);
+        }
+    }
+}
+
 /// Internal (non-serialized) mirror of EntryContextForLlm, stored in memory.
 #[derive(Debug, Clone)]
 struct EntryContextForState {
@@ -123,8 +122,8 @@ struct EntryContextForState {
     sweep_wick_extreme: Option<f64>,
     horizon: Option<String>,
     entry_reason: String,
-    /// V captured at entry time; passed to management model to ensure
-    /// consistent V-based threshold calculations throughout the trade.
+    /// Helper-derived V captured at entry time for internal audit/journal continuity.
+    /// This is not serialized into management-mode prompt inputs.
     entry_v: Option<f64>,
 }
 
@@ -159,6 +158,31 @@ impl TradeSignalFields {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedEntryV {
+    value: f64,
+    timeframe: &'static str,
+    basis: String,
+}
+
+#[derive(Debug, Clone)]
+struct EntryVGateResult {
+    resolved_v: ResolvedEntryV,
+    take_profit_distance: f64,
+    take_profit_distance_v: f64,
+    min_distance_v: f64,
+    passed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct EntryRrGateResult {
+    risk_reward_ratio: f64,
+    reward_distance: f64,
+    risk_distance: f64,
+    min_rr: f64,
+    passed: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct MinuteBundleEnvelope {
     msg_type: String,
@@ -174,7 +198,7 @@ struct MinuteBundleEnvelope {
 #[derive(Debug, Clone)]
 struct LatestBundle {
     raw: MinuteBundleEnvelope,
-    filtered_indicators: Value,
+    indicators: Value,
     missing_indicator_codes: Vec<String>,
     received_at: DateTime<Utc>,
 }
@@ -225,10 +249,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 
     let mut pending_invoke_bundle: Option<LatestBundle> = None;
     let mut last_invoked_ts_bucket: Option<DateTime<Utc>> = None;
-    let last_management_reason = Arc::new(Mutex::new(None::<String>));
-    let position_context_state =
-        Arc::new(Mutex::new(HashMap::<String, PositionContextState>::new()));
-    restore_last_management_reason_from_journal(&last_management_reason).await?;
+    let runtime_lifecycle_state = Arc::new(Mutex::new(RuntimeLifecycleStore::default()));
+    restore_last_management_reasons_from_journal(&runtime_lifecycle_state).await?;
     let invoke_inflight = Arc::new(AtomicBool::new(false));
     let invoke_throttle = Arc::new(Mutex::new(InvokeThrottleState::default()));
     let active_provider = ctx.config.active_default_model();
@@ -243,6 +265,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     debug!(
         queue = %ctx.consume_queue_name,
         symbol = %ctx.config.llm.symbol,
+        request_enabled = ctx.config.llm.request_enabled,
         active_provider = %active_provider,
         prompt_template = %ctx.config.llm.prompt_template,
         purge_queue_on_start = ctx.config.llm.purge_queue_on_start,
@@ -266,8 +289,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     &mut last_invoked_ts_bucket,
                     &invoke_inflight,
                     &invoke_throttle,
-                    &last_management_reason,
-                    &position_context_state,
+                    &runtime_lifecycle_state,
                     min_invoke_interval,
                     apply_min_invoke_interval_throttle,
                     "scheduled_bundle",
@@ -320,10 +342,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                     continue;
                                 }
 
-                                let (filtered, missing) = filter_indicators(
-                                    &bundle.indicators,
-                                    &ctx.config.llm.indicator_codes,
-                                );
+                                let missing = Vec::new();
 
                                 if let Err(err) = persist_bundle_to_disk(
                                     &bundle,
@@ -342,7 +361,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 
                                 let current_bundle = LatestBundle {
                                     raw: bundle.clone(),
-                                    filtered_indicators: Value::Object(filtered),
+                                    indicators: bundle.indicators.clone(),
                                     missing_indicator_codes: missing.clone(),
                                     received_at: now,
                                 };
@@ -418,8 +437,6 @@ fn build_invocation_input(
     last_management_reason: Option<String>,
     position_context: Option<PositionContextForLlm>,
 ) -> ModelInvocationInput {
-    let mut indicators = bundle.filtered_indicators.clone();
-    inject_precomputed_v_into_runtime_indicators(&mut indicators);
     let management_snapshot = build_management_snapshot_for_llm(
         trading_state.as_ref(),
         last_management_reason,
@@ -433,12 +450,30 @@ fn build_invocation_input(
         source_routing_key: bundle.raw.routing_key.clone(),
         source_published_at: bundle.raw.published_at,
         received_at: bundle.received_at,
-        indicators,
+        indicators: bundle.indicators.clone(),
         missing_indicator_codes: bundle.missing_indicator_codes.clone(),
         management_mode,
         pending_order_mode,
         trading_state,
         management_snapshot,
+    }
+}
+
+fn build_persist_only_input(bundle: &LatestBundle) -> ModelInvocationInput {
+    ModelInvocationInput {
+        symbol: bundle.raw.symbol.clone(),
+        ts_bucket: bundle.raw.ts_bucket,
+        window_code: bundle.raw.window_code.clone(),
+        indicator_count: bundle.raw.indicator_count,
+        source_routing_key: bundle.raw.routing_key.clone(),
+        source_published_at: bundle.raw.published_at,
+        received_at: bundle.received_at,
+        indicators: bundle.indicators.clone(),
+        missing_indicator_codes: bundle.missing_indicator_codes.clone(),
+        management_mode: false,
+        pending_order_mode: false,
+        trading_state: None,
+        management_snapshot: None,
     }
 }
 
@@ -582,7 +617,7 @@ fn derive_management_telegram_fields(
 
 async fn derive_pending_order_telegram_fields(
     trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    context_state: &Arc<Mutex<HashMap<String, PositionContextState>>>,
+    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
 ) -> TelegramPositionFields {
     let Some(state) = trading_state else {
         return TelegramPositionFields::default();
@@ -607,8 +642,10 @@ async fn derive_pending_order_telegram_fields(
         state.symbol.to_ascii_uppercase(),
         position_side.to_ascii_uppercase()
     );
-    let guard = context_state.lock().await;
-    let ctx = guard.get(&key);
+    let guard = runtime_lifecycle_state.lock().await;
+    let ctx = guard
+        .symbol_state(&state.symbol)
+        .and_then(|symbol_state| symbol_state.contexts.get(&key));
     let entry_price = if order.price > 0.0 {
         Some(order.price)
     } else {
@@ -706,6 +743,7 @@ fn build_management_snapshot_for_llm(
                 entry_price: p.entry_price,
                 mark_price: p.mark_price,
                 unrealized_pnl: p.unrealized_pnl,
+                pnl_by_latest_price: compute_pnl_by_latest_price(p),
                 current_tp_price,
                 current_sl_price,
             }
@@ -722,6 +760,16 @@ fn build_management_snapshot_for_llm(
         last_management_reason,
         position_context,
     })
+}
+
+fn compute_pnl_by_latest_price(
+    position: &crate::execution::binance::ActivePositionSnapshot,
+) -> f64 {
+    if position.entry_price > 0.0 && position.mark_price > 0.0 && position.position_amt != 0.0 {
+        (position.mark_price - position.entry_price) * position.position_amt
+    } else {
+        position.unrealized_pnl
+    }
 }
 
 fn primary_position_key(
@@ -901,6 +949,108 @@ fn remap_trade_entry_and_stop_loss(
     Some((remapped_entry, remapped_stop_loss))
 }
 
+fn resolve_entry_v_from_helper(
+    trace: Option<&[Value]>,
+    input: &ModelInvocationInput,
+    horizon: Option<&str>,
+) -> Option<ResolvedEntryV> {
+    let entry_style = entry_stage_trace_entry_style(trace);
+    let preferred = preferred_v_timeframe(entry_style.as_deref(), horizon);
+    let fallback = if preferred == "1d" { "4h" } else { "1d" };
+
+    PreComputedVHelper::compute_for_timeframe(&input.indicators, preferred)
+        .map(|(value, basis)| ResolvedEntryV {
+            value,
+            timeframe: preferred,
+            basis,
+        })
+        .or_else(|| {
+            PreComputedVHelper::compute_for_timeframe(&input.indicators, fallback).map(
+                |(value, basis)| ResolvedEntryV {
+                    value,
+                    timeframe: fallback,
+                    basis,
+                },
+            )
+        })
+}
+
+fn evaluate_trade_entry_v_gate(
+    execution_config: &crate::app::config::LlmExecutionConfig,
+    intent: &TradeIntent,
+    input: &ModelInvocationInput,
+    trace: Option<&[Value]>,
+) -> Result<Option<EntryVGateResult>> {
+    if !matches!(intent.decision, TradeDecision::Long | TradeDecision::Short) {
+        return Ok(None);
+    }
+
+    let entry = intent
+        .entry_price
+        .ok_or_else(|| anyhow::anyhow!("entry V gate requires entry price"))?;
+    let take_profit = intent
+        .take_profit
+        .ok_or_else(|| anyhow::anyhow!("entry V gate requires take profit"))?;
+    let resolved_v = resolve_entry_v_from_helper(trace, input, intent.horizon.as_deref())
+        .ok_or_else(|| {
+            anyhow::anyhow!("entry V gate could not compute helper V from kline_history")
+        })?;
+    if resolved_v.value <= f64::EPSILON {
+        return Err(anyhow::anyhow!(
+            "entry V gate resolved non-positive helper V={}",
+            resolved_v.value
+        ));
+    }
+
+    let take_profit_distance = (take_profit - entry).abs();
+    let take_profit_distance_v = take_profit_distance / resolved_v.value;
+    let min_distance_v = execution_config.min_distance_v;
+    let passed = take_profit_distance_v + f64::EPSILON >= min_distance_v;
+
+    Ok(Some(EntryVGateResult {
+        resolved_v,
+        take_profit_distance,
+        take_profit_distance_v,
+        min_distance_v,
+        passed,
+    }))
+}
+
+fn evaluate_trade_rr_gate(
+    execution_config: &crate::app::config::LlmExecutionConfig,
+    intent: &TradeIntent,
+) -> Result<Option<EntryRrGateResult>> {
+    if !matches!(intent.decision, TradeDecision::Long | TradeDecision::Short) {
+        return Ok(None);
+    }
+
+    let entry = intent
+        .entry_price
+        .ok_or_else(|| anyhow::anyhow!("entry RR gate requires entry price"))?;
+    let take_profit = intent
+        .take_profit
+        .ok_or_else(|| anyhow::anyhow!("entry RR gate requires take profit"))?;
+    let stop_loss = intent
+        .stop_loss
+        .ok_or_else(|| anyhow::anyhow!("entry RR gate requires stop loss"))?;
+    let reward_distance = (take_profit - entry).abs();
+    let risk_distance = (entry - stop_loss).abs();
+    let risk_reward_ratio =
+        compute_rr_from_levels(entry, take_profit, stop_loss).ok_or_else(|| {
+            anyhow::anyhow!("entry RR gate could not compute risk_reward_ratio from entry/tp/sl")
+        })?;
+    let min_rr = execution_config.min_rr;
+    let passed = risk_reward_ratio + f64::EPSILON >= min_rr;
+
+    Ok(Some(EntryRrGateResult {
+        risk_reward_ratio,
+        reward_distance,
+        risk_distance,
+        min_rr,
+        passed,
+    }))
+}
+
 async fn preview_trade_signal_fields(
     http_client: &Client,
     config: &RootConfig,
@@ -934,7 +1084,7 @@ async fn preview_trade_signal_fields(
 async fn enrich_telegram_fields_from_entry_context(
     mut fields: TelegramPositionFields,
     trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    context_state: &Arc<Mutex<HashMap<String, PositionContextState>>>,
+    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
 ) -> TelegramPositionFields {
     let Some(state) = trading_state else {
         return fields;
@@ -942,8 +1092,11 @@ async fn enrich_telegram_fields_from_entry_context(
     let Some((key, _, _)) = primary_position_key(state) else {
         return fields;
     };
-    let guard = context_state.lock().await;
-    let Some(ctx) = guard.get(&key) else {
+    let guard = runtime_lifecycle_state.lock().await;
+    let Some(ctx) = guard
+        .symbol_state(&state.symbol)
+        .and_then(|symbol_state| symbol_state.contexts.get(&key))
+    else {
         return fields;
     };
     let Some(entry_ctx) = ctx.entry_context.as_ref() else {
@@ -968,8 +1121,7 @@ async fn enrich_telegram_fields_from_entry_context(
 
 async fn sync_and_build_position_context_snapshot(
     trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    context_state: &Arc<Mutex<HashMap<String, PositionContextState>>>,
-    last_management_reason: Option<String>,
+    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
 ) -> Option<PositionContextForLlm> {
     let state = trading_state?;
     let (key, current_qty, current_price) =
@@ -977,10 +1129,11 @@ async fn sync_and_build_position_context_snapshot(
     if current_qty <= f64::EPSILON {
         return None;
     }
-    let mut guard = context_state.lock().await;
+    let mut guard = runtime_lifecycle_state.lock().await;
+    let symbol_state = guard.symbol_state_mut(&state.symbol);
     let fallback_both_context = both_context_alias_for_directional_key(&key)
-        .and_then(|alias_key| guard.get(&alias_key).cloned());
-    let entry = guard.entry(key).or_default();
+        .and_then(|alias_key| symbol_state.contexts.get(&alias_key).cloned());
+    let entry = symbol_state.contexts.entry(key).or_default();
     if let Some(fallback) = fallback_both_context.as_ref() {
         if entry.effective_entry_price.is_none() {
             entry.effective_entry_price = fallback.effective_entry_price;
@@ -1004,24 +1157,17 @@ async fn sync_and_build_position_context_snapshot(
         entry.original_qty = current_qty;
     }
     if entry.last_management_reason.is_none() {
-        entry.last_management_reason = last_management_reason;
+        entry.last_management_reason = symbol_state.last_management_reason.clone();
     }
     let current_pct = if entry.original_qty > f64::EPSILON {
         current_qty / entry.original_qty * 100.0
     } else {
         100.0
     };
-    let base_v = entry
-        .reduction_history
-        .iter()
-        .rev()
-        .find_map(|h| h.volatility_unit_v)
-        .unwrap_or(0.0);
-    let level_threshold = if base_v > 0.0 { base_v * 0.5 } else { 0.5 };
     let times_reduced_at_current_level = entry
         .reduction_history
         .iter()
-        .filter(|h| (h.price - current_price).abs() <= level_threshold)
+        .filter(|h| (h.price - current_price).abs() <= MANAGEMENT_REDUCTION_LEVEL_THRESHOLD)
         .count();
 
     Some(PositionContextForLlm {
@@ -1053,7 +1199,6 @@ async fn sync_and_build_position_context_snapshot(
             sweep_wick_extreme: ec.sweep_wick_extreme,
             horizon: ec.horizon.clone(),
             entry_reason: ec.entry_reason.clone(),
-            entry_v: ec.entry_v,
         }),
     })
 }
@@ -1063,7 +1208,7 @@ async fn hydrate_position_context_from_live_state(
     api_config: &crate::app::config::BinanceApiConfig,
     exec_config: &crate::app::config::LlmExecutionConfig,
     trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    context_state: &Arc<Mutex<HashMap<String, PositionContextState>>>,
+    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
 ) {
     let Some(state) = trading_state else {
         return;
@@ -1077,7 +1222,8 @@ async fn hydrate_position_context_from_live_state(
         None
     };
 
-    let mut guard = context_state.lock().await;
+    let mut guard = runtime_lifecycle_state.lock().await;
+    let symbol_state = guard.symbol_state_mut(&state.symbol);
 
     if let Some(pos) = state
         .active_positions
@@ -1089,7 +1235,7 @@ async fn hydrate_position_context_from_live_state(
             state.symbol.to_ascii_uppercase(),
             pos.position_side.to_ascii_uppercase()
         );
-        let entry = guard.entry(key).or_default();
+        let entry = symbol_state.contexts.entry(key).or_default();
         let qty = pos.position_amt.abs();
         if entry.original_qty <= f64::EPSILON || qty > entry.original_qty {
             entry.original_qty = qty;
@@ -1127,7 +1273,7 @@ async fn hydrate_position_context_from_live_state(
                 state.symbol.to_ascii_uppercase(),
                 position_side.to_ascii_uppercase()
             );
-            let entry = guard.entry(key).or_default();
+            let entry = symbol_state.contexts.entry(key).or_default();
             let remaining_qty = (order.orig_qty - order.executed_qty).max(0.0);
             if entry.original_qty <= f64::EPSILON || remaining_qty > entry.original_qty {
                 entry.original_qty = remaining_qty;
@@ -1154,7 +1300,7 @@ async fn hydrate_position_context_from_live_state(
 
 async fn restore_position_context_from_journal_for_live_state(
     trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    context_state: &Arc<Mutex<HashMap<String, PositionContextState>>>,
+    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
 ) -> Result<()> {
     let Some(state) = trading_state else {
         return Ok(());
@@ -1172,7 +1318,8 @@ async fn restore_position_context_from_journal_for_live_state(
 
     let symbol = state.symbol.to_ascii_uppercase();
     let contents = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let mut guard = context_state.lock().await;
+    let mut guard = runtime_lifecycle_state.lock().await;
+    let symbol_state = guard.symbol_state_mut(&symbol);
     for line in contents.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -1195,6 +1342,11 @@ async fn restore_position_context_from_journal_for_live_state(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+        if reason.is_some() {
+            symbol_state.last_management_reason = reason
+                .clone()
+                .or(symbol_state.last_management_reason.clone());
+        }
         match event_type {
             "llm_order_execution" => {
                 let keys = execution_context_keys_for_journal_restore(
@@ -1238,7 +1390,7 @@ async fn restore_position_context_from_journal_for_live_state(
                     None
                 };
                 for key in keys {
-                    let entry = guard.entry(key).or_default();
+                    let entry = symbol_state.contexts.entry(key).or_default();
                     entry.last_management_reason =
                         reason.clone().or(entry.last_management_reason.clone());
                     entry.effective_entry_price = value
@@ -1267,7 +1419,7 @@ async fn restore_position_context_from_journal_for_live_state(
                 let Some(key) = active_key.as_ref() else {
                     continue;
                 };
-                let entry = guard.entry(key.clone()).or_default();
+                let entry = symbol_state.contexts.entry(key.clone()).or_default();
                 entry.last_management_action = value
                     .get("action")
                     .and_then(Value::as_str)
@@ -1288,7 +1440,7 @@ async fn restore_position_context_from_journal_for_live_state(
                 let Some(key) = pending_key.as_ref() else {
                     continue;
                 };
-                let entry = guard.entry(key.clone()).or_default();
+                let entry = symbol_state.contexts.entry(key.clone()).or_default();
                 entry.last_management_action = value
                     .get("action")
                     .and_then(Value::as_str)
@@ -1323,15 +1475,15 @@ async fn restore_position_context_from_journal_for_live_state(
     Ok(())
 }
 
-async fn restore_last_management_reason_from_journal(
-    last_management_reason: &Arc<Mutex<Option<String>>>,
+async fn restore_last_management_reasons_from_journal(
+    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
 ) -> Result<()> {
     let path = Path::new(LLM_JOURNAL_FILE);
     if !path.exists() {
         return Ok(());
     }
-    let mut restored: Option<String> = None;
     let contents = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut guard = runtime_lifecycle_state.lock().await;
     for line in contents.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -1350,6 +1502,14 @@ async fn restore_last_management_reason_from_journal(
         ) {
             continue;
         }
+        let symbol = value
+            .get("symbol")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let Some(symbol) = symbol else {
+            continue;
+        };
         let reason = value
             .get("reason")
             .and_then(Value::as_str)
@@ -1357,12 +1517,8 @@ async fn restore_last_management_reason_from_journal(
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
         if reason.is_some() {
-            restored = reason;
+            guard.set_last_management_reason(symbol, reason);
         }
-    }
-    if restored.is_some() {
-        let mut guard = last_management_reason.lock().await;
-        *guard = restored;
     }
     Ok(())
 }
@@ -1370,9 +1526,8 @@ async fn restore_last_management_reason_from_journal(
 async fn validate_reduce_anti_repetition(
     symbol: &str,
     intent: &crate::llm::decision::PositionManagementIntent,
-    parsed_decision: &Value,
     trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
-    context_state: &Arc<Mutex<HashMap<String, PositionContextState>>>,
+    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
 ) -> Result<()> {
     if !matches!(
         intent.decision,
@@ -1389,8 +1544,10 @@ async fn validate_reduce_anti_repetition(
             "REDUCE validation failed: current_qty is zero"
         ));
     }
-    let guard = context_state.lock().await;
-    let ctx = guard.get(&key);
+    let guard = runtime_lifecycle_state.lock().await;
+    let ctx = guard
+        .symbol_state(symbol)
+        .and_then(|symbol_state| symbol_state.contexts.get(&key));
     let original_qty = ctx
         .map(|c| c.original_qty)
         .unwrap_or(current_qty)
@@ -1429,17 +1586,13 @@ async fn validate_reduce_anti_repetition(
     if let Some(ctx) = ctx {
         if ctx.last_management_action.as_deref() == Some("REDUCE") {
             if let Some(last) = ctx.reduction_history.last() {
-                let v = extract_nested_f64(parsed_decision, &["analysis", "volatility_unit_v"])
-                    .or(last.volatility_unit_v)
-                    .unwrap_or(0.0);
-                let threshold = if v > 0.0 { 0.5 * v } else { 0.5 };
-                if (current_price - last.price).abs() <= threshold {
+                if (current_price - last.price).abs() <= MANAGEMENT_REDUCTION_LEVEL_THRESHOLD {
                     return Err(anyhow::anyhow!(
                         "HC-10 violation: repeated REDUCE near same level symbol={} current_price={} last_reduce_price={} threshold={}",
                         symbol,
                         current_price,
                         last.price,
-                        threshold
+                        MANAGEMENT_REDUCTION_LEVEL_THRESHOLD
                     ));
                 }
                 let current_reason_summary = summarize_reason(&intent.reason);
@@ -1458,8 +1611,7 @@ async fn update_position_context_after_management_action(
     symbol: &str,
     trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
     intent: &crate::llm::decision::PositionManagementIntent,
-    parsed_decision: &Value,
-    context_state: &Arc<Mutex<HashMap<String, PositionContextState>>>,
+    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
 ) {
     let Some(state) = trading_state else {
         return;
@@ -1467,15 +1619,17 @@ async fn update_position_context_after_management_action(
     let Some((key, current_qty, current_price)) = primary_position_key(state) else {
         return;
     };
-    let mut guard = context_state.lock().await;
+    let mut guard = runtime_lifecycle_state.lock().await;
+    let symbol_state = guard.symbol_state_mut(symbol);
     if matches!(
         intent.decision,
         crate::llm::decision::PositionManagementDecision::Close
     ) {
-        guard.remove(&key);
+        symbol_state.contexts.remove(&key);
         return;
     }
-    let entry = guard.entry(key).or_default();
+    symbol_state.last_management_reason = Some(intent.reason.clone());
+    let entry = symbol_state.contexts.entry(key).or_default();
     if entry.original_qty <= f64::EPSILON {
         entry.original_qty = current_qty;
     } else if current_qty > entry.original_qty {
@@ -1506,10 +1660,6 @@ async fn update_position_context_after_management_action(
                 qty_ratio,
                 reason_summary: summarize_reason(&intent.reason),
                 price: current_price,
-                volatility_unit_v: extract_nested_f64(
-                    parsed_decision,
-                    &["analysis", "volatility_unit_v"],
-                ),
             });
             if entry.reduction_history.len() > 30 {
                 let drop = entry.reduction_history.len() - 30;
@@ -1529,7 +1679,7 @@ async fn update_position_context_after_pending_order_action(
     symbol: &str,
     trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
     intent: &crate::llm::decision::PendingOrderManagementIntent,
-    context_state: &Arc<Mutex<HashMap<String, PositionContextState>>>,
+    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
 ) {
     let Some(state) = trading_state else {
         return;
@@ -1539,25 +1689,30 @@ async fn update_position_context_after_pending_order_action(
             intent.decision,
             crate::llm::decision::PendingOrderManagementDecision::Close
         ) {
-            let mut guard = context_state.lock().await;
+            let mut guard = runtime_lifecycle_state.lock().await;
             let prefix = format!("{}:", symbol.to_ascii_uppercase());
-            guard.retain(|existing_key, _| !existing_key.starts_with(&prefix));
+            let symbol_state = guard.symbol_state_mut(symbol);
+            symbol_state
+                .contexts
+                .retain(|existing_key, _| !existing_key.starts_with(&prefix));
         }
         return;
     };
 
-    let mut guard = context_state.lock().await;
+    let mut guard = runtime_lifecycle_state.lock().await;
+    let symbol_state = guard.symbol_state_mut(symbol);
     let fallback_both_context = both_context_alias_for_directional_key(&key)
-        .and_then(|alias_key| guard.get(&alias_key).cloned());
+        .and_then(|alias_key| symbol_state.contexts.get(&alias_key).cloned());
     if matches!(
         intent.decision,
         crate::llm::decision::PendingOrderManagementDecision::Close
     ) {
-        guard.remove(&key);
+        symbol_state.contexts.remove(&key);
         return;
     }
 
-    let entry = guard.entry(key).or_default();
+    symbol_state.last_management_reason = Some(intent.reason.clone());
+    let entry = symbol_state.contexts.entry(key).or_default();
     if let Some(fallback) = fallback_both_context.as_ref() {
         if entry.effective_entry_price.is_none() {
             entry.effective_entry_price = fallback.effective_entry_price;
@@ -1591,6 +1746,9 @@ async fn update_position_context_after_pending_order_action(
     if let Some(new_sl) = intent.new_sl {
         entry.effective_stop_loss = Some(new_sl);
     }
+    if let Some(new_leverage) = intent.new_leverage {
+        entry.effective_leverage = Some(new_leverage as u32);
+    }
 }
 
 fn summarize_reason(reason: &str) -> String {
@@ -1621,8 +1779,7 @@ fn queue_latest_bundle_invoke(
     last_invoked_ts_bucket: &mut Option<DateTime<Utc>>,
     invoke_inflight: &Arc<AtomicBool>,
     invoke_throttle: &Arc<Mutex<InvokeThrottleState>>,
-    last_management_reason: &Arc<Mutex<Option<String>>>,
-    position_context_state: &Arc<Mutex<HashMap<String, PositionContextState>>>,
+    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
     min_invoke_interval: Duration,
     apply_min_invoke_interval_throttle: bool,
     trigger: &str,
@@ -1673,8 +1830,7 @@ fn queue_latest_bundle_invoke(
     let print_response = ctx.config.llm.print_response;
     let invoke_inflight = Arc::clone(invoke_inflight);
     let invoke_throttle = Arc::clone(invoke_throttle);
-    let last_management_reason = Arc::clone(last_management_reason);
-    let position_context_state = Arc::clone(position_context_state);
+    let runtime_lifecycle_state = Arc::clone(runtime_lifecycle_state);
     let trigger = Arc::<str>::from(trigger.to_string());
     let ts_bucket = bundle.raw.ts_bucket;
     tokio::spawn(async move {
@@ -1705,8 +1861,7 @@ fn queue_latest_bundle_invoke(
                 print_response,
                 bundle,
                 trigger,
-                last_management_reason,
-                position_context_state,
+                runtime_lifecycle_state,
             )
             .await;
         } else {
@@ -1727,11 +1882,76 @@ async fn invoke_bundle_models(
     print_response: bool,
     bundle: LatestBundle,
     trigger: Arc<str>,
-    last_management_reason: Arc<Mutex<Option<String>>>,
-    position_context_state: Arc<Mutex<HashMap<String, PositionContextState>>>,
+    runtime_lifecycle_state: Arc<Mutex<RuntimeLifecycleStore>>,
 ) {
     let mut execution_done = false;
     let mut execution_blocked_due_to_stale = false;
+    if !config.llm.request_enabled {
+        let input = build_persist_only_input(&bundle);
+        let source_file = minute_bundle_path(&bundle.raw);
+        let model_input_files = match persist_model_input_to_disk(
+            &bundle.raw,
+            trigger.as_ref(),
+            false,
+            false,
+            &input,
+            config.llm.temp_cache_retention_minutes,
+        )
+        .await
+        {
+            Ok(path) => Some(path),
+            Err(err) => {
+                warn!(
+                    symbol = %bundle.raw.symbol,
+                    ts_bucket = %bundle.raw.ts_bucket,
+                    trigger = %trigger,
+                    error = %err,
+                    "persist llm model input to temp_model_input failed while llm.request_enabled=false"
+                );
+                None
+            }
+        };
+        let scan_input_path = model_input_files
+            .as_ref()
+            .map(|files| files.scan.display().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let core_input_path = model_input_files
+            .as_ref()
+            .map(|files| files.core.display().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let scan_input_exists = model_input_files
+            .as_ref()
+            .map(|files| files.scan.exists())
+            .unwrap_or(false);
+        let core_input_exists = model_input_files
+            .as_ref()
+            .map(|files| files.core.exists())
+            .unwrap_or(false);
+        println!(
+            "LLM_INPUT_SOURCE ts_bucket={} trigger={} symbol={} source_temp_indicator_file={} source_file_exists={} source_scan_input_file={} scan_input_file_exists={} source_core_input_file={} core_input_file_exists={} indicator_count={} missing_count={} management_mode={} pending_order_mode={}",
+            bundle.raw.ts_bucket,
+            &*trigger,
+            bundle.raw.symbol,
+            source_file.display(),
+            source_file.exists(),
+            scan_input_path,
+            scan_input_exists,
+            core_input_path,
+            core_input_exists,
+            bundle.raw.indicator_count,
+            bundle.missing_indicator_codes.len(),
+            false,
+            false,
+        );
+        info!(
+            ts_bucket = %bundle.raw.ts_bucket,
+            trigger = %trigger,
+            indicator_count = bundle.raw.indicator_count,
+            missing_count = bundle.missing_indicator_codes.len(),
+            "llm request skipped because llm.request_enabled=false; persisted temp_indicator and temp_model_input only"
+        );
+        return;
+    }
     let trading_state = if config.llm.execution.enabled {
         match fetch_symbol_trading_state(
             &http_client,
@@ -1781,11 +2001,11 @@ async fn invoke_bundle_models(
         )
         .unwrap_or("NO_ACTIVE_CONTEXT");
     let global_management_reason = {
-        let guard = last_management_reason.lock().await;
+        let guard = runtime_lifecycle_state.lock().await;
         if active_position_count == 0 && open_order_count == 0 {
             None
         } else {
-            guard.clone()
+            guard.last_management_reason(&bundle.raw.symbol)
         }
     };
     hydrate_position_context_from_live_state(
@@ -1793,12 +2013,12 @@ async fn invoke_bundle_models(
         &config.api.binance,
         &config.llm.execution,
         trading_state.as_ref(),
-        &position_context_state,
+        &runtime_lifecycle_state,
     )
     .await;
     if let Err(err) = restore_position_context_from_journal_for_live_state(
         trading_state.as_ref(),
-        &position_context_state,
+        &runtime_lifecycle_state,
     )
     .await
     {
@@ -1808,12 +2028,9 @@ async fn invoke_bundle_models(
             "restore position context from journal failed"
         );
     }
-    let position_context = sync_and_build_position_context_snapshot(
-        trading_state.as_ref(),
-        &position_context_state,
-        global_management_reason.clone(),
-    )
-    .await;
+    let position_context =
+        sync_and_build_position_context_snapshot(trading_state.as_ref(), &runtime_lifecycle_state)
+            .await;
     let invoke_management_reason = resolve_invoke_management_reason(
         active_position_count,
         open_order_count,
@@ -1882,7 +2099,7 @@ async fn invoke_bundle_models(
         "llm invoking models"
     );
     let source_file = minute_bundle_path(&bundle.raw);
-    let model_input_file = match persist_model_input_to_disk(
+    let model_input_files = match persist_model_input_to_disk(
         &bundle.raw,
         trigger.as_ref(),
         management_mode,
@@ -1904,23 +2121,33 @@ async fn invoke_bundle_models(
             None
         }
     };
-    let model_input_path = model_input_file
+    let scan_input_path = model_input_files
         .as_ref()
-        .map(|p| p.display().to_string())
+        .map(|files| files.scan.display().to_string())
         .unwrap_or_else(|| "-".to_string());
-    let model_input_exists = model_input_file
+    let core_input_path = model_input_files
         .as_ref()
-        .map(|p| p.exists())
+        .map(|files| files.core.display().to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let scan_input_exists = model_input_files
+        .as_ref()
+        .map(|files| files.scan.exists())
+        .unwrap_or(false);
+    let core_input_exists = model_input_files
+        .as_ref()
+        .map(|files| files.core.exists())
         .unwrap_or(false);
     println!(
-        "LLM_INPUT_SOURCE ts_bucket={} trigger={} symbol={} source_temp_indicator_file={} source_file_exists={} source_model_input_file={} model_input_file_exists={} indicator_count={} missing_count={} management_mode={} pending_order_mode={}",
+        "LLM_INPUT_SOURCE ts_bucket={} trigger={} symbol={} source_temp_indicator_file={} source_file_exists={} source_scan_input_file={} scan_input_file_exists={} source_core_input_file={} core_input_file_exists={} indicator_count={} missing_count={} management_mode={} pending_order_mode={}",
         bundle.raw.ts_bucket,
         &*trigger,
         bundle.raw.symbol,
         source_file.display(),
         source_file.exists(),
-        model_input_path,
-        model_input_exists,
+        scan_input_path,
+        scan_input_exists,
+        core_input_path,
+        core_input_exists,
         bundle.raw.indicator_count,
         bundle.missing_indicator_codes.len(),
         management_mode,
@@ -2235,9 +2462,22 @@ async fn invoke_bundle_models(
             continue;
         };
         if pending_order_mode {
+            let pending_ctx = {
+                let po = input
+                    .management_snapshot
+                    .as_ref()
+                    .and_then(|ms| ms.pending_order.as_ref());
+                PendingOrderContext {
+                    has_open_orders: open_order_count > 0,
+                    current_entry: po.and_then(|p| p.entry_price),
+                    current_tp: po.and_then(|p| p.current_tp_price),
+                    current_sl: po.and_then(|p| p.current_sl_price),
+                    current_leverage: po.and_then(|p| p.leverage.map(|v| v as f64)),
+                }
+            };
             let intent = match pending_order_management_intent_from_value_with_context(
                 parsed_decision,
-                open_order_count > 0,
+                &pending_ctx,
             ) {
                 Ok(intent) => intent,
                 Err(err) => {
@@ -2273,17 +2513,16 @@ async fn invoke_bundle_models(
             };
             if matches!(intent.decision, PendingOrderManagementDecision::Hold) {
                 {
-                    let mut guard = last_management_reason.lock().await;
-                    if matches!(intent.decision, PendingOrderManagementDecision::Close) {
-                        *guard = None;
-                    } else {
-                        *guard = Some(intent.reason.clone());
-                    }
+                    let mut guard = runtime_lifecycle_state.lock().await;
+                    guard.set_last_management_reason(
+                        &bundle.raw.symbol,
+                        Some(intent.reason.clone()),
+                    );
                 }
                 execution_done = true;
                 let fields = derive_pending_order_telegram_fields(
                     trading_state.as_ref(),
-                    &position_context_state,
+                    &runtime_lifecycle_state,
                 )
                 .await;
                 println!(
@@ -2342,7 +2581,7 @@ async fn invoke_bundle_models(
                     &bundle.raw.symbol,
                     trading_state.as_ref(),
                     &intent,
-                    &position_context_state,
+                    &runtime_lifecycle_state,
                 )
                 .await;
                 continue;
@@ -2352,7 +2591,7 @@ async fn invoke_bundle_models(
                 let fields = with_telegram_field_overrides(
                     derive_pending_order_telegram_fields(
                         trading_state.as_ref(),
-                        &position_context_state,
+                        &runtime_lifecycle_state,
                     )
                     .await,
                     intent.new_entry,
@@ -2426,12 +2665,14 @@ async fn invoke_bundle_models(
                 continue;
             }
             {
-                let mut guard = last_management_reason.lock().await;
-                if matches!(intent.decision, PendingOrderManagementDecision::Close) {
-                    *guard = None;
-                } else {
-                    *guard = Some(intent.reason.clone());
-                }
+                let mut guard = runtime_lifecycle_state.lock().await;
+                let next_reason =
+                    if matches!(intent.decision, PendingOrderManagementDecision::Close) {
+                        None
+                    } else {
+                        Some(intent.reason.clone())
+                    };
+                guard.set_last_management_reason(&bundle.raw.symbol, next_reason);
             }
 
             match execute_pending_order_intent(
@@ -2532,7 +2773,7 @@ async fn invoke_bundle_models(
                         &bundle.raw.symbol,
                         trading_state.as_ref(),
                         &intent,
-                        &position_context_state,
+                        &runtime_lifecycle_state,
                     )
                     .await;
                 }
@@ -2600,9 +2841,8 @@ async fn invoke_bundle_models(
             if let Err(err) = validate_reduce_anti_repetition(
                 &bundle.raw.symbol,
                 &intent,
-                parsed_decision,
                 trading_state.as_ref(),
-                &position_context_state,
+                &runtime_lifecycle_state,
             )
             .await
             {
@@ -2631,19 +2871,17 @@ async fn invoke_bundle_models(
             }
             if matches!(intent.decision, PositionManagementDecision::Hold) {
                 {
-                    let mut guard = last_management_reason.lock().await;
-                    if matches!(intent.decision, PositionManagementDecision::Close) {
-                        // Reset on close — don't carry this reason into the next trade's management context.
-                        *guard = None;
-                    } else {
-                        *guard = Some(intent.reason.clone());
-                    }
+                    let mut guard = runtime_lifecycle_state.lock().await;
+                    guard.set_last_management_reason(
+                        &bundle.raw.symbol,
+                        Some(intent.reason.clone()),
+                    );
                 }
                 execution_done = true;
                 let fallback_fields = enrich_telegram_fields_from_entry_context(
                     derive_management_telegram_fields(trading_state.as_ref()),
                     trading_state.as_ref(),
-                    &position_context_state,
+                    &runtime_lifecycle_state,
                 )
                 .await;
                 debug!(
@@ -2723,8 +2961,7 @@ async fn invoke_bundle_models(
                     &bundle.raw.symbol,
                     trading_state.as_ref(),
                     &intent,
-                    parsed_decision,
-                    &position_context_state,
+                    &runtime_lifecycle_state,
                 )
                 .await;
                 continue;
@@ -2735,7 +2972,7 @@ async fn invoke_bundle_models(
                     enrich_telegram_fields_from_entry_context(
                         derive_management_telegram_fields(trading_state.as_ref()),
                         trading_state.as_ref(),
-                        &position_context_state,
+                        &runtime_lifecycle_state,
                     )
                     .await,
                     None,
@@ -2817,13 +3054,13 @@ async fn invoke_bundle_models(
                 continue;
             }
             {
-                let mut guard = last_management_reason.lock().await;
-                if matches!(intent.decision, PositionManagementDecision::Close) {
-                    // Reset on close — don't carry this reason into the next trade's management context.
-                    *guard = None;
+                let mut guard = runtime_lifecycle_state.lock().await;
+                let next_reason = if matches!(intent.decision, PositionManagementDecision::Close) {
+                    None
                 } else {
-                    *guard = Some(intent.reason.clone());
-                }
+                    Some(intent.reason.clone())
+                };
+                guard.set_last_management_reason(&bundle.raw.symbol, next_reason);
             }
 
             match execute_management_intent(
@@ -2957,7 +3194,7 @@ async fn invoke_bundle_models(
                         enrich_telegram_fields_from_entry_context(
                             derive_management_telegram_fields(trading_state.as_ref()),
                             trading_state.as_ref(),
-                            &position_context_state,
+                            &runtime_lifecycle_state,
                         )
                         .await,
                         None,
@@ -2990,8 +3227,7 @@ async fn invoke_bundle_models(
                         &bundle.raw.symbol,
                         trading_state.as_ref(),
                         &intent,
-                        parsed_decision,
-                        &position_context_state,
+                        &runtime_lifecycle_state,
                     )
                     .await;
                     if report.realized_pnl_usdt != 0.0 {
@@ -3062,7 +3298,7 @@ async fn invoke_bundle_models(
                         enrich_telegram_fields_from_entry_context(
                             derive_management_telegram_fields(trading_state.as_ref()),
                             trading_state.as_ref(),
-                            &position_context_state,
+                            &runtime_lifecycle_state,
                         )
                         .await,
                         None,
@@ -3128,9 +3364,38 @@ async fn invoke_bundle_models(
                 }
             };
             let mut execution_intent = intent.clone();
-            if let Some((remapped_entry, remapped_stop_loss)) =
-                remap_trade_entry_and_stop_loss(&out.provider, &config.llm.execution, &intent)
-            {
+            if matches!(
+                execution_intent.decision,
+                TradeDecision::Long | TradeDecision::Short
+            ) {
+                let computed_rr = execution_intent
+                    .entry_price
+                    .zip(execution_intent.take_profit)
+                    .zip(execution_intent.stop_loss)
+                    .and_then(|((entry, tp), sl)| compute_rr_from_levels(entry, tp, sl));
+                if let Some(geometry_rr) = computed_rr {
+                    if execution_intent
+                        .risk_reward_ratio
+                        .map(|model_rr| (model_rr - geometry_rr).abs() > 1e-6)
+                        .unwrap_or(false)
+                    {
+                        info!(
+                            model_name = %out.model_name,
+                            symbol = %bundle.raw.symbol,
+                            decision = execution_intent.decision.as_str(),
+                            model_rr = execution_intent.risk_reward_ratio.unwrap_or_default(),
+                            geometry_rr = geometry_rr,
+                            "overriding model rr with geometry-derived rr from entry/tp/sl"
+                        );
+                    }
+                    execution_intent.risk_reward_ratio = Some(geometry_rr);
+                }
+            }
+            if let Some((remapped_entry, remapped_stop_loss)) = remap_trade_entry_and_stop_loss(
+                &out.provider,
+                &config.llm.execution,
+                &execution_intent,
+            ) {
                 execution_intent.entry_price = Some(remapped_entry);
                 execution_intent.stop_loss = Some(remapped_stop_loss);
                 info!(
@@ -3254,6 +3519,284 @@ async fn invoke_bundle_models(
                 )
                 .await;
                 continue;
+            }
+            let entry_v_gate = match evaluate_trade_entry_v_gate(
+                &config.llm.execution,
+                &execution_intent,
+                &input,
+                out.entry_stage_trace.as_deref(),
+            ) {
+                Ok(result) => result,
+                Err(err) => {
+                    warn!(
+                        model_name = %out.model_name,
+                        symbol = %bundle.raw.symbol,
+                        decision = execution_intent.decision.as_str(),
+                        entry_price = execution_intent.entry_price.unwrap_or_default(),
+                        take_profit = execution_intent.take_profit.unwrap_or_default(),
+                        stop_loss = execution_intent.stop_loss.unwrap_or_default(),
+                        reason = %intent.reason,
+                        error = %err,
+                        "llm trade execution blocked by entry V gate"
+                    );
+                    println!(
+                        "LLM_ORDER_V_GATE_FAILED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} min_distance_v={} reason={} error={}",
+                        bundle.raw.ts_bucket,
+                        &*trigger,
+                        bundle.raw.symbol,
+                        out.model_name,
+                        execution_intent.decision.as_str(),
+                        format_metric_number(execution_intent.entry_price),
+                        format_metric_number(execution_intent.take_profit),
+                        format_metric_number(execution_intent.stop_loss),
+                        config.llm.execution.min_distance_v,
+                        intent.reason.replace('\n', " "),
+                        err.to_string().replace('\n', " "),
+                    );
+                    let event = json!({
+                        "event_type": "llm_order_v_gate_failed",
+                        "event_ts": Utc::now().to_rfc3339(),
+                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
+                        "trigger": &*trigger,
+                        "symbol": bundle.raw.symbol,
+                        "model_name": out.model_name.clone(),
+                        "decision": execution_intent.decision.as_str(),
+                        "entry_price": execution_intent.entry_price,
+                        "take_profit": execution_intent.take_profit,
+                        "stop_loss": execution_intent.stop_loss,
+                        "min_distance_v": config.llm.execution.min_distance_v,
+                        "reason": intent.reason.clone(),
+                        "error": err.to_string(),
+                    });
+                    if let Err(err) = append_journal_event(event) {
+                        warn!(error = %err, "append llm_order_v_gate_failed journal failed");
+                    }
+                    continue;
+                }
+            };
+            if let Some(gate) = entry_v_gate.as_ref() {
+                if !gate.passed {
+                    warn!(
+                        model_name = %out.model_name,
+                        symbol = %bundle.raw.symbol,
+                        decision = execution_intent.decision.as_str(),
+                        entry_price = execution_intent.entry_price.unwrap_or_default(),
+                        take_profit = execution_intent.take_profit.unwrap_or_default(),
+                        stop_loss = execution_intent.stop_loss.unwrap_or_default(),
+                        selected_v = gate.resolved_v.value,
+                        v_timeframe = gate.resolved_v.timeframe,
+                        v_basis = %gate.resolved_v.basis,
+                        take_profit_distance = gate.take_profit_distance,
+                        take_profit_distance_v = gate.take_profit_distance_v,
+                        min_distance_v = gate.min_distance_v,
+                        reason = %intent.reason,
+                        "llm trade execution blocked by entry V gate"
+                    );
+                    println!(
+                        "LLM_ORDER_V_GATE_FAILED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} selected_v={} v_timeframe={} v_basis={} tp_distance={} tp_in_v={} min_distance_v={} gate_passed=false reason={}",
+                        bundle.raw.ts_bucket,
+                        &*trigger,
+                        bundle.raw.symbol,
+                        out.model_name,
+                        execution_intent.decision.as_str(),
+                        format_metric_number(execution_intent.entry_price),
+                        format_metric_number(execution_intent.take_profit),
+                        format_metric_number(execution_intent.stop_loss),
+                        gate.resolved_v.value,
+                        gate.resolved_v.timeframe,
+                        gate.resolved_v.basis,
+                        gate.take_profit_distance,
+                        gate.take_profit_distance_v,
+                        gate.min_distance_v,
+                        intent.reason.replace('\n', " "),
+                    );
+                    let event = json!({
+                        "event_type": "llm_order_v_gate_failed",
+                        "event_ts": Utc::now().to_rfc3339(),
+                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
+                        "trigger": &*trigger,
+                        "symbol": bundle.raw.symbol,
+                        "model_name": out.model_name.clone(),
+                        "decision": execution_intent.decision.as_str(),
+                        "entry_price": execution_intent.entry_price,
+                        "take_profit": execution_intent.take_profit,
+                        "stop_loss": execution_intent.stop_loss,
+                        "selected_v": gate.resolved_v.value,
+                        "v_timeframe": gate.resolved_v.timeframe,
+                        "v_basis": gate.resolved_v.basis.clone(),
+                        "take_profit_distance": gate.take_profit_distance,
+                        "take_profit_distance_v": gate.take_profit_distance_v,
+                        "min_distance_v": gate.min_distance_v,
+                        "gate_passed": false,
+                        "reason": intent.reason.clone(),
+                    });
+                    if let Err(err) = append_journal_event(event) {
+                        warn!(error = %err, "append llm_order_v_gate_failed journal failed");
+                    }
+                    continue;
+                }
+                info!(
+                    model_name = %out.model_name,
+                    symbol = %bundle.raw.symbol,
+                    decision = execution_intent.decision.as_str(),
+                    selected_v = gate.resolved_v.value,
+                    v_timeframe = gate.resolved_v.timeframe,
+                    v_basis = %gate.resolved_v.basis,
+                    take_profit_distance = gate.take_profit_distance,
+                    take_profit_distance_v = gate.take_profit_distance_v,
+                    min_distance_v = gate.min_distance_v,
+                    "llm trade entry V gate passed"
+                );
+                println!(
+                    "LLM_ORDER_V_GATE_PASSED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} selected_v={} v_timeframe={} v_basis={} tp_distance={} tp_in_v={} min_distance_v={} gate_passed=true",
+                    bundle.raw.ts_bucket,
+                    &*trigger,
+                    bundle.raw.symbol,
+                    out.model_name,
+                    execution_intent.decision.as_str(),
+                    format_metric_number(execution_intent.entry_price),
+                    format_metric_number(execution_intent.take_profit),
+                    format_metric_number(execution_intent.stop_loss),
+                    gate.resolved_v.value,
+                    gate.resolved_v.timeframe,
+                    gate.resolved_v.basis,
+                    gate.take_profit_distance,
+                    gate.take_profit_distance_v,
+                    gate.min_distance_v,
+                );
+            }
+            let entry_rr_gate = match evaluate_trade_rr_gate(
+                &config.llm.execution,
+                &execution_intent,
+            ) {
+                Ok(result) => result,
+                Err(err) => {
+                    warn!(
+                        model_name = %out.model_name,
+                        symbol = %bundle.raw.symbol,
+                        decision = execution_intent.decision.as_str(),
+                        entry_price = execution_intent.entry_price.unwrap_or_default(),
+                        take_profit = execution_intent.take_profit.unwrap_or_default(),
+                        stop_loss = execution_intent.stop_loss.unwrap_or_default(),
+                        reason = %intent.reason,
+                        error = %err,
+                        "llm trade execution blocked by entry RR gate"
+                    );
+                    println!(
+                        "LLM_ORDER_RR_GATE_FAILED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} min_rr={} reason={} error={}",
+                        bundle.raw.ts_bucket,
+                        &*trigger,
+                        bundle.raw.symbol,
+                        out.model_name,
+                        execution_intent.decision.as_str(),
+                        format_metric_number(execution_intent.entry_price),
+                        format_metric_number(execution_intent.take_profit),
+                        format_metric_number(execution_intent.stop_loss),
+                        config.llm.execution.min_rr,
+                        intent.reason.replace('\n', " "),
+                        err.to_string().replace('\n', " "),
+                    );
+                    let event = json!({
+                        "event_type": "llm_order_rr_gate_failed",
+                        "event_ts": Utc::now().to_rfc3339(),
+                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
+                        "trigger": &*trigger,
+                        "symbol": bundle.raw.symbol,
+                        "model_name": out.model_name.clone(),
+                        "decision": execution_intent.decision.as_str(),
+                        "entry_price": execution_intent.entry_price,
+                        "take_profit": execution_intent.take_profit,
+                        "stop_loss": execution_intent.stop_loss,
+                        "min_rr": config.llm.execution.min_rr,
+                        "reason": intent.reason.clone(),
+                        "error": err.to_string(),
+                    });
+                    if let Err(err) = append_journal_event(event) {
+                        warn!(error = %err, "append llm_order_rr_gate_failed journal failed");
+                    }
+                    continue;
+                }
+            };
+            if let Some(gate) = entry_rr_gate.as_ref() {
+                if !gate.passed {
+                    warn!(
+                        model_name = %out.model_name,
+                        symbol = %bundle.raw.symbol,
+                        decision = execution_intent.decision.as_str(),
+                        entry_price = execution_intent.entry_price.unwrap_or_default(),
+                        take_profit = execution_intent.take_profit.unwrap_or_default(),
+                        stop_loss = execution_intent.stop_loss.unwrap_or_default(),
+                        risk_reward_ratio = gate.risk_reward_ratio,
+                        reward_distance = gate.reward_distance,
+                        risk_distance = gate.risk_distance,
+                        min_rr = gate.min_rr,
+                        reason = %intent.reason,
+                        "llm trade execution blocked by entry RR gate"
+                    );
+                    println!(
+                        "LLM_ORDER_RR_GATE_FAILED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} rr={} reward_distance={} risk_distance={} min_rr={} gate_passed=false reason={}",
+                        bundle.raw.ts_bucket,
+                        &*trigger,
+                        bundle.raw.symbol,
+                        out.model_name,
+                        execution_intent.decision.as_str(),
+                        format_metric_number(execution_intent.entry_price),
+                        format_metric_number(execution_intent.take_profit),
+                        format_metric_number(execution_intent.stop_loss),
+                        gate.risk_reward_ratio,
+                        gate.reward_distance,
+                        gate.risk_distance,
+                        gate.min_rr,
+                        intent.reason.replace('\n', " "),
+                    );
+                    let event = json!({
+                        "event_type": "llm_order_rr_gate_failed",
+                        "event_ts": Utc::now().to_rfc3339(),
+                        "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
+                        "trigger": &*trigger,
+                        "symbol": bundle.raw.symbol,
+                        "model_name": out.model_name.clone(),
+                        "decision": execution_intent.decision.as_str(),
+                        "entry_price": execution_intent.entry_price,
+                        "take_profit": execution_intent.take_profit,
+                        "stop_loss": execution_intent.stop_loss,
+                        "risk_reward_ratio": gate.risk_reward_ratio,
+                        "reward_distance": gate.reward_distance,
+                        "risk_distance": gate.risk_distance,
+                        "min_rr": gate.min_rr,
+                        "gate_passed": false,
+                        "reason": intent.reason.clone(),
+                    });
+                    if let Err(err) = append_journal_event(event) {
+                        warn!(error = %err, "append llm_order_rr_gate_failed journal failed");
+                    }
+                    continue;
+                }
+                info!(
+                    model_name = %out.model_name,
+                    symbol = %bundle.raw.symbol,
+                    decision = execution_intent.decision.as_str(),
+                    risk_reward_ratio = gate.risk_reward_ratio,
+                    reward_distance = gate.reward_distance,
+                    risk_distance = gate.risk_distance,
+                    min_rr = gate.min_rr,
+                    "llm trade entry RR gate passed"
+                );
+                println!(
+                    "LLM_ORDER_RR_GATE_PASSED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} rr={} reward_distance={} risk_distance={} min_rr={} gate_passed=true",
+                    bundle.raw.ts_bucket,
+                    &*trigger,
+                    bundle.raw.symbol,
+                    out.model_name,
+                    execution_intent.decision.as_str(),
+                    format_metric_number(execution_intent.entry_price),
+                    format_metric_number(execution_intent.take_profit),
+                    format_metric_number(execution_intent.stop_loss),
+                    gate.risk_reward_ratio,
+                    gate.reward_distance,
+                    gate.risk_distance,
+                    gate.min_rr,
+                );
             }
 
             match execute_trade_intent(
@@ -3394,8 +3937,11 @@ async fn invoke_bundle_models(
                     )
                     .await;
                     {
-                        let mut guard = last_management_reason.lock().await;
-                        *guard = Some(intent.reason.clone());
+                        let mut guard = runtime_lifecycle_state.lock().await;
+                        guard.set_last_management_reason(
+                            &bundle.raw.symbol,
+                            Some(intent.reason.clone()),
+                        );
                     }
                     // Capture entry context so management cycles can continue the strategy.
                     let context_keys = execution_context_keys_for_report(
@@ -3404,9 +3950,10 @@ async fn invoke_bundle_models(
                         intent.decision,
                     );
                     if !context_keys.is_empty() {
-                        let mut guard = position_context_state.lock().await;
+                        let mut guard = runtime_lifecycle_state.lock().await;
+                        let symbol_state = guard.symbol_state_mut(&bundle.raw.symbol);
                         for key in context_keys {
-                            let ctx_entry = guard.entry(key).or_default();
+                            let ctx_entry = symbol_state.contexts.entry(key).or_default();
                             ctx_entry.effective_entry_price = Some(report.maker_entry_price);
                             ctx_entry.effective_stop_loss = Some(report.actual_stop_loss);
                             ctx_entry.effective_take_profit = Some(report.actual_take_profit);
@@ -3480,2327 +4027,6 @@ async fn invoke_bundle_models(
             }
         }
     }
-}
-
-fn filter_indicators(
-    raw_indicators: &Value,
-    required_codes: &[String],
-) -> (Map<String, Value>, Vec<String>) {
-    let source = raw_indicators.as_object().cloned().unwrap_or_default();
-    let mut out = Map::new();
-    let mut missing = Vec::new();
-
-    for code in required_codes {
-        if let Some(val) = source.get(code) {
-            let mut filtered = val.clone();
-            // FVG uses 1h/4h/1d windows (no 15m); all others use the standard 15m/4h/1d set.
-            if code == "fvg" {
-                retain_fvg_windows_in_place(&mut filtered);
-            } else {
-                retain_llm_windows_in_place(&mut filtered);
-            }
-            out.insert(code.clone(), filtered);
-        } else {
-            missing.push(code.clone());
-        }
-    }
-
-    compact_llm_indicators_in_place(&mut out);
-    (out, missing)
-}
-
-fn retain_llm_windows_in_place(value: &mut Value) {
-    match value {
-        Value::Object(obj) => {
-            if let Some(by_window) = obj.get_mut("by_window").and_then(Value::as_object_mut) {
-                by_window.retain(|window, _| LLM_ALLOWED_WINDOWS.contains(&window.as_str()));
-            }
-            if let Some(series_by_window) = obj
-                .get_mut("series_by_window")
-                .and_then(Value::as_object_mut)
-            {
-                series_by_window.retain(|window, _| LLM_ALLOWED_WINDOWS.contains(&window.as_str()));
-            }
-            for child in obj.values_mut() {
-                retain_llm_windows_in_place(child);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                retain_llm_windows_in_place(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// FVG has windows 1h/4h/1d (no 15m timeframe produced by the engine).
-fn retain_fvg_windows_in_place(value: &mut Value) {
-    match value {
-        Value::Object(obj) => {
-            if let Some(by_window) = obj.get_mut("by_window").and_then(Value::as_object_mut) {
-                by_window.retain(|window, _| LLM_FVG_ALLOWED_WINDOWS.contains(&window.as_str()));
-            }
-            for child in obj.values_mut() {
-                retain_fvg_windows_in_place(child);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                retain_fvg_windows_in_place(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn compact_llm_indicators_in_place(indicators: &mut Map<String, Value>) {
-    let reference_price = extract_reference_price(indicators);
-
-    if let Some(payload) = indicator_payload_mut(indicators, "orderbook_depth") {
-        compact_orderbook_depth_payload(payload);
-    }
-    if let Some(payload) = indicator_payload_mut(indicators, "kline_history") {
-        compact_kline_history_payload(payload);
-    }
-    if let Some(payload) = indicator_payload_mut(indicators, "funding_rate") {
-        compact_funding_rate_payload_with_time_buckets(payload);
-    }
-    if let Some(payload) = indicator_payload_mut(indicators, "cvd_pack") {
-        compact_cvd_pack_payload_with_time_buckets(payload);
-    }
-    if let Some(payload) = indicator_payload_mut(indicators, "price_volume_structure") {
-        compact_price_volume_structure_payload_with_price_bands(payload, reference_price);
-    }
-
-    let pvs_value_areas = extract_pvs_value_area_ranges(indicators);
-    if let Some(payload) = indicator_payload_mut(indicators, "footprint") {
-        compact_footprint_payload_with_price_bands(payload, reference_price, &pvs_value_areas);
-    }
-    if let Some(payload) = indicator_payload_mut(indicators, "ema_trend_regime") {
-        compact_ema_trend_regime_payload(payload);
-    }
-    if let Some(payload) = indicator_payload_mut(indicators, "tpo_market_profile") {
-        compact_tpo_market_profile_payload(payload);
-    }
-    if let Some(payload) = indicator_payload_mut(indicators, "rvwap_sigma_bands") {
-        compact_rvwap_sigma_bands_payload(payload);
-    }
-    if let Some(payload) = indicator_payload_mut(indicators, "high_volume_pulse") {
-        compact_high_volume_pulse_payload(payload);
-    }
-
-    // Compress event indicators: keep last 24h in full, aggregate older bars by day.
-    for code in [
-        "absorption",
-        "bearish_absorption",
-        "bullish_absorption",
-        "buying_exhaustion",
-        "selling_exhaustion",
-        "initiation",
-        "bearish_initiation",
-        "bullish_initiation",
-    ] {
-        if let Some(payload) = indicator_payload_mut(indicators, code) {
-            compact_event_payload(payload);
-        }
-    }
-
-    apply_llm_token_governor(indicators);
-    build_core_price_anchors(indicators, reference_price);
-}
-
-fn indicator_payload_mut<'a>(
-    indicators: &'a mut Map<String, Value>,
-    code: &str,
-) -> Option<&'a mut Map<String, Value>> {
-    indicators
-        .get_mut(code)
-        .and_then(Value::as_object_mut)
-        .and_then(|indicator| indicator.get_mut("payload"))
-        .and_then(Value::as_object_mut)
-}
-
-fn indicator_payload_ref<'a>(
-    indicators: &'a Map<String, Value>,
-    code: &str,
-) -> Option<&'a Map<String, Value>> {
-    indicators
-        .get(code)
-        .and_then(Value::as_object)
-        .and_then(|indicator| indicator.get("payload"))
-        .and_then(Value::as_object)
-}
-
-fn extract_reference_price(indicators: &Map<String, Value>) -> Option<f64> {
-    indicators
-        .get("avwap")
-        .and_then(Value::as_object)
-        .and_then(|indicator| indicator.get("payload"))
-        .and_then(Value::as_object)
-        .and_then(|payload| {
-            payload
-                .get("fut_last_price")
-                .and_then(Value::as_f64)
-                .or_else(|| payload.get("fut_mark_price").and_then(Value::as_f64))
-        })
-        .or_else(|| {
-            indicators
-                .get("orderbook_depth")
-                .and_then(Value::as_object)
-                .and_then(|indicator| indicator.get("payload"))
-                .and_then(Value::as_object)
-                .and_then(|payload| {
-                    payload
-                        .get("depth_band_reference_price")
-                        .and_then(Value::as_f64)
-                })
-        })
-}
-
-fn extract_pvs_value_area_ranges(indicators: &Map<String, Value>) -> HashMap<String, (f64, f64)> {
-    let mut out = HashMap::new();
-    let Some(by_window) = indicators
-        .get("price_volume_structure")
-        .and_then(Value::as_object)
-        .and_then(|indicator| indicator.get("payload"))
-        .and_then(Value::as_object)
-        .and_then(|payload| payload.get("by_window"))
-        .and_then(Value::as_object)
-    else {
-        return out;
-    };
-
-    for (window, value) in by_window {
-        let Some(obj) = value.as_object() else {
-            continue;
-        };
-        let val = obj.get("val").and_then(Value::as_f64);
-        let vah = obj.get("vah").and_then(Value::as_f64);
-        if let (Some(val), Some(vah)) = (val, vah) {
-            let lo = val.min(vah);
-            let hi = val.max(vah);
-            out.insert(window.clone(), (lo, hi));
-        }
-    }
-    out
-}
-
-fn compact_kline_history_payload(payload: &mut Map<String, Value>) {
-    let Some(intervals_obj) = payload.get_mut("intervals").and_then(Value::as_object_mut) else {
-        return;
-    };
-
-    let mut compacted_intervals = Map::new();
-    for interval in ["1m", "15m", "4h", "1d"] {
-        let keep = match interval {
-            "1m" => LLM_KLINE_KEEP_1M,
-            "15m" => LLM_KLINE_KEEP_15M,
-            "4h" => LLM_KLINE_KEEP_4H,
-            "1d" => LLM_KLINE_KEEP_1D,
-            _ => 60,
-        };
-
-        let (futures_bars, spot_bars) = (
-            read_kline_market_bars(intervals_obj, interval, "futures"),
-            read_kline_market_bars(intervals_obj, interval, "spot"),
-        );
-        if futures_bars.is_empty() && spot_bars.is_empty() {
-            continue;
-        }
-
-        let mut compacted = Map::new();
-        compacted.insert(
-            "interval_code".to_string(),
-            Value::String(interval.to_string()),
-        );
-
-        let futures_trimmed = if futures_bars.len() > keep {
-            futures_bars[futures_bars.len() - keep..].to_vec()
-        } else {
-            futures_bars
-        };
-        let spot_trimmed = if spot_bars.len() > keep {
-            spot_bars[spot_bars.len() - keep..].to_vec()
-        } else {
-            spot_bars
-        };
-
-        let latest_close_gap_f_minus_s = futures_trimmed
-            .last()
-            .and_then(|f| f.get("close").and_then(Value::as_f64))
-            .zip(
-                spot_trimmed
-                    .last()
-                    .and_then(|s| s.get("close").and_then(Value::as_f64)),
-            )
-            .map(|(f, s)| f - s);
-
-        let latest_high_gap_f_minus_s = futures_trimmed
-            .last()
-            .and_then(|f| f.get("high").and_then(Value::as_f64))
-            .zip(
-                spot_trimmed
-                    .last()
-                    .and_then(|s| s.get("high").and_then(Value::as_f64)),
-            )
-            .map(|(f, s)| f - s);
-
-        let latest_low_gap_f_minus_s = futures_trimmed
-            .last()
-            .and_then(|f| f.get("low").and_then(Value::as_f64))
-            .zip(
-                spot_trimmed
-                    .last()
-                    .and_then(|s| s.get("low").and_then(Value::as_f64)),
-            )
-            .map(|(f, s)| f - s);
-
-        compacted.insert(
-            "futures".to_string(),
-            json!({
-                "returned_count": futures_trimmed.len(),
-                "bars": futures_trimmed,
-            }),
-        );
-        // Include actual spot bars so the LLM can compare spot vs futures price
-        // action directly — required for strategy 7 (spot-led flow continuation).
-        if !spot_trimmed.is_empty() {
-            compacted.insert(
-                "spot".to_string(),
-                json!({
-                    "returned_count": spot_trimmed.len(),
-                    "bars": spot_trimmed,
-                }),
-            );
-        }
-        compacted.insert(
-            "spot_gap".to_string(),
-            json!({
-                "latest_close_gap_f_minus_s": latest_close_gap_f_minus_s,
-                "latest_high_gap_f_minus_s": latest_high_gap_f_minus_s,
-                "latest_low_gap_f_minus_s": latest_low_gap_f_minus_s,
-            }),
-        );
-
-        compacted_intervals.insert(interval.to_string(), Value::Object(compacted));
-    }
-
-    payload.insert("intervals".to_string(), Value::Object(compacted_intervals));
-}
-
-fn read_kline_market_bars(
-    intervals_obj: &Map<String, Value>,
-    interval_code: &str,
-    market: &str,
-) -> Vec<Value> {
-    intervals_obj
-        .get(interval_code)
-        .and_then(Value::as_object)
-        .and_then(|interval| interval.get("markets"))
-        .and_then(Value::as_object)
-        .and_then(|markets| markets.get(market))
-        .and_then(Value::as_object)
-        .and_then(|market_obj| market_obj.get("bars"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-}
-
-fn compact_funding_rate_payload_with_time_buckets(payload: &mut Map<String, Value>) {
-    let Some(by_window) = payload.get_mut("by_window").and_then(Value::as_object_mut) else {
-        return;
-    };
-
-    for window_payload in by_window.values_mut() {
-        let Some(window_obj) = window_payload.as_object_mut() else {
-            continue;
-        };
-
-        let changes = window_obj
-            .remove("changes")
-            .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default();
-        window_obj.insert("change_count".to_string(), json!(changes.len()));
-        if changes.is_empty() {
-            window_obj.insert("changes_recent".to_string(), Value::Array(Vec::new()));
-            window_obj.insert(
-                "changes_bucketed".to_string(),
-                json!({
-                    "bucket_span_secs": LLM_TIME_BUCKET_SPAN_SECS,
-                    "bucket_count": 0,
-                    "buckets": [],
-                }),
-            );
-            continue;
-        }
-
-        let buckets = bucket_funding_changes(&changes, LLM_TIME_BUCKET_SPAN_SECS);
-        let recent =
-            select_recent_records_by_timestamp(&changes, "change_ts", LLM_TIME_BUCKET_RECENT_KEEP);
-        window_obj.insert("changes_recent".to_string(), Value::Array(recent));
-        window_obj.insert(
-            "changes_bucketed".to_string(),
-            json!({
-                "bucket_span_secs": LLM_TIME_BUCKET_SPAN_SECS,
-                "bucket_count": buckets.len(),
-                "buckets": buckets,
-            }),
-        );
-    }
-}
-
-fn compact_cvd_pack_payload_with_time_buckets(payload: &mut Map<String, Value>) {
-    let Some(by_window) = payload.get_mut("by_window").and_then(Value::as_object_mut) else {
-        return;
-    };
-
-    for (window, window_payload) in by_window.iter_mut() {
-        let Some(window_obj) = window_payload.as_object_mut() else {
-            continue;
-        };
-        let series = window_obj
-            .remove("series")
-            .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default();
-        let series_count = series.len();
-        window_obj.insert("series_count".to_string(), json!(series_count));
-        if series_count <= 1 {
-            window_obj.insert("series".to_string(), Value::Array(series));
-            continue;
-        }
-
-        // 15m needs more history for S2 delta divergence detection (96 bars = 24h)
-        let keep = if window == "15m" {
-            LLM_CVD_KEEP_15M
-        } else {
-            LLM_TIME_BUCKET_RECENT_KEEP
-        };
-        let recent = select_recent_records_by_timestamp(&series, "ts", keep);
-        window_obj.insert("series".to_string(), Value::Array(recent));
-    }
-}
-
-fn compact_orderbook_depth_payload(payload: &mut Map<String, Value>) {
-    let Some(levels) = payload
-        .remove("levels")
-        .and_then(|value| value.as_array().cloned())
-    else {
-        return;
-    };
-
-    let reference_price = infer_reference_price(&levels);
-    payload.insert("levels_total".to_string(), json!(levels.len()));
-    payload.insert(
-        "top_bid_walls".to_string(),
-        Value::Array(select_top_levels_by_metric(
-            &levels,
-            "bid_liquidity",
-            LLM_ORDERBOOK_SIDE_LEVELS,
-            false,
-        )),
-    );
-    payload.insert(
-        "top_ask_walls".to_string(),
-        Value::Array(select_top_levels_by_metric(
-            &levels,
-            "ask_liquidity",
-            LLM_ORDERBOOK_SIDE_LEVELS,
-            false,
-        )),
-    );
-    payload.insert(
-        "top_total_liquidity_levels".to_string(),
-        Value::Array(select_top_levels_by_metric(
-            &levels,
-            "total_liquidity",
-            LLM_ORDERBOOK_TOP_LEVELS,
-            false,
-        )),
-    );
-    payload.insert(
-        "top_abs_net_liquidity_levels".to_string(),
-        Value::Array(select_top_levels_by_metric(
-            &levels,
-            "net_liquidity",
-            LLM_ORDERBOOK_TOP_LEVELS,
-            true,
-        )),
-    );
-    if let Some(reference_price) = reference_price {
-        payload.insert(
-            "depth_band_reference_price".to_string(),
-            json!(reference_price),
-        );
-    }
-    payload.insert(
-        "depth_bands".to_string(),
-        Value::Array(build_depth_bands(&levels, reference_price)),
-    );
-
-    // Remove redundant microprice variants — all four carry the same value;
-    // keep only microprice_fut as the canonical field.
-    for field in [
-        "microprice_adj_fut",
-        "microprice_classic_fut",
-        "microprice_kappa_fut",
-    ] {
-        payload.remove(field);
-    }
-
-    // Remove redundant OBI variants — keep obi_k_dw_twa_fut (time-weighted, distance-weighted),
-    // obi_k_dw_twa_spot (spot counterpart), obi_k_dw_change_fut (momentum),
-    // obi_k_dw_slope_fut (DOM slope for S3 liquidity wall), and
-    // obi_shock_fut (shock signal); discard the aliases and lesser variants.
-    for field in [
-        "obi",
-        "obi_fut",
-        "obi_k_twa_fut",
-        "obi_l1_twa_fut",
-        "obi_k_dw_adj_twa_fut",
-        "obi_k_dw_close_fut",
-    ] {
-        payload.remove(field);
-    }
-}
-
-fn compact_footprint_payload_with_price_bands(
-    payload: &mut Map<String, Value>,
-    reference_price: Option<f64>,
-    pvs_value_areas: &HashMap<String, (f64, f64)>,
-) {
-    compact_price_points_to_zones(payload, "buy_imbalance_prices", "buy_imbalance");
-    compact_price_points_to_zones(payload, "sell_imbalance_prices", "sell_imbalance");
-
-    if let Some(levels) = payload
-        .remove("levels")
-        .and_then(|value| value.as_array().cloned())
-    {
-        payload.insert("levels_total".to_string(), json!(levels.len()));
-        payload.insert(
-            "top_levels_by_total".to_string(),
-            Value::Array(select_top_levels_by_metric(
-                &levels,
-                "total",
-                LLM_FOOTPRINT_TOP_LEVELS,
-                false,
-            )),
-        );
-        payload.insert(
-            "top_levels_by_abs_delta".to_string(),
-            Value::Array(select_top_levels_by_metric(
-                &levels,
-                "delta",
-                LLM_FOOTPRINT_TOP_LEVELS,
-                true,
-            )),
-        );
-    }
-
-    let Some(by_window) = payload.get_mut("by_window").and_then(Value::as_object_mut) else {
-        return;
-    };
-
-    for (window, window_payload) in by_window.iter_mut() {
-        let Some(obj) = window_payload.as_object_mut() else {
-            continue;
-        };
-        compact_footprint_window_payload(
-            window,
-            obj,
-            reference_price,
-            pvs_value_areas.get(window).copied(),
-        );
-    }
-}
-
-fn compact_price_volume_structure_payload_with_price_bands(
-    payload: &mut Map<String, Value>,
-    reference_price: Option<f64>,
-) {
-    compact_price_volume_structure_window_summary(
-        payload,
-        LLM_PROFILE_TOP_LEVELS,
-        LLM_VALUE_AREA_TOP_LEVELS,
-    );
-
-    let Some(by_window) = payload.get_mut("by_window").and_then(Value::as_object_mut) else {
-        return;
-    };
-
-    for (window, window_payload) in by_window.iter_mut() {
-        let Some(window_obj) = window_payload.as_object_mut() else {
-            continue;
-        };
-        compact_price_volume_structure_window_payload(window, window_obj, reference_price);
-    }
-}
-
-fn compact_price_volume_structure_window_summary(
-    payload: &mut Map<String, Value>,
-    profile_top_levels: usize,
-    value_area_top_levels: usize,
-) {
-    if let Some(value_area_levels) = payload
-        .remove("value_area_levels")
-        .and_then(|value| value.as_array().cloned())
-    {
-        payload.insert(
-            "value_area_level_count".to_string(),
-            json!(value_area_levels.len()),
-        );
-        payload.insert(
-            "top_value_area_levels".to_string(),
-            Value::Array(select_top_levels_by_metric(
-                &value_area_levels,
-                "volume",
-                value_area_top_levels,
-                false,
-            )),
-        );
-    }
-
-    if let Some(levels) = payload
-        .remove("levels")
-        .and_then(|value| value.as_array().cloned())
-    {
-        payload.insert("levels_total".to_string(), json!(levels.len()));
-        payload.insert(
-            "top_volume_levels".to_string(),
-            Value::Array(select_top_levels_by_metric(
-                &levels,
-                "volume",
-                profile_top_levels,
-                false,
-            )),
-        );
-        payload.insert(
-            "top_abs_delta_levels".to_string(),
-            Value::Array(select_top_levels_by_metric(
-                &levels,
-                "delta",
-                profile_top_levels,
-                true,
-            )),
-        );
-    }
-}
-
-fn compact_price_volume_structure_window_payload(
-    window: &str,
-    payload: &mut Map<String, Value>,
-    reference_price: Option<f64>,
-) {
-    // Drop raw heavy arrays and stale derived keys, then rebuild compacted fields.
-    for key in [
-        "levels_in_va_corridor",
-        "levels_near_price",
-        "levels_in_va_corridor_bucketed",
-        "levels_near_price_bucketed",
-        "levels_in_va_corridor_raw_level_count",
-        "levels_near_price_raw_level_count",
-    ] {
-        payload.remove(key);
-    }
-
-    let (profile_top_levels, value_area_top_levels) = match window {
-        "4h" => (LLM_PROFILE_TOP_LEVELS_4H, LLM_VALUE_AREA_TOP_LEVELS_4H),
-        "1d" => (LLM_PROFILE_TOP_LEVELS_1D, LLM_VALUE_AREA_TOP_LEVELS_1D),
-        "15m" => (LLM_PROFILE_TOP_LEVELS_15M, LLM_VALUE_AREA_TOP_LEVELS_15M),
-        _ => (LLM_PROFILE_TOP_LEVELS_1D, LLM_VALUE_AREA_TOP_LEVELS_1D),
-    };
-
-    let value_area_levels = payload
-        .remove("value_area_levels")
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default();
-    let levels = payload
-        .remove("levels")
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default();
-
-    payload.insert(
-        "value_area_level_count".to_string(),
-        json!(value_area_levels.len()),
-    );
-    payload.insert("levels_total".to_string(), json!(levels.len()));
-    payload.insert(
-        "top_value_area_levels".to_string(),
-        Value::Array(select_top_levels_by_metric(
-            &value_area_levels,
-            "volume",
-            value_area_top_levels,
-            false,
-        )),
-    );
-    payload.insert(
-        "top_volume_levels".to_string(),
-        Value::Array(select_top_levels_by_metric(
-            &levels,
-            "volume",
-            profile_top_levels,
-            false,
-        )),
-    );
-    payload.insert(
-        "top_abs_delta_levels".to_string(),
-        Value::Array(select_top_levels_by_metric(
-            &levels,
-            "delta",
-            profile_top_levels,
-            true,
-        )),
-    );
-
-    if window == "4h" && !levels.is_empty() {
-        let effective_reference = reference_price.or_else(|| infer_reference_price(&levels));
-        let band_size = dynamic_price_band_size(effective_reference);
-
-        if let (Some(val), Some(vah)) = (
-            payload.get("val").and_then(Value::as_f64),
-            payload.get("vah").and_then(Value::as_f64),
-        ) {
-            let corridor = select_levels_in_price_range(&levels, val, vah);
-            payload.insert(
-                "levels_in_va_corridor_raw_level_count".to_string(),
-                json!(corridor.len()),
-            );
-            payload.insert(
-                "levels_in_va_corridor_bucketed".to_string(),
-                build_pvs_level_bands_summary(&corridor, band_size, effective_reference),
-            );
-        }
-
-        if let Some(reference) = effective_reference {
-            let near = select_levels_near_price(&levels, reference, LLM_LEVELS_NEAR_PRICE_PCT_4H);
-            payload.insert(
-                "levels_near_price_raw_level_count".to_string(),
-                json!(near.len()),
-            );
-            payload.insert(
-                "levels_near_price_bucketed".to_string(),
-                build_pvs_level_bands_summary(&near, band_size, Some(reference)),
-            );
-        }
-    }
-}
-
-fn compact_footprint_window_payload(
-    window: &str,
-    payload: &mut Map<String, Value>,
-    reference_price: Option<f64>,
-    pvs_value_area: Option<(f64, f64)>,
-) {
-    // Drop raw heavy arrays and stale derived keys, then rebuild compacted fields.
-    for key in [
-        "levels_in_va_corridor",
-        "levels_near_price",
-        "levels_in_va_corridor_bucketed",
-        "levels_near_price_bucketed",
-        "levels_in_va_corridor_raw_level_count",
-        "levels_near_price_raw_level_count",
-    ] {
-        payload.remove(key);
-    }
-
-    let levels = payload
-        .remove("levels")
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default();
-    let buy_zones = take_price_points_as_zones(payload, "buy_imbalance_prices", "buy_imbalance");
-    let sell_zones = take_price_points_as_zones(payload, "sell_imbalance_prices", "sell_imbalance");
-    let buy_stacks = payload
-        .remove("buy_stacks")
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default();
-    let sell_stacks = payload
-        .remove("sell_stacks")
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default();
-
-    // Extract unfinished-auction prices before levels are discarded (S4: TP targets).
-    // ua_top_flag marks the highest unfilled price (supply gap top);
-    // ua_bottom_flag marks the lowest unfilled price (demand gap bottom).
-    if let Some(ua_top_price) = levels
-        .iter()
-        .filter(|l| {
-            l.get("ua_top_flag")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        })
-        .filter_map(|l| l.get("price_level").and_then(Value::as_f64))
-        .reduce(f64::max)
-    {
-        payload.insert("ua_top_price".to_string(), json!(ua_top_price));
-    }
-    if let Some(ua_bottom_price) = levels
-        .iter()
-        .filter(|l| {
-            l.get("ua_bottom_flag")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        })
-        .filter_map(|l| l.get("price_level").and_then(Value::as_f64))
-        .reduce(f64::min)
-    {
-        payload.insert("ua_bottom_price".to_string(), json!(ua_bottom_price));
-    }
-
-    payload.insert("levels_total".to_string(), json!(levels.len()));
-    payload.insert("buy_stack_count".to_string(), json!(buy_stacks.len()));
-    payload.insert("sell_stack_count".to_string(), json!(sell_stacks.len()));
-
-    let (top_levels_keep, stack_keep) = match window {
-        "4h" => (LLM_FOOTPRINT_TOP_LEVELS_4H, LLM_FOOTPRINT_STACK_TOP_4H),
-        "1d" => (LLM_FOOTPRINT_TOP_LEVELS_1D, LLM_FOOTPRINT_STACK_TOP_1D),
-        "15m" => (LLM_FOOTPRINT_TOP_LEVELS_15M, LLM_FOOTPRINT_STACK_TOP_15M),
-        _ => (LLM_FOOTPRINT_TOP_LEVELS_1D, LLM_FOOTPRINT_STACK_TOP_1D),
-    };
-
-    payload.insert(
-        "top_levels_by_total".to_string(),
-        Value::Array(select_top_levels_by_metric(
-            &levels,
-            "total",
-            top_levels_keep,
-            false,
-        )),
-    );
-    payload.insert(
-        "top_levels_by_abs_delta".to_string(),
-        Value::Array(select_top_levels_by_metric(
-            &levels,
-            "delta",
-            top_levels_keep,
-            true,
-        )),
-    );
-    payload.insert(
-        "buy_stacks_top".to_string(),
-        Value::Array(select_top_levels_by_metric(
-            &buy_stacks,
-            "length",
-            stack_keep,
-            false,
-        )),
-    );
-    payload.insert(
-        "sell_stacks_top".to_string(),
-        Value::Array(select_top_levels_by_metric(
-            &sell_stacks,
-            "length",
-            stack_keep,
-            false,
-        )),
-    );
-
-    let effective_reference = reference_price.or_else(|| infer_reference_price(&levels));
-
-    // Annotate zones with `intact` flag so LLM (S1) can assess zone validity.
-    // Buy zones are intact while price is still above them (supply not yet revisited).
-    // Sell zones are intact while price is still below them (demand not yet revisited).
-    let buy_zones = if let Some(ref_price) = effective_reference {
-        annotate_zones_intact(buy_zones, ref_price, true)
-    } else {
-        buy_zones
-    };
-    let sell_zones = if let Some(ref_price) = effective_reference {
-        annotate_zones_intact(sell_zones, ref_price, false)
-    } else {
-        sell_zones
-    };
-
-    match window {
-        "4h" => {
-            payload.insert(
-                "buy_imbalance_zones_top_strength".to_string(),
-                Value::Array(select_top_levels_by_metric(
-                    &buy_zones,
-                    "count",
-                    LLM_FOOTPRINT_ZONE_STRENGTH_TOP_4H,
-                    false,
-                )),
-            );
-            payload.insert(
-                "sell_imbalance_zones_top_strength".to_string(),
-                Value::Array(select_top_levels_by_metric(
-                    &sell_zones,
-                    "count",
-                    LLM_FOOTPRINT_ZONE_STRENGTH_TOP_4H,
-                    false,
-                )),
-            );
-            payload.insert(
-                "buy_imbalance_zones_top".to_string(),
-                Value::Array(select_top_levels_by_metric(
-                    &buy_zones,
-                    "count",
-                    LLM_FOOTPRINT_ZONE_STRENGTH_TOP_4H,
-                    false,
-                )),
-            );
-            payload.insert(
-                "sell_imbalance_zones_top".to_string(),
-                Value::Array(select_top_levels_by_metric(
-                    &sell_zones,
-                    "count",
-                    LLM_FOOTPRINT_ZONE_STRENGTH_TOP_4H,
-                    false,
-                )),
-            );
-
-            if let Some(reference) = effective_reference {
-                payload.insert(
-                    "buy_imbalance_zones_near_price".to_string(),
-                    Value::Array(select_nearest_zones(
-                        &buy_zones,
-                        reference,
-                        LLM_FOOTPRINT_ZONE_NEAR_TOP_4H,
-                    )),
-                );
-                payload.insert(
-                    "sell_imbalance_zones_near_price".to_string(),
-                    Value::Array(select_nearest_zones(
-                        &sell_zones,
-                        reference,
-                        LLM_FOOTPRINT_ZONE_NEAR_TOP_4H,
-                    )),
-                );
-                payload.insert(
-                    "buy_imbalance_zone_nearest_above".to_string(),
-                    nearest_zone_above(&buy_zones, reference).unwrap_or(Value::Null),
-                );
-                payload.insert(
-                    "buy_imbalance_zone_nearest_below".to_string(),
-                    nearest_zone_below(&buy_zones, reference).unwrap_or(Value::Null),
-                );
-                payload.insert(
-                    "sell_imbalance_zone_nearest_above".to_string(),
-                    nearest_zone_above(&sell_zones, reference).unwrap_or(Value::Null),
-                );
-                payload.insert(
-                    "sell_imbalance_zone_nearest_below".to_string(),
-                    nearest_zone_below(&sell_zones, reference).unwrap_or(Value::Null),
-                );
-
-                let near =
-                    select_levels_near_price(&levels, reference, LLM_LEVELS_NEAR_PRICE_PCT_4H);
-                payload.insert(
-                    "levels_near_price_raw_level_count".to_string(),
-                    json!(near.len()),
-                );
-                payload.insert(
-                    "levels_near_price_bucketed".to_string(),
-                    build_footprint_level_bands_summary(
-                        &near,
-                        dynamic_price_band_size(Some(reference)),
-                        Some(reference),
-                    ),
-                );
-            }
-
-            if let Some((val, vah)) = pvs_value_area {
-                let corridor = select_levels_in_price_range(&levels, val, vah);
-                payload.insert(
-                    "levels_in_va_corridor_raw_level_count".to_string(),
-                    json!(corridor.len()),
-                );
-                payload.insert(
-                    "levels_in_va_corridor_bucketed".to_string(),
-                    build_footprint_level_bands_summary(
-                        &corridor,
-                        dynamic_price_band_size(effective_reference),
-                        effective_reference,
-                    ),
-                );
-            }
-        }
-        "1d" => {
-            payload.insert(
-                "buy_imbalance_zones_top_strength".to_string(),
-                Value::Array(select_top_levels_by_metric(
-                    &buy_zones,
-                    "count",
-                    LLM_FOOTPRINT_ZONE_STRENGTH_TOP_1D,
-                    false,
-                )),
-            );
-            payload.insert(
-                "sell_imbalance_zones_top_strength".to_string(),
-                Value::Array(select_top_levels_by_metric(
-                    &sell_zones,
-                    "count",
-                    LLM_FOOTPRINT_ZONE_STRENGTH_TOP_1D,
-                    false,
-                )),
-            );
-            payload.insert(
-                "buy_imbalance_zones_top".to_string(),
-                Value::Array(select_top_levels_by_metric(
-                    &buy_zones,
-                    "count",
-                    LLM_FOOTPRINT_ZONE_STRENGTH_TOP_1D,
-                    false,
-                )),
-            );
-            payload.insert(
-                "sell_imbalance_zones_top".to_string(),
-                Value::Array(select_top_levels_by_metric(
-                    &sell_zones,
-                    "count",
-                    LLM_FOOTPRINT_ZONE_STRENGTH_TOP_1D,
-                    false,
-                )),
-            );
-        }
-        "15m" => {
-            let buy_near = if let Some(reference) = effective_reference {
-                select_nearest_zones(&buy_zones, reference, LLM_FOOTPRINT_ZONE_NEAR_TOP_15M)
-            } else {
-                select_top_levels_by_metric(
-                    &buy_zones,
-                    "count",
-                    LLM_FOOTPRINT_ZONE_STRENGTH_TOP_15M,
-                    false,
-                )
-            };
-            let sell_near = if let Some(reference) = effective_reference {
-                select_nearest_zones(&sell_zones, reference, LLM_FOOTPRINT_ZONE_NEAR_TOP_15M)
-            } else {
-                select_top_levels_by_metric(
-                    &sell_zones,
-                    "count",
-                    LLM_FOOTPRINT_ZONE_STRENGTH_TOP_15M,
-                    false,
-                )
-            };
-            payload.insert(
-                "buy_imbalance_zones_near_price".to_string(),
-                Value::Array(buy_near.clone()),
-            );
-            payload.insert(
-                "sell_imbalance_zones_near_price".to_string(),
-                Value::Array(sell_near.clone()),
-            );
-            payload.insert(
-                "buy_imbalance_zones_top".to_string(),
-                Value::Array(buy_near),
-            );
-            payload.insert(
-                "sell_imbalance_zones_top".to_string(),
-                Value::Array(sell_near),
-            );
-        }
-        _ => {
-            payload.insert(
-                "buy_imbalance_zones_top".to_string(),
-                Value::Array(select_top_levels_by_metric(
-                    &buy_zones,
-                    "count",
-                    LLM_FOOTPRINT_ZONE_STRENGTH_TOP_1D,
-                    false,
-                )),
-            );
-            payload.insert(
-                "sell_imbalance_zones_top".to_string(),
-                Value::Array(select_top_levels_by_metric(
-                    &sell_zones,
-                    "count",
-                    LLM_FOOTPRINT_ZONE_STRENGTH_TOP_1D,
-                    false,
-                )),
-            );
-        }
-    }
-}
-
-fn take_price_points_as_zones(
-    payload: &mut Map<String, Value>,
-    source_key: &str,
-    prefix: &str,
-) -> Vec<Value> {
-    let Some(points) = payload
-        .remove(source_key)
-        .and_then(|value| value.as_array().cloned())
-    else {
-        return Vec::new();
-    };
-    let zones = price_points_to_zones(&points);
-    payload.insert(format!("{}_count", prefix), json!(points.len()));
-    payload.insert(format!("{}_zone_count", prefix), json!(zones.len()));
-    zones
-}
-
-#[derive(Debug, Clone)]
-struct FundingBucketAgg {
-    start_ts: i64,
-    end_ts: i64,
-    count: usize,
-    funding_delta_sum: f64,
-    funding_delta_abs_max: f64,
-    funding_new_last: Option<f64>,
-    funding_new_last_ts: i64,
-    mark_price_weighted_sum: f64,
-    mark_price_weight_sum: f64,
-    mark_price_simple_sum: f64,
-    mark_price_simple_count: usize,
-}
-
-impl FundingBucketAgg {
-    fn new(start_ts: i64, end_ts: i64) -> Self {
-        Self {
-            start_ts,
-            end_ts,
-            count: 0,
-            funding_delta_sum: 0.0,
-            funding_delta_abs_max: 0.0,
-            funding_new_last: None,
-            funding_new_last_ts: i64::MIN,
-            mark_price_weighted_sum: 0.0,
-            mark_price_weight_sum: 0.0,
-            mark_price_simple_sum: 0.0,
-            mark_price_simple_count: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct PriceBandAgg {
-    price_start: f64,
-    price_end: f64,
-    level_count: usize,
-    volume_sum: f64,
-    delta_sum: f64,
-    buy_sum: f64,
-    sell_sum: f64,
-    imbalance_buy_count: usize,
-    imbalance_sell_count: usize,
-    hvn_count: usize,
-    lvn_count: usize,
-    max_total_metric: f64,
-    max_total_level_price: Option<f64>,
-    max_abs_delta_metric: f64,
-    max_abs_delta_level_price: Option<f64>,
-}
-
-impl PriceBandAgg {
-    fn new(price_start: f64, price_end: f64) -> Self {
-        Self {
-            price_start,
-            price_end,
-            level_count: 0,
-            volume_sum: 0.0,
-            delta_sum: 0.0,
-            buy_sum: 0.0,
-            sell_sum: 0.0,
-            imbalance_buy_count: 0,
-            imbalance_sell_count: 0,
-            hvn_count: 0,
-            lvn_count: 0,
-            max_total_metric: f64::NEG_INFINITY,
-            max_total_level_price: None,
-            max_abs_delta_metric: f64::NEG_INFINITY,
-            max_abs_delta_level_price: None,
-        }
-    }
-}
-
-fn parse_rfc3339_to_utc(raw: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
-}
-
-fn unix_ts_to_rfc3339(ts: i64) -> Option<String> {
-    DateTime::<Utc>::from_timestamp(ts, 0).map(|dt| dt.to_rfc3339())
-}
-
-fn select_recent_records_by_timestamp(records: &[Value], ts_key: &str, keep: usize) -> Vec<Value> {
-    let mut ranked = records
-        .iter()
-        .map(|record| {
-            let ts = record
-                .get(ts_key)
-                .and_then(Value::as_str)
-                .and_then(parse_rfc3339_to_utc)
-                .map(|dt| dt.timestamp())
-                .unwrap_or(i64::MIN);
-            (ts, record.clone())
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|a, b| b.0.cmp(&a.0));
-    ranked.truncate(keep);
-    ranked.into_iter().map(|(_, record)| record).collect()
-}
-
-fn bucket_funding_changes(changes: &[Value], bucket_span_secs: i64) -> Vec<Value> {
-    let mut buckets: HashMap<i64, FundingBucketAgg> = HashMap::new();
-    for change in changes {
-        let Some(obj) = change.as_object() else {
-            continue;
-        };
-        let Some(ts_raw) = obj.get("change_ts").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(ts) = parse_rfc3339_to_utc(ts_raw).map(|dt| dt.timestamp()) else {
-            continue;
-        };
-        let start_ts = ts.div_euclid(bucket_span_secs) * bucket_span_secs;
-        let end_ts = start_ts + bucket_span_secs;
-        let entry = buckets
-            .entry(start_ts)
-            .or_insert_with(|| FundingBucketAgg::new(start_ts, end_ts));
-
-        entry.count += 1;
-        let funding_delta = obj
-            .get("funding_delta")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        entry.funding_delta_sum += funding_delta;
-        entry.funding_delta_abs_max = entry.funding_delta_abs_max.max(funding_delta.abs());
-
-        if ts >= entry.funding_new_last_ts {
-            entry.funding_new_last = obj.get("funding_new").and_then(Value::as_f64);
-            entry.funding_new_last_ts = ts;
-        }
-
-        if let Some(mark_price) = obj.get("mark_price_at_change").and_then(Value::as_f64) {
-            let weight = funding_delta.abs();
-            if weight > 0.0 {
-                entry.mark_price_weighted_sum += mark_price * weight;
-                entry.mark_price_weight_sum += weight;
-            }
-            entry.mark_price_simple_sum += mark_price;
-            entry.mark_price_simple_count += 1;
-        }
-    }
-
-    let mut ranked = buckets.into_values().collect::<Vec<_>>();
-    ranked.sort_by(|a, b| b.start_ts.cmp(&a.start_ts));
-    ranked
-        .into_iter()
-        .map(|bucket| {
-            let mark_price_vwap = if bucket.mark_price_weight_sum > 0.0 {
-                Some(bucket.mark_price_weighted_sum / bucket.mark_price_weight_sum)
-            } else if bucket.mark_price_simple_count > 0 {
-                Some(bucket.mark_price_simple_sum / bucket.mark_price_simple_count as f64)
-            } else {
-                None
-            };
-            json!({
-                "bucket_start_ts": unix_ts_to_rfc3339(bucket.start_ts),
-                "bucket_end_ts": unix_ts_to_rfc3339(bucket.end_ts),
-                "count": bucket.count,
-                "funding_delta_sum": bucket.funding_delta_sum,
-                "funding_delta_abs_max": bucket.funding_delta_abs_max,
-                "funding_new_last": bucket.funding_new_last,
-                "mark_price_vwap": mark_price_vwap,
-            })
-        })
-        .collect()
-}
-
-fn dynamic_price_band_size(reference_price: Option<f64>) -> f64 {
-    let base = reference_price
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .map(|v| v * LLM_PRICE_BAND_RATIO)
-        .unwrap_or(LLM_PRICE_BAND_MIN_SIZE);
-    let raw = base.max(LLM_PRICE_BAND_MIN_SIZE);
-    (raw * 10_000.0).round() / 10_000.0
-}
-
-fn build_pvs_level_bands_summary(
-    levels: &[Value],
-    band_size: f64,
-    reference_price: Option<f64>,
-) -> Value {
-    let mut bands: HashMap<i64, PriceBandAgg> = HashMap::new();
-    for level in levels {
-        let Some(obj) = level.as_object() else {
-            continue;
-        };
-        let Some(price) = obj.get("price_level").and_then(Value::as_f64) else {
-            continue;
-        };
-        let band_idx = (price / band_size).floor() as i64;
-        let price_start = band_idx as f64 * band_size;
-        let price_end = price_start + band_size;
-        let agg = bands
-            .entry(band_idx)
-            .or_insert_with(|| PriceBandAgg::new(price_start, price_end));
-
-        let volume = obj.get("volume").and_then(Value::as_f64).unwrap_or(0.0);
-        let delta = obj.get("delta").and_then(Value::as_f64).unwrap_or(0.0);
-        let buy = obj.get("buy_volume").and_then(Value::as_f64).unwrap_or(0.0);
-        let sell = obj
-            .get("sell_volume")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-
-        agg.level_count += 1;
-        agg.volume_sum += volume;
-        agg.delta_sum += delta;
-        agg.buy_sum += buy;
-        agg.sell_sum += sell;
-        if delta > 0.0 {
-            agg.imbalance_buy_count += 1;
-        } else if delta < 0.0 {
-            agg.imbalance_sell_count += 1;
-        }
-        if obj.get("is_hvn").and_then(Value::as_bool).unwrap_or(false) {
-            agg.hvn_count += 1;
-        }
-        if obj.get("is_lvn").and_then(Value::as_bool).unwrap_or(false) {
-            agg.lvn_count += 1;
-        }
-        if volume > agg.max_total_metric {
-            agg.max_total_metric = volume;
-            agg.max_total_level_price = Some(price);
-        }
-        if delta.abs() > agg.max_abs_delta_metric {
-            agg.max_abs_delta_metric = delta.abs();
-            agg.max_abs_delta_level_price = Some(price);
-        }
-    }
-
-    build_price_band_summary_from_map(bands, levels.len(), band_size, reference_price)
-}
-
-fn build_footprint_level_bands_summary(
-    levels: &[Value],
-    band_size: f64,
-    reference_price: Option<f64>,
-) -> Value {
-    let mut bands: HashMap<i64, PriceBandAgg> = HashMap::new();
-    for level in levels {
-        let Some(obj) = level.as_object() else {
-            continue;
-        };
-        let Some(price) = obj.get("price_level").and_then(Value::as_f64) else {
-            continue;
-        };
-        let band_idx = (price / band_size).floor() as i64;
-        let price_start = band_idx as f64 * band_size;
-        let price_end = price_start + band_size;
-        let agg = bands
-            .entry(band_idx)
-            .or_insert_with(|| PriceBandAgg::new(price_start, price_end));
-
-        let total = obj.get("total").and_then(Value::as_f64).unwrap_or(0.0);
-        let delta = obj.get("delta").and_then(Value::as_f64).unwrap_or(0.0);
-        let buy = obj.get("buy").and_then(Value::as_f64).unwrap_or(0.0);
-        let sell = obj.get("sell").and_then(Value::as_f64).unwrap_or(0.0);
-
-        agg.level_count += 1;
-        agg.volume_sum += total;
-        agg.delta_sum += delta;
-        agg.buy_sum += buy;
-        agg.sell_sum += sell;
-
-        if obj
-            .get("buy_imbalance")
-            .and_then(Value::as_bool)
-            .or_else(|| {
-                obj.get("buy_imbalance")
-                    .and_then(Value::as_i64)
-                    .map(|v| v > 0)
-            })
-            .unwrap_or(false)
-        {
-            agg.imbalance_buy_count += 1;
-        }
-        if obj
-            .get("sell_imbalance")
-            .and_then(Value::as_bool)
-            .or_else(|| {
-                obj.get("sell_imbalance")
-                    .and_then(Value::as_i64)
-                    .map(|v| v > 0)
-            })
-            .unwrap_or(false)
-        {
-            agg.imbalance_sell_count += 1;
-        }
-
-        if total > agg.max_total_metric {
-            agg.max_total_metric = total;
-            agg.max_total_level_price = Some(price);
-        }
-        if delta.abs() > agg.max_abs_delta_metric {
-            agg.max_abs_delta_metric = delta.abs();
-            agg.max_abs_delta_level_price = Some(price);
-        }
-    }
-
-    build_price_band_summary_from_map(bands, levels.len(), band_size, reference_price)
-}
-
-fn build_price_band_summary_from_map(
-    bands_map: HashMap<i64, PriceBandAgg>,
-    source_level_count: usize,
-    band_size: f64,
-    reference_price: Option<f64>,
-) -> Value {
-    let mut entries = bands_map.into_iter().collect::<Vec<_>>();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let source_band_count = entries.len();
-    if entries.len() > LLM_PRICE_BAND_MAX_BANDS {
-        entries = trim_price_band_entries(
-            entries,
-            reference_price,
-            band_size,
-            LLM_PRICE_BAND_MAX_BANDS,
-        );
-    }
-
-    let bands = entries
-        .into_iter()
-        .map(|(_, band)| {
-            json!({
-                "price_start": band.price_start,
-                "price_end": band.price_end,
-                "level_count": band.level_count,
-                "volume_sum": band.volume_sum,
-                "delta_sum": band.delta_sum,
-                "buy_sum": band.buy_sum,
-                "sell_sum": band.sell_sum,
-                "imbalance_buy_count": band.imbalance_buy_count,
-                "imbalance_sell_count": band.imbalance_sell_count,
-                "hvn_count": band.hvn_count,
-                "lvn_count": band.lvn_count,
-                "max_total_level_price": band.max_total_level_price,
-                "max_abs_delta_level_price": band.max_abs_delta_level_price,
-            })
-        })
-        .collect::<Vec<_>>();
-
-    json!({
-        "band_size": band_size,
-        "band_count": bands.len(),
-        "source_band_count": source_band_count,
-        "source_level_count": source_level_count,
-        "bands": bands,
-    })
-}
-
-fn trim_price_band_entries(
-    mut entries: Vec<(i64, PriceBandAgg)>,
-    reference_price: Option<f64>,
-    band_size: f64,
-    keep: usize,
-) -> Vec<(i64, PriceBandAgg)> {
-    if entries.len() <= keep {
-        return entries;
-    }
-
-    if let Some(reference) = reference_price.filter(|v| v.is_finite()) {
-        let ref_idx = (reference / band_size).floor() as i64;
-        entries.sort_by(|a, b| {
-            (a.0 - ref_idx)
-                .abs()
-                .cmp(&(b.0 - ref_idx).abs())
-                .then_with(|| a.0.cmp(&b.0))
-        });
-    } else {
-        entries.sort_by(|a, b| {
-            b.1.level_count
-                .cmp(&a.1.level_count)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-    }
-    entries.truncate(keep);
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    entries
-}
-
-/// Compress event-type indicators (absorption, exhaustion, initiation).
-/// Events from the last 24 h are kept in full.
-/// Older events are aggregated per calendar day into a compact summary so the
-/// LLM can still see historical context without the full event list.
-fn compact_event_payload(payload: &mut Map<String, Value>) {
-    let Some(events_val) = payload.remove("events") else {
-        return;
-    };
-    let Some(events) = events_val.as_array() else {
-        payload.insert("events".to_string(), events_val);
-        return;
-    };
-    if events.is_empty() {
-        payload.insert("events".to_string(), Value::Array(Vec::new()));
-        return;
-    }
-
-    let cutoff = Utc::now() - chrono::Duration::hours(24);
-
-    let mut recent: Vec<Value> = Vec::new();
-    // day_key → (count, score_sum, best_score, best_event_summary)
-    let mut daily: std::collections::BTreeMap<String, (usize, f64, f64, Value)> =
-        std::collections::BTreeMap::new();
-
-    for event in events {
-        let ts_str = event
-            .get("start_ts")
-            .and_then(Value::as_str)
-            .or_else(|| event.get("event_start_ts").and_then(Value::as_str))
-            .unwrap_or("");
-        let is_recent = parse_rfc3339_to_utc(ts_str)
-            .map(|t| t >= cutoff)
-            .unwrap_or(true); // unknown ts → keep full
-
-        if is_recent {
-            recent.push(event.clone());
-        } else {
-            // Derive a YYYY-MM-DD day key from the ts string (first 10 chars).
-            let day_key = if ts_str.len() >= 10 {
-                ts_str[..10].to_string()
-            } else {
-                "unknown".to_string()
-            };
-            let score = event.get("score").and_then(Value::as_f64).unwrap_or(0.0);
-            let entry = daily
-                .entry(day_key)
-                .or_insert_with(|| (0, 0.0, f64::NEG_INFINITY, Value::Null));
-            entry.0 += 1;
-            entry.1 += score;
-            if score > entry.2 {
-                entry.2 = score;
-                // Compact summary of the strongest event for that day.
-                let mut summary = Map::new();
-                if let Some(v) = event.get("start_ts") {
-                    summary.insert("start_ts".to_string(), v.clone());
-                }
-                if let Some(v) = event.get("direction") {
-                    summary.insert("direction".to_string(), v.clone());
-                }
-                if let Some(v) = event.get("pivot_price") {
-                    summary.insert("pivot_price".to_string(), v.clone());
-                }
-                if let Some(v) = event.get("score") {
-                    summary.insert("score".to_string(), v.clone());
-                }
-                if let Some(v) = event.get("type") {
-                    summary.insert("type".to_string(), v.clone());
-                }
-                entry.3 = Value::Object(summary);
-            }
-        }
-    }
-
-    // Rebuild: compressed daily summaries first (oldest→newest), then full recent events.
-    let mut result: Vec<Value> = daily
-        .into_iter()
-        .map(|(day, (count, score_sum, _best_score, best_event))| {
-            let avg_score = if count > 0 {
-                score_sum / count as f64
-            } else {
-                0.0
-            };
-            json!({
-                "_compressed_day": day,
-                "event_count": count,
-                "avg_score": avg_score,
-                "strongest_event": best_event,
-            })
-        })
-        .collect();
-    result.extend(recent);
-
-    payload.insert("event_count".to_string(), json!(result.len()));
-    payload.insert("events".to_string(), Value::Array(result));
-}
-
-/// Strips the heavy `ffill_series_by_output_window` time-series from ema_trend_regime.
-/// Keeps all current scalar EMAs and the `trend_regime` state map — exactly what
-/// strategies 2/8/10 need for directional anchoring.
-fn compact_ema_trend_regime_payload(payload: &mut Map<String, Value>) {
-    payload.remove("ffill_series_by_output_window");
-}
-
-/// Strips `dev_series` (developing TPO bar history) from every session inside `by_session`.
-/// Keeps the session-level TPO poc/vah/val scalars plus top-level `tpo_vah/val/poc`
-/// and `tpo_single_print_zones` — required by strategies 4 (unfinished auction) and
-/// 6 (value area re-fill).
-fn compact_tpo_market_profile_payload(payload: &mut Map<String, Value>) {
-    if let Some(by_session) = payload.get_mut("by_session").and_then(Value::as_object_mut) {
-        for session_payload in by_session.values_mut() {
-            if let Some(session_obj) = session_payload.as_object_mut() {
-                session_obj.remove("dev_series");
-            }
-        }
-    }
-}
-
-/// Strips time-series arrays inside each `by_window` entry of rvwap_sigma_bands,
-/// keeping only the current scalar band values (rvwap_w, band_±1/±2, sigma, z-score).
-/// Strategies 6 and 10 need band values for precise entry triggers.
-fn compact_rvwap_sigma_bands_payload(payload: &mut Map<String, Value>) {
-    if let Some(by_window) = payload.get_mut("by_window").and_then(Value::as_object_mut) {
-        for window_payload in by_window.values_mut() {
-            if let Some(window_obj) = window_payload.as_object_mut() {
-                window_obj.remove("series");
-            }
-        }
-    }
-
-    // Trim series_by_output_window: keep last 15 bars per output window,
-    // reduce each bar to {ts, z: {15m, 4h, 1d}} for S10 z-score direction.
-    if let Some(sbw) = payload
-        .get_mut("series_by_output_window")
-        .and_then(Value::as_object_mut)
-    {
-        for series in sbw.values_mut() {
-            let Some(arr) = series.as_array_mut() else {
-                continue;
-            };
-            // Sort ascending by ts and keep the most recent 15 points.
-            arr.sort_by(|a, b| {
-                let ta = a.get("ts").and_then(Value::as_str).unwrap_or("");
-                let tb = b.get("ts").and_then(Value::as_str).unwrap_or("");
-                ta.cmp(tb)
-            });
-            let skip = arr.len().saturating_sub(15);
-            let trimmed: Vec<Value> = arr
-                .drain(skip..)
-                .map(|pt| {
-                    // Reduce to {ts, z: {15m, 4h, 1d}} to minimise payload.
-                    let ts = pt.get("ts").cloned().unwrap_or(Value::Null);
-                    let mut z = Map::new();
-                    if let Some(bw) = pt.get("by_window").and_then(Value::as_object) {
-                        for win in ["15m", "4h", "1d"] {
-                            if let Some(z_val) = bw
-                                .get(win)
-                                .and_then(|w| w.get("z_price_minus_rvwap"))
-                                .cloned()
-                            {
-                                z.insert(win.to_string(), z_val);
-                            }
-                        }
-                    }
-                    json!({ "ts": ts, "z": Value::Object(z) })
-                })
-                .collect();
-            *series = Value::Array(trimmed);
-        }
-    }
-}
-
-/// Strips `intrabar_poc_max_by_window` (per-window POC history series) from
-/// high_volume_pulse, keeping `by_z_window` boolean spike flags and the current
-/// bar's `intrabar_poc_price/volume` — sufficient for strategy 9 volume confirmation.
-fn compact_high_volume_pulse_payload(payload: &mut Map<String, Value>) {
-    payload.remove("intrabar_poc_max_by_window");
-}
-
-fn build_core_price_anchors(indicators: &mut Map<String, Value>, reference_price: Option<f64>) {
-    let mut anchors = Map::new();
-    anchors.insert("reference_price".to_string(), json!(reference_price));
-
-    if let Some(pvs_payload) = indicator_payload_ref(indicators, "price_volume_structure") {
-        let mut pvs = Map::new();
-        if let Some(v) = pvs_payload.get("poc_price") {
-            pvs.insert("poc".to_string(), v.clone());
-        }
-        if let Some(v) = pvs_payload.get("val") {
-            pvs.insert("val".to_string(), v.clone());
-        }
-        if let Some(v) = pvs_payload.get("vah") {
-            pvs.insert("vah".to_string(), v.clone());
-        }
-        if let Some(levels) = pvs_payload.get("hvn_levels").and_then(Value::as_array) {
-            pvs.insert(
-                "hvn_top".to_string(),
-                Value::Array(select_numeric_levels_near_reference(
-                    levels,
-                    reference_price,
-                    LLM_CORE_ANCHOR_TOP_N,
-                )),
-            );
-        }
-        if let Some(levels) = pvs_payload.get("lvn_levels").and_then(Value::as_array) {
-            pvs.insert(
-                "lvn_top".to_string(),
-                Value::Array(select_numeric_levels_near_reference(
-                    levels,
-                    reference_price,
-                    LLM_CORE_ANCHOR_TOP_N,
-                )),
-            );
-        }
-        if !pvs.is_empty() {
-            anchors.insert("pvs".to_string(), Value::Object(pvs));
-        }
-    }
-
-    if let Some(footprint_payload) = indicator_payload_ref(indicators, "footprint") {
-        if let Some(window_4h) = footprint_payload
-            .get("by_window")
-            .and_then(Value::as_object)
-            .and_then(|by_window| by_window.get("4h"))
-            .and_then(Value::as_object)
-        {
-            let mut footprint = Map::new();
-            if let Some(v) = window_4h.get("ua_top") {
-                footprint.insert("ua_top".to_string(), v.clone());
-            }
-            if let Some(v) = window_4h.get("ua_bottom") {
-                footprint.insert("ua_bottom".to_string(), v.clone());
-            }
-            for (src, dst) in [
-                ("buy_imbalance_zone_nearest_above", "nearest_buy_zone_above"),
-                ("buy_imbalance_zone_nearest_below", "nearest_buy_zone_below"),
-                (
-                    "sell_imbalance_zone_nearest_above",
-                    "nearest_sell_zone_above",
-                ),
-                (
-                    "sell_imbalance_zone_nearest_below",
-                    "nearest_sell_zone_below",
-                ),
-            ] {
-                if let Some(v) = window_4h.get(src) {
-                    footprint.insert(dst.to_string(), v.clone());
-                }
-            }
-            if !footprint.is_empty() {
-                anchors.insert("footprint".to_string(), Value::Object(footprint));
-            }
-        }
-    }
-
-    if let Some(orderbook_payload) = indicator_payload_ref(indicators, "orderbook_depth") {
-        let mut orderbook = Map::new();
-        let top_bid = orderbook_payload
-            .get("top_bid_walls")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-            .cloned()
-            .unwrap_or(Value::Null);
-        let top_ask = orderbook_payload
-            .get("top_ask_walls")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-            .cloned()
-            .unwrap_or(Value::Null);
-        orderbook.insert("top_bid_wall".to_string(), top_bid);
-        orderbook.insert("top_ask_wall".to_string(), top_ask);
-        anchors.insert("orderbook".to_string(), Value::Object(orderbook));
-    }
-
-    if let Some(liq_payload) = indicator_payload_ref(indicators, "liquidation_density") {
-        let mut liquidation = Map::new();
-        if let Some(peak_levels) = liq_payload.get("peak_levels").and_then(Value::as_array) {
-            liquidation.insert(
-                "peak_long".to_string(),
-                select_peak_by_metric(peak_levels, &["long", "long_notional", "long_qty"])
-                    .unwrap_or(Value::Null),
-            );
-            liquidation.insert(
-                "peak_short".to_string(),
-                select_peak_by_metric(peak_levels, &["short", "short_notional", "short_qty"])
-                    .unwrap_or(Value::Null),
-            );
-        }
-        if let Some(v) = liq_payload.get("long_total") {
-            liquidation.insert("long_total".to_string(), v.clone());
-        }
-        if let Some(v) = liq_payload.get("short_total") {
-            liquidation.insert("short_total".to_string(), v.clone());
-        }
-        if !liquidation.is_empty() {
-            anchors.insert("liquidation".to_string(), Value::Object(liquidation));
-        }
-    }
-
-    indicators.insert("core_price_anchors".to_string(), Value::Object(anchors));
-}
-
-fn select_numeric_levels_near_reference(
-    levels: &[Value],
-    reference_price: Option<f64>,
-    keep: usize,
-) -> Vec<Value> {
-    let mut nums = levels
-        .iter()
-        .filter_map(Value::as_f64)
-        .filter(|v| v.is_finite())
-        .collect::<Vec<_>>();
-    if nums.is_empty() {
-        return Vec::new();
-    }
-    if let Some(reference) = reference_price.filter(|v| v.is_finite()) {
-        nums.sort_by(|a, b| {
-            (a - reference)
-                .abs()
-                .partial_cmp(&(b - reference).abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        nums.truncate(keep);
-        nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    } else {
-        nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        nums.truncate(keep);
-    }
-    nums.into_iter().map(Value::from).collect()
-}
-
-fn select_peak_by_metric(levels: &[Value], metric_keys: &[&str]) -> Option<Value> {
-    let mut ranked = levels
-        .iter()
-        .filter_map(|level| {
-            let obj = level.as_object()?;
-            let metric = metric_keys
-                .iter()
-                .find_map(|key| obj.get(*key).and_then(Value::as_f64))?;
-            Some((metric, level.clone()))
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    ranked.into_iter().next().map(|(_, level)| level)
-}
-
-fn apply_llm_token_governor(indicators: &mut Map<String, Value>) {
-    if serialized_indicator_size(indicators) <= LLM_INPUT_INDICATORS_BUDGET_BYTES {
-        return;
-    }
-    governor_trim_15m(indicators);
-    if serialized_indicator_size(indicators) <= LLM_INPUT_INDICATORS_BUDGET_BYTES {
-        return;
-    }
-    governor_trim_4h(indicators);
-    if serialized_indicator_size(indicators) <= LLM_INPUT_INDICATORS_BUDGET_BYTES {
-        return;
-    }
-    governor_trim_1d(indicators);
-}
-
-fn governor_trim_15m(indicators: &mut Map<String, Value>) {
-    if let Some(payload) = by_window_payload_mut(indicators, "footprint", "15m") {
-        truncate_array_field(payload, "buy_imbalance_zones_near_price", 12);
-        truncate_array_field(payload, "sell_imbalance_zones_near_price", 12);
-        truncate_array_field(payload, "buy_imbalance_zones_top", 12);
-        truncate_array_field(payload, "sell_imbalance_zones_top", 12);
-        truncate_array_field(payload, "buy_stacks_top", 8);
-        truncate_array_field(payload, "sell_stacks_top", 8);
-        truncate_array_field(payload, "top_levels_by_total", 8);
-        truncate_array_field(payload, "top_levels_by_abs_delta", 8);
-    }
-    if let Some(payload) = by_window_payload_mut(indicators, "price_volume_structure", "15m") {
-        truncate_array_field(payload, "top_volume_levels", 6);
-        truncate_array_field(payload, "top_abs_delta_levels", 6);
-        truncate_array_field(payload, "top_value_area_levels", 6);
-    }
-    truncate_kline_bars(indicators, "15m", 48);
-}
-
-fn governor_trim_1d(indicators: &mut Map<String, Value>) {
-    if let Some(payload) = by_window_payload_mut(indicators, "footprint", "1d") {
-        truncate_array_field(payload, "buy_imbalance_zones_top_strength", 16);
-        truncate_array_field(payload, "sell_imbalance_zones_top_strength", 16);
-        truncate_array_field(payload, "buy_imbalance_zones_top", 16);
-        truncate_array_field(payload, "sell_imbalance_zones_top", 16);
-        truncate_array_field(payload, "buy_stacks_top", 10);
-        truncate_array_field(payload, "sell_stacks_top", 10);
-        truncate_array_field(payload, "top_levels_by_total", 8);
-        truncate_array_field(payload, "top_levels_by_abs_delta", 8);
-    }
-    if let Some(payload) = by_window_payload_mut(indicators, "price_volume_structure", "1d") {
-        truncate_array_field(payload, "top_volume_levels", 6);
-        truncate_array_field(payload, "top_abs_delta_levels", 6);
-        truncate_array_field(payload, "top_value_area_levels", 6);
-    }
-    truncate_kline_bars(indicators, "1d", 20);
-}
-
-fn governor_trim_4h(indicators: &mut Map<String, Value>) {
-    if let Some(payload) = by_window_payload_mut(indicators, "footprint", "4h") {
-        truncate_array_field(
-            payload,
-            "buy_imbalance_zones_top_strength",
-            LLM_FOOTPRINT_ZONE_STRENGTH_TOP_1D,
-        );
-        truncate_array_field(
-            payload,
-            "sell_imbalance_zones_top_strength",
-            LLM_FOOTPRINT_ZONE_STRENGTH_TOP_1D,
-        );
-        truncate_array_field(payload, "buy_imbalance_zones_near_price", 80);
-        truncate_array_field(payload, "sell_imbalance_zones_near_price", 80);
-        truncate_array_field(payload, "buy_imbalance_zones_top", 80);
-        truncate_array_field(payload, "sell_imbalance_zones_top", 80);
-        truncate_bucketed_bands(payload, "levels_near_price_bucketed", 80);
-        truncate_bucketed_bands(payload, "levels_in_va_corridor_bucketed", 80);
-        truncate_array_field(payload, "buy_stacks_top", 24);
-        truncate_array_field(payload, "sell_stacks_top", 24);
-    }
-    if let Some(payload) = by_window_payload_mut(indicators, "price_volume_structure", "4h") {
-        truncate_bucketed_bands(payload, "levels_near_price_bucketed", 80);
-        truncate_bucketed_bands(payload, "levels_in_va_corridor_bucketed", 80);
-        truncate_array_field(payload, "top_volume_levels", 16);
-        truncate_array_field(payload, "top_abs_delta_levels", 16);
-        truncate_array_field(payload, "top_value_area_levels", 12);
-    }
-    truncate_kline_bars(indicators, "4h", 40);
-}
-
-fn serialized_indicator_size(indicators: &Map<String, Value>) -> usize {
-    serde_json::to_vec(indicators)
-        .map(|buf| buf.len())
-        .unwrap_or(usize::MAX)
-}
-
-fn by_window_payload_mut<'a>(
-    indicators: &'a mut Map<String, Value>,
-    code: &str,
-    window: &str,
-) -> Option<&'a mut Map<String, Value>> {
-    indicators
-        .get_mut(code)
-        .and_then(Value::as_object_mut)
-        .and_then(|indicator| indicator.get_mut("payload"))
-        .and_then(Value::as_object_mut)
-        .and_then(|payload| payload.get_mut("by_window"))
-        .and_then(Value::as_object_mut)
-        .and_then(|by_window| by_window.get_mut(window))
-        .and_then(Value::as_object_mut)
-}
-
-fn truncate_kline_bars(indicators: &mut Map<String, Value>, interval: &str, max_len: usize) {
-    let Some(bars) = indicators
-        .get_mut("kline_history")
-        .and_then(Value::as_object_mut)
-        .and_then(|indicator| indicator.get_mut("payload"))
-        .and_then(Value::as_object_mut)
-        .and_then(|payload| payload.get_mut("intervals"))
-        .and_then(Value::as_object_mut)
-        .and_then(|intervals| intervals.get_mut(interval))
-        .and_then(Value::as_object_mut)
-        .and_then(|interval_obj| interval_obj.get_mut("futures"))
-        .and_then(Value::as_object_mut)
-        .and_then(|futures| futures.get_mut("bars"))
-        .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-    if bars.len() > max_len {
-        let drop_count = bars.len() - max_len;
-        bars.drain(0..drop_count);
-    }
-}
-
-fn truncate_array_field(payload: &mut Map<String, Value>, key: &str, max_len: usize) {
-    let Some(arr) = payload.get_mut(key).and_then(Value::as_array_mut) else {
-        return;
-    };
-    if arr.len() > max_len {
-        arr.truncate(max_len);
-    }
-}
-
-fn truncate_bucketed_bands(payload: &mut Map<String, Value>, key: &str, max_len: usize) {
-    let Some(obj) = payload.get_mut(key).and_then(Value::as_object_mut) else {
-        return;
-    };
-    let Some(arr) = obj.get_mut("bands").and_then(Value::as_array_mut) else {
-        return;
-    };
-    if arr.len() > max_len {
-        arr.truncate(max_len);
-    }
-    let band_count = arr.len();
-    obj.insert("band_count".to_string(), json!(band_count));
-}
-
-fn select_levels_in_price_range(levels: &[Value], p1: f64, p2: f64) -> Vec<Value> {
-    let lo = p1.min(p2);
-    let hi = p1.max(p2);
-    let mut out = levels
-        .iter()
-        .filter(|level| {
-            level
-                .get("price_level")
-                .and_then(Value::as_f64)
-                .map(|price| price >= lo && price <= hi)
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    out.sort_by(|a, b| {
-        let lhs = a
-            .get("price_level")
-            .and_then(Value::as_f64)
-            .unwrap_or_default();
-        let rhs = b
-            .get("price_level")
-            .and_then(Value::as_f64)
-            .unwrap_or_default();
-        lhs.partial_cmp(&rhs).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    out
-}
-
-fn select_levels_near_price(levels: &[Value], reference_price: f64, pct_band: f64) -> Vec<Value> {
-    let band = (reference_price.abs() * pct_band).max(1.0);
-    let mut out = levels
-        .iter()
-        .filter(|level| {
-            level
-                .get("price_level")
-                .and_then(Value::as_f64)
-                .map(|price| (price - reference_price).abs() <= band)
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if out.is_empty() {
-        let mut ranked = levels
-            .iter()
-            .filter_map(|level| {
-                let price = level.get("price_level").and_then(Value::as_f64)?;
-                Some(((price - reference_price).abs(), level.clone()))
-            })
-            .collect::<Vec<_>>();
-        ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        ranked.truncate(64);
-        out = ranked.into_iter().map(|(_, level)| level).collect();
-    }
-    out.sort_by(|a, b| {
-        let lhs = a
-            .get("price_level")
-            .and_then(Value::as_f64)
-            .unwrap_or_default();
-        let rhs = b
-            .get("price_level")
-            .and_then(Value::as_f64)
-            .unwrap_or_default();
-        lhs.partial_cmp(&rhs).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    out
-}
-
-fn select_nearest_zones(zones: &[Value], reference_price: f64, max_items: usize) -> Vec<Value> {
-    let mut ranked = zones
-        .iter()
-        .filter_map(|zone| {
-            let start = zone.get("start_price").and_then(Value::as_f64)?;
-            let end = zone.get("end_price").and_then(Value::as_f64)?;
-            let distance = if reference_price < start {
-                start - reference_price
-            } else if reference_price > end {
-                reference_price - end
-            } else {
-                0.0
-            };
-            Some((distance, start, zone.clone()))
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|a, b| {
-        a.0.partial_cmp(&b.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-    });
-    ranked.truncate(max_items);
-    ranked.into_iter().map(|(_, _, zone)| zone).collect()
-}
-
-fn nearest_zone_above(zones: &[Value], reference_price: f64) -> Option<Value> {
-    let mut candidates = zones
-        .iter()
-        .filter_map(|zone| {
-            let start = zone.get("start_price").and_then(Value::as_f64)?;
-            let end = zone.get("end_price").and_then(Value::as_f64)?;
-            let key = if reference_price <= start {
-                start
-            } else if reference_price <= end {
-                reference_price
-            } else {
-                return None;
-            };
-            Some((key, zone.clone()))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    candidates.into_iter().next().map(|(_, zone)| zone)
-}
-
-fn nearest_zone_below(zones: &[Value], reference_price: f64) -> Option<Value> {
-    let mut candidates = zones
-        .iter()
-        .filter_map(|zone| {
-            let start = zone.get("start_price").and_then(Value::as_f64)?;
-            let end = zone.get("end_price").and_then(Value::as_f64)?;
-            let key = if reference_price >= end {
-                end
-            } else if reference_price >= start {
-                reference_price
-            } else {
-                return None;
-            };
-            Some((key, zone.clone()))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    candidates.into_iter().next().map(|(_, zone)| zone)
-}
-
-/// Add an `intact` boolean to each zone.
-/// Buy zones: intact when price is still ABOVE the zone (zone hasn't been retested from below).
-/// Sell zones: intact when price is still BELOW the zone (zone hasn't been retested from above).
-fn annotate_zones_intact(zones: Vec<Value>, reference_price: f64, is_buy: bool) -> Vec<Value> {
-    zones
-        .into_iter()
-        .map(|mut zone| {
-            if let Some(obj) = zone.as_object_mut() {
-                let intact = if is_buy {
-                    // Buy zone is intact if price is above the zone top (end_price)
-                    obj.get("end_price")
-                        .and_then(Value::as_f64)
-                        .map(|end| reference_price > end)
-                        .unwrap_or(false)
-                } else {
-                    // Sell zone is intact if price is below the zone bottom (start_price)
-                    obj.get("start_price")
-                        .and_then(Value::as_f64)
-                        .map(|start| reference_price < start)
-                        .unwrap_or(false)
-                };
-                obj.insert("intact".to_string(), json!(intact));
-            }
-            zone
-        })
-        .collect()
-}
-
-fn select_top_levels_by_metric(
-    levels: &[Value],
-    metric_key: &str,
-    max_items: usize,
-    by_abs: bool,
-) -> Vec<Value> {
-    let mut ranked = levels
-        .iter()
-        .filter_map(|level| {
-            let metric = level.get(metric_key).and_then(Value::as_f64)?;
-            Some((metric, level.clone()))
-        })
-        .collect::<Vec<_>>();
-
-    ranked.sort_by(|a, b| {
-        let lhs = if by_abs { a.0.abs() } else { a.0 };
-        let rhs = if by_abs { b.0.abs() } else { b.0 };
-        rhs.partial_cmp(&lhs).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    ranked.truncate(max_items);
-    ranked.into_iter().map(|(_, level)| level).collect()
-}
-
-fn compact_price_points_to_zones(payload: &mut Map<String, Value>, source_key: &str, prefix: &str) {
-    let Some(points) = payload
-        .remove(source_key)
-        .and_then(|value| value.as_array().cloned())
-    else {
-        return;
-    };
-
-    payload.insert(format!("{}_count", prefix), json!(points.len()));
-    payload.insert(
-        format!("{}_zones", prefix),
-        Value::Array(price_points_to_zones(&points)),
-    );
-}
-
-fn price_points_to_zones(points: &[Value]) -> Vec<Value> {
-    let mut prices = points
-        .iter()
-        .filter_map(Value::as_f64)
-        .filter(|price| price.is_finite())
-        .collect::<Vec<_>>();
-    if prices.is_empty() {
-        return Vec::new();
-    }
-
-    prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mut zones = Vec::new();
-    let mut start = prices[0];
-    let mut prev = prices[0];
-    let mut count = 1_usize;
-
-    for price in prices.into_iter().skip(1) {
-        if (price - prev).abs() <= 0.011 {
-            prev = price;
-            count += 1;
-            continue;
-        }
-
-        zones.push(json!({
-            "start_price": start,
-            "end_price": prev,
-            "count": count,
-        }));
-        start = price;
-        prev = price;
-        count = 1;
-    }
-
-    zones.push(json!({
-        "start_price": start,
-        "end_price": prev,
-        "count": count,
-    }));
-    zones
-}
-
-fn infer_reference_price(levels: &[Value]) -> Option<f64> {
-    let mut prices = levels
-        .iter()
-        .filter_map(|level| level.get("price_level").and_then(Value::as_f64))
-        .filter(|price| price.is_finite())
-        .collect::<Vec<_>>();
-    if prices.is_empty() {
-        return None;
-    }
-
-    prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = prices.len() / 2;
-    if prices.len() % 2 == 1 {
-        Some(prices[mid])
-    } else {
-        Some((prices[mid - 1] + prices[mid]) / 2.0)
-    }
-}
-
-fn build_depth_bands(levels: &[Value], reference_price: Option<f64>) -> Vec<Value> {
-    let Some(reference_price) = reference_price.filter(|price| *price > 0.0) else {
-        return Vec::new();
-    };
-
-    struct BandAccumulator {
-        label: &'static str,
-        min_pct: f64,
-        max_pct: f64,
-        bid_liquidity: f64,
-        ask_liquidity: f64,
-        level_count: usize,
-        peak_bid_level: Option<(f64, f64)>,
-        peak_ask_level: Option<(f64, f64)>,
-    }
-
-    let mut bands = vec![
-        BandAccumulator {
-            label: "0-0.10%",
-            min_pct: 0.0,
-            max_pct: 0.10,
-            bid_liquidity: 0.0,
-            ask_liquidity: 0.0,
-            level_count: 0,
-            peak_bid_level: None,
-            peak_ask_level: None,
-        },
-        BandAccumulator {
-            label: "0.10-0.25%",
-            min_pct: 0.10,
-            max_pct: 0.25,
-            bid_liquidity: 0.0,
-            ask_liquidity: 0.0,
-            level_count: 0,
-            peak_bid_level: None,
-            peak_ask_level: None,
-        },
-        BandAccumulator {
-            label: "0.25-0.50%",
-            min_pct: 0.25,
-            max_pct: 0.50,
-            bid_liquidity: 0.0,
-            ask_liquidity: 0.0,
-            level_count: 0,
-            peak_bid_level: None,
-            peak_ask_level: None,
-        },
-        BandAccumulator {
-            label: "0.50-1.00%",
-            min_pct: 0.50,
-            max_pct: 1.00,
-            bid_liquidity: 0.0,
-            ask_liquidity: 0.0,
-            level_count: 0,
-            peak_bid_level: None,
-            peak_ask_level: None,
-        },
-        BandAccumulator {
-            label: "1.00-2.00%",
-            min_pct: 1.00,
-            max_pct: 2.00,
-            bid_liquidity: 0.0,
-            ask_liquidity: 0.0,
-            level_count: 0,
-            peak_bid_level: None,
-            peak_ask_level: None,
-        },
-    ];
-
-    for level in levels {
-        let Some(price_level) = level.get("price_level").and_then(Value::as_f64) else {
-            continue;
-        };
-        let distance_pct = ((price_level - reference_price).abs() / reference_price) * 100.0;
-        let Some(band) = bands.iter_mut().find(|band| {
-            distance_pct >= band.min_pct
-                && (distance_pct < band.max_pct
-                    || (band.max_pct - 2.00).abs() < f64::EPSILON && distance_pct <= band.max_pct)
-        }) else {
-            continue;
-        };
-
-        let bid_liquidity = level
-            .get("bid_liquidity")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let ask_liquidity = level
-            .get("ask_liquidity")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-
-        band.level_count += 1;
-        band.bid_liquidity += bid_liquidity;
-        band.ask_liquidity += ask_liquidity;
-
-        if band
-            .peak_bid_level
-            .map(|(_, liq)| bid_liquidity > liq)
-            .unwrap_or(bid_liquidity > 0.0)
-        {
-            band.peak_bid_level = Some((price_level, bid_liquidity));
-        }
-        if band
-            .peak_ask_level
-            .map(|(_, liq)| ask_liquidity > liq)
-            .unwrap_or(ask_liquidity > 0.0)
-        {
-            band.peak_ask_level = Some((price_level, ask_liquidity));
-        }
-    }
-
-    bands
-        .into_iter()
-        .filter(|band| band.level_count > 0)
-        .map(|band| {
-            json!({
-                "band": band.label,
-                "level_count": band.level_count,
-                "bid_liquidity": band.bid_liquidity,
-                "ask_liquidity": band.ask_liquidity,
-                "total_liquidity": band.bid_liquidity + band.ask_liquidity,
-                "net_liquidity": band.bid_liquidity - band.ask_liquidity,
-                "peak_bid_level": band.peak_bid_level.map(|(price_level, bid_liquidity)| json!({
-                    "price_level": price_level,
-                    "bid_liquidity": bid_liquidity,
-                })),
-                "peak_ask_level": band.peak_ask_level.map(|(price_level, ask_liquidity)| json!({
-                    "price_level": price_level,
-                    "ask_liquidity": ask_liquidity,
-                })),
-            })
-        })
-        .collect()
 }
 
 async fn ensure_temp_indicator_dir() -> Result<()> {
@@ -5937,26 +4163,23 @@ fn temp_indicator_ts_bucket_from_path(path: &Path) -> Option<DateTime<Utc>> {
 
 async fn persist_model_input_to_disk(
     bundle: &MinuteBundleEnvelope,
-    trigger: &str,
-    management_mode: bool,
-    pending_order_mode: bool,
+    _trigger: &str,
+    _management_mode: bool,
+    _pending_order_mode: bool,
     input: &ModelInvocationInput,
     retention_minutes: u64,
-) -> Result<PathBuf> {
+) -> Result<PersistedModelInputFiles> {
     ensure_temp_model_input_dir().await?;
 
-    let input_json = serialize_llm_input_minified(input).context("serialize llm model input")?;
-    let raw_json: Value =
-        serde_json::from_str(&input_json).context("parse llm model input as json")?;
-    let pretty =
-        serde_json::to_vec_pretty(&raw_json).context("serialize llm model input pretty json")?;
-    let path = llm_model_input_path(bundle, trigger, management_mode, pending_order_mode);
+    let scan_value = ScanFilter::build_value(input).context("build scan model input")?;
+    let core_value = CoreFilter::build_value(input).context("build core model input")?;
+    let scan_path = llm_filtered_model_input_path(bundle, "scan");
+    let core_path = llm_filtered_model_input_path(bundle, "core");
 
-    let mut file = fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
-    file.write_all(&pretty)
-        .with_context(|| format!("write {}", path.display()))?;
-    file.flush()
-        .with_context(|| format!("flush {}", path.display()))?;
+    write_pretty_json_file(&scan_path, &scan_value)
+        .with_context(|| format!("write {}", scan_path.display()))?;
+    write_pretty_json_file(&core_path, &core_value)
+        .with_context(|| format!("write {}", core_path.display()))?;
     let removed = prune_expired_temp_model_input_files(
         Path::new(TEMP_MODEL_INPUT_DIR),
         bundle.ts_bucket,
@@ -5972,7 +4195,10 @@ async fn persist_model_input_to_disk(
         );
     }
 
-    Ok(path)
+    Ok(PersistedModelInputFiles {
+        scan: scan_path,
+        core: core_path,
+    })
 }
 
 async fn persist_entry_stage_prompt_inputs_to_disk(
@@ -6045,6 +4271,12 @@ fn minute_bundle_path(bundle: &MinuteBundleEnvelope) -> PathBuf {
     Path::new(TEMP_INDICATOR_DIR).join(format!("{}_{}.json", ts, symbol))
 }
 
+#[derive(Debug, Clone)]
+struct PersistedModelInputFiles {
+    scan: PathBuf,
+    core: PathBuf,
+}
+
 fn write_pretty_json_file(path: &Path, value: &Value) -> Result<()> {
     let pretty = serde_json::to_vec_pretty(value).context("serialize pretty json")?;
     let mut file = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
@@ -6055,35 +4287,23 @@ fn write_pretty_json_file(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn llm_model_input_path(
-    bundle: &MinuteBundleEnvelope,
-    trigger: &str,
-    management_mode: bool,
-    pending_order_mode: bool,
-) -> PathBuf {
+fn llm_filtered_model_input_path(bundle: &MinuteBundleEnvelope, stage: &str) -> PathBuf {
     let bucket_ts = bundle.ts_bucket.format("%Y%m%dT%H%M%SZ").to_string();
     let invoke_ts = Utc::now()
         .format("%Y%m%dT%H%M%S%.3fZ")
         .to_string()
         .replace('.', "");
     let symbol = sanitize_filename_component(&bundle.symbol);
-    let trigger = sanitize_filename_component(trigger);
-    let mode = if pending_order_mode {
-        "pending_management"
-    } else if management_mode {
-        "management"
-    } else {
-        "entry"
-    };
+    let stage = sanitize_filename_component(stage);
     Path::new(TEMP_MODEL_INPUT_DIR).join(format!(
-        "{}_{}_{}_{}_{}.json",
-        bucket_ts, symbol, mode, trigger, invoke_ts
+        "{}_{}_{}_{}.json",
+        bucket_ts, symbol, stage, invoke_ts
     ))
 }
 
 fn llm_stage_prompt_input_path(
     bundle: &MinuteBundleEnvelope,
-    trigger: &str,
+    _trigger: &str,
     management_mode: bool,
     pending_order_mode: bool,
     provider: &str,
@@ -6096,7 +4316,6 @@ fn llm_stage_prompt_input_path(
         .to_string()
         .replace('.', "");
     let symbol = sanitize_filename_component(&bundle.symbol);
-    let trigger = sanitize_filename_component(trigger);
     let provider = sanitize_filename_component(provider);
     let model_name = sanitize_filename_component(model_name);
     let stage = sanitize_filename_component(stage);
@@ -6108,8 +4327,8 @@ fn llm_stage_prompt_input_path(
         "entry"
     };
     Path::new(TEMP_MODEL_INPUT_DIR).join(format!(
-        "{}_{}_{}_{}_{}_{}_{}_prompt_input_{}.json",
-        bucket_ts, symbol, mode, trigger, provider, model_name, stage, invoke_ts
+        "{}_{}_{}_{}_{}_{}_prompt_input_{}.json",
+        bucket_ts, symbol, mode, provider, model_name, stage, invoke_ts
     ))
 }
 
@@ -6194,94 +4413,6 @@ fn entry_stage_trace_stop_model_hint(trace: Option<&[Value]>) -> Option<String> 
     )
 }
 
-fn compute_v_for_timeframe_from_indicators(
-    indicators: &Value,
-    timeframe: &str,
-) -> Option<(f64, String)> {
-    let base = format!("/kline_history/payload/intervals/{timeframe}");
-    let bars = indicators
-        .pointer(&format!("{base}/futures/bars"))
-        .or_else(|| indicators.pointer(&format!("{base}/markets/futures/bars")))?
-        .as_array()?;
-
-    let closed_ranges: Vec<(String, f64)> = bars
-        .iter()
-        .filter(|bar| {
-            bar.get("is_closed")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-        })
-        .filter_map(|bar| {
-            let high = bar.get("high").and_then(Value::as_f64)?;
-            let low = bar.get("low").and_then(Value::as_f64)?;
-            let open_time = bar
-                .get("open_time")
-                .and_then(Value::as_str)
-                .unwrap_or("?")
-                .to_string();
-            Some((open_time, high - low))
-        })
-        .take(5)
-        .collect();
-
-    if closed_ranges.len() < 3 {
-        return None;
-    }
-
-    let mut sorted: Vec<f64> = closed_ranges.iter().map(|(_, range)| *range).collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = sorted[sorted.len() / 2];
-    let bars_desc = closed_ranges
-        .iter()
-        .map(|(time, range)| format!("{}:{:.4}", time, range))
-        .collect::<Vec<_>>()
-        .join(",");
-    let basis = format!(
-        "tf={}; n={}; bars=[{}]; sorted=[{}]; median={:.4}",
-        timeframe,
-        closed_ranges.len(),
-        bars_desc,
-        sorted
-            .iter()
-            .map(|range| format!("{:.4}", range))
-            .collect::<Vec<_>>()
-            .join(","),
-        median
-    );
-    Some((median, basis))
-}
-
-fn inject_precomputed_v_into_runtime_indicators(indicators: &mut Value) {
-    if indicators.pointer("/pre_computed_v").is_some() {
-        return;
-    }
-
-    let v_4h = compute_v_for_timeframe_from_indicators(indicators, "4h");
-    let v_1d = compute_v_for_timeframe_from_indicators(indicators, "1d");
-    let status = match (v_4h.is_some(), v_1d.is_some()) {
-        (true, true) => "ok",
-        (true, false) => "v_4h_only",
-        (false, true) => "v_1d_only",
-        (false, false) => "unavailable",
-    };
-
-    let Some(indicators_obj) = indicators.as_object_mut() else {
-        return;
-    };
-
-    let mut pre_computed_v = Map::new();
-    pre_computed_v.insert("status".to_string(), Value::String(status.to_string()));
-    if let Some((value, basis)) = v_4h {
-        pre_computed_v.insert("v_4h".to_string(), json!(value));
-        pre_computed_v.insert("v_4h_basis".to_string(), Value::String(basis));
-    }
-    if let Some((value, basis)) = v_1d {
-        pre_computed_v.insert("v_1d".to_string(), json!(value));
-        pre_computed_v.insert("v_1d_basis".to_string(), Value::String(basis));
-    }
-    indicators_obj.insert("pre_computed_v".to_string(), Value::Object(pre_computed_v));
-}
-
 fn normalize_entry_style(value: &str) -> String {
     value
         .chars()
@@ -6315,36 +4446,11 @@ fn preferred_v_timeframe(entry_style: Option<&str>, horizon: Option<&str>) -> &'
 }
 
 fn resolve_entry_v_from_sources(
-    parsed_decision: &Value,
     trace: Option<&[Value]>,
     input: &ModelInvocationInput,
     horizon: Option<&str>,
 ) -> Option<f64> {
-    if let Some(entry_v) = extract_nested_f64(parsed_decision, &["analysis", "volatility_unit_v"]) {
-        return Some(entry_v);
-    }
-
-    let entry_style = entry_stage_trace_entry_style(trace);
-    let preferred = preferred_v_timeframe(entry_style.as_deref(), horizon);
-    let v_4h = input
-        .indicators
-        .pointer("/pre_computed_v/v_4h")
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            compute_v_for_timeframe_from_indicators(&input.indicators, "4h").map(|(value, _)| value)
-        });
-    let v_1d = input
-        .indicators
-        .pointer("/pre_computed_v/v_1d")
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            compute_v_for_timeframe_from_indicators(&input.indicators, "1d").map(|(value, _)| value)
-        });
-
-    match preferred {
-        "1d" => v_1d.or(v_4h),
-        _ => v_4h.or(v_1d),
-    }
+    resolve_entry_v_from_helper(trace, input, horizon).map(|resolved| resolved.value)
 }
 
 fn build_entry_context_from_fallbacks(
@@ -6366,7 +4472,7 @@ fn build_entry_context_from_fallbacks(
         sweep_wick_extreme: extract_nested_f64(parsed_decision, &["params", "sweep_wick_extreme"]),
         horizon: horizon.map(str::to_string),
         entry_reason: entry_reason.to_string(),
-        entry_v: resolve_entry_v_from_sources(parsed_decision, trace, input, horizon),
+        entry_v: resolve_entry_v_from_sources(trace, input, horizon),
     }
 }
 
@@ -6585,6 +4691,7 @@ mod tests {
         ActivePositionSnapshot, OpenOrderSnapshot, TradingStateSnapshot,
     };
     use crate::llm::decision::{TradeDecision, TradeIntent};
+    use crate::llm::provider::serialize_llm_input_minified;
 
     fn sample_model_input(indicators: Value) -> ModelInvocationInput {
         ModelInvocationInput {
@@ -6604,6 +4711,39 @@ mod tests {
         }
     }
 
+    fn sample_indicators_with_known_v() -> Value {
+        json!({
+            "kline_history": {
+                "payload": {
+                    "intervals": {
+                        "4h": {
+                            "futures": {
+                                "bars": [
+                                    {"open_time": "2026-03-13T00:00:00Z", "high": 110.0, "low": 100.0, "is_closed": true},
+                                    {"open_time": "2026-03-13T04:00:00Z", "high": 118.73, "low": 100.0, "is_closed": true},
+                                    {"open_time": "2026-03-13T08:00:00Z", "high": 122.0, "low": 100.0, "is_closed": true},
+                                    {"open_time": "2026-03-13T12:00:00Z", "high": 117.0, "low": 100.0, "is_closed": true},
+                                    {"open_time": "2026-03-13T16:00:00Z", "high": 121.0, "low": 100.0, "is_closed": true}
+                                ]
+                            }
+                        },
+                        "1d": {
+                            "futures": {
+                                "bars": [
+                                    {"open_time": "2026-03-10T00:00:00Z", "high": 160.0, "low": 100.0, "is_closed": true},
+                                    {"open_time": "2026-03-11T00:00:00Z", "high": 172.83, "low": 100.0, "is_closed": true},
+                                    {"open_time": "2026-03-12T00:00:00Z", "high": 180.0, "low": 100.0, "is_closed": true},
+                                    {"open_time": "2026-03-13T00:00:00Z", "high": 170.0, "low": 100.0, "is_closed": true},
+                                    {"open_time": "2026-03-14T00:00:00Z", "high": 190.0, "low": 100.0, "is_closed": true}
+                                ]
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     #[test]
     fn compact_sample_input_size_snapshot() {
         let path = Path::new("/data/systems/llm/temp_indicator/20260304T055500Z_ETHUSDT.json");
@@ -6614,20 +4754,122 @@ mod tests {
         let raw = fs::read_to_string(path).expect("read sample indicator file");
         let root: Value = serde_json::from_str(&raw).expect("parse sample indicator json");
         let indicators = root.get("indicators").cloned().expect("indicators field");
-        let required = indicators
-            .as_object()
-            .expect("indicators object")
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let (filtered, missing) = filter_indicators(&indicators, &required);
-        assert!(missing.is_empty(), "missing indicators in sample");
-
-        let compact_root = json!({ "indicators": filtered });
-        let compact_minified = serde_json::to_vec(&compact_root).expect("serialize compact");
+        let input = sample_model_input(indicators);
+        let compact_minified = serialize_llm_input_minified(&input)
+            .expect("serialize prompt input")
+            .into_bytes();
         eprintln!("compact_minified_bytes={}", compact_minified.len());
         assert!(!compact_minified.is_empty());
+    }
+
+    #[test]
+    fn persist_model_input_to_disk_writes_scan_and_core_files() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        runtime.block_on(async {
+            let ts_bucket = DateTime::parse_from_rfc3339("2026-03-14T06:29:00Z")
+                .expect("parse ts bucket")
+                .with_timezone(&Utc);
+            let indicators = json!({
+                "funding_rate": {
+                    "payload": {
+                        "funding_current": -0.00004527,
+                        "recent_7d": [
+                            {
+                                "change_ts": "2026-03-14T06:00:00Z",
+                                "funding_delta": -0.00000063
+                            },
+                            {
+                                "change_ts": "2026-03-14T06:15:00Z",
+                                "funding_delta": -0.00000011
+                            }
+                        ]
+                    }
+                },
+                "avwap": {
+                    "payload": {
+                        "fut_mark_price": 2001.5678,
+                        "series_by_window": {
+                            "15m": [
+                                {"ts": "2026-03-14T06:00:00Z", "avwap_fut": 2000.1234},
+                                {"ts": "2026-03-14T06:15:00Z", "avwap_fut": 2000.9876}
+                            ]
+                        }
+                    }
+                }
+            });
+            let bundle = MinuteBundleEnvelope {
+                msg_type: "indicator_bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket,
+                window_code: "15m".to_string(),
+                indicator_count: indicators.as_object().map(|obj| obj.len()).unwrap_or(0),
+                published_at: None,
+                indicators: indicators.clone(),
+            };
+            let input = sample_model_input(indicators);
+
+            let persisted =
+                persist_model_input_to_disk(&bundle, "unit_test", false, false, &input, 5)
+                    .await
+                    .expect("persist filtered model input");
+
+            assert!(persisted.scan.exists());
+            assert!(persisted.core.exists());
+            assert!(persisted
+                .scan
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.contains("_scan_"))
+                .unwrap_or(false));
+            assert!(persisted
+                .core
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.contains("_core_"))
+                .unwrap_or(false));
+
+            let scan_value: Value = serde_json::from_str(
+                &fs::read_to_string(&persisted.scan).expect("read scan model input"),
+            )
+            .expect("parse scan model input");
+            let core_value: Value = serde_json::from_str(
+                &fs::read_to_string(&persisted.core).expect("read core model input"),
+            )
+            .expect("parse core model input");
+
+            assert_eq!(
+                scan_value.pointer("/indicators/funding_rate/payload/funding_current"),
+                Some(&json!(-0.00004527))
+            );
+            assert_eq!(
+                scan_value.pointer("/indicators/avwap/payload/fut_mark_price"),
+                Some(&json!(2001.57))
+            );
+            assert_eq!(
+                scan_value
+                    .pointer("/indicators/avwap/payload/series_by_window/15m/0/ts")
+                    .and_then(Value::as_str),
+                Some("2026-03-14T06:15:00Z")
+            );
+            assert_eq!(
+                core_value
+                    .pointer("/indicators/avwap/payload/series_by_window/15m/0/ts")
+                    .and_then(Value::as_str),
+                Some("2026-03-14T06:15:00Z")
+            );
+            assert_eq!(scan_value.as_object().map(|obj| obj.len()), Some(3));
+            assert!(scan_value.pointer("/indicator_count").is_none());
+            assert!(scan_value.pointer("/indicators/pre_computed_v").is_none());
+            assert!(core_value.pointer("/indicators/pre_computed_v").is_none());
+
+            fs::remove_file(&persisted.scan).expect("cleanup scan model input");
+            fs::remove_file(&persisted.core).expect("cleanup core model input");
+        });
     }
 
     #[test]
@@ -6865,6 +5107,7 @@ mod tests {
         assert_eq!(snapshot.positions.len(), 1);
         let position = &snapshot.positions[0];
         assert_eq!(position.entry_price, 2100.0);
+        assert_eq!(position.pnl_by_latest_price, 1.0);
         assert_eq!(position.current_tp_price, Some(2050.0));
         assert_eq!(position.current_sl_price, Some(2125.0));
     }
@@ -6943,7 +5186,6 @@ mod tests {
                 sweep_wick_extreme: None,
                 horizon: Some("4h".to_string()),
                 entry_reason: "rvwap extreme, keep pending long".to_string(),
-                entry_v: None,
             }),
         };
 
@@ -7006,7 +5248,7 @@ mod tests {
     }
 
     #[test]
-    fn build_entry_context_from_fallbacks_uses_stage_trace_and_precomputed_v() {
+    fn build_entry_context_from_fallbacks_uses_stage_trace_and_helper_v() {
         let parsed_decision = json!({
             "decision": "LONG",
             "params": {
@@ -7032,12 +5274,7 @@ mod tests {
                 "stop_model_hint": "Value Area Invalidation Stop"
             }),
         ];
-        let input = sample_model_input(json!({
-            "pre_computed_v": {
-                "v_4h": 18.73,
-                "v_1d": 72.83
-            }
-        }));
+        let input = sample_model_input(sample_indicators_with_known_v());
 
         let captured = build_entry_context_from_fallbacks(
             &parsed_decision,
@@ -7058,19 +5295,15 @@ mod tests {
         );
         assert_eq!(captured.original_tp, Some(2148.0));
         assert_eq!(captured.original_sl, Some(2106.91));
-        assert_eq!(captured.entry_v, Some(18.73));
+        assert!(captured
+            .entry_v
+            .map(|value| (value - 18.73).abs() < 1e-9)
+            .unwrap_or(false));
         assert_eq!(captured.horizon.as_deref(), Some("4h"));
     }
 
     #[test]
     fn resolve_entry_v_from_sources_uses_entry_style_to_pick_1d_v() {
-        let parsed_decision = json!({
-            "decision": "LONG",
-            "params": {
-                "tp": 2148.0,
-                "sl": 2106.91
-            }
-        });
         let stage_trace = vec![json!({
             "stage": "scan",
             "parsed_scan": {
@@ -7079,21 +5312,17 @@ mod tests {
                 }
             }
         })];
-        let input = sample_model_input(json!({
-            "pre_computed_v": {
-                "v_4h": 18.73,
-                "v_1d": 72.83
-            }
-        }));
+        let input = sample_model_input(sample_indicators_with_known_v());
 
-        let entry_v =
-            resolve_entry_v_from_sources(&parsed_decision, Some(&stage_trace), &input, Some("4h"));
+        let entry_v = resolve_entry_v_from_sources(Some(&stage_trace), &input, Some("4h"));
 
-        assert_eq!(entry_v, Some(72.83));
+        assert!(entry_v
+            .map(|value| (value - 72.83).abs() < 1e-9)
+            .unwrap_or(false));
     }
 
     #[test]
-    fn build_entry_context_from_fallbacks_preserves_model_values_when_present() {
+    fn build_entry_context_from_fallbacks_prefers_helper_v_over_model_output() {
         let parsed_decision = json!({
             "decision": "LONG",
             "analysis": {
@@ -7113,12 +5342,7 @@ mod tests {
             "entry_style": "patient_retest",
             "stop_model_hint": "Fallback Stop"
         })];
-        let input = sample_model_input(json!({
-            "pre_computed_v": {
-                "v_4h": 18.73,
-                "v_1d": 72.83
-            }
-        }));
+        let input = sample_model_input(sample_indicators_with_known_v());
 
         let captured = build_entry_context_from_fallbacks(
             &parsed_decision,
@@ -7131,11 +5355,136 @@ mod tests {
         assert_eq!(captured.entry_strategy.as_deref(), Some("Model Strategy"));
         assert_eq!(captured.stop_model.as_deref(), Some("Model Stop"));
         assert_eq!(captured.entry_mode.as_deref(), Some("market_after_flip"));
-        assert_eq!(captured.entry_v, Some(55.5));
+        assert!(captured
+            .entry_v
+            .map(|value| (value - 18.73).abs() < 1e-9)
+            .unwrap_or(false));
     }
 
     #[test]
-    fn build_invocation_input_injects_precomputed_v_into_runtime_indicators() {
+    fn evaluate_trade_entry_v_gate_blocks_when_distances_are_below_threshold() {
+        let mut execution_config = LlmExecutionConfig::default();
+        execution_config.min_distance_v = 1.0;
+        let intent = TradeIntent {
+            decision: TradeDecision::Long,
+            entry_price: Some(2000.0),
+            take_profit: Some(2015.0),
+            stop_loss: Some(1990.0),
+            leverage: Some(5.0),
+            risk_reward_ratio: Some(1.5),
+            horizon: Some("4h".to_string()),
+            swing_logic: Some("test".to_string()),
+            reason: "test".to_string(),
+        };
+        let stage_trace = vec![json!({
+            "stage": "scan",
+            "parsed_scan": {
+                "scan": {
+                    "entry_style": "patient_retest"
+                }
+            }
+        })];
+        let input = sample_model_input(sample_indicators_with_known_v());
+
+        let gate =
+            evaluate_trade_entry_v_gate(&execution_config, &intent, &input, Some(&stage_trace))
+                .expect("gate should evaluate")
+                .expect("gate should apply");
+
+        assert!(!gate.passed);
+        assert!((gate.take_profit_distance_v - (15.0 / 18.73)).abs() < 1e-9);
+        assert!((gate.min_distance_v - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn evaluate_trade_entry_v_gate_passes_with_helper_based_v() {
+        let mut execution_config = LlmExecutionConfig::default();
+        execution_config.min_distance_v = 1.0;
+        let intent = TradeIntent {
+            decision: TradeDecision::Long,
+            entry_price: Some(2000.0),
+            take_profit: Some(2025.0),
+            stop_loss: Some(1990.0),
+            leverage: Some(5.0),
+            risk_reward_ratio: Some(2.5),
+            horizon: Some("4h".to_string()),
+            swing_logic: Some("test".to_string()),
+            reason: "test".to_string(),
+        };
+        let stage_trace = vec![json!({
+            "stage": "scan",
+            "parsed_scan": {
+                "scan": {
+                    "entry_style": "patient_retest"
+                }
+            }
+        })];
+        let input = sample_model_input(sample_indicators_with_known_v());
+
+        let gate =
+            evaluate_trade_entry_v_gate(&execution_config, &intent, &input, Some(&stage_trace))
+                .expect("gate should evaluate")
+                .expect("gate should be enabled");
+
+        assert!(gate.passed);
+        assert!((gate.resolved_v.value - 18.73).abs() < 1e-9);
+        assert_eq!(gate.resolved_v.timeframe, "4h");
+        assert!(gate.take_profit_distance_v > 1.0);
+    }
+
+    #[test]
+    fn evaluate_trade_rr_gate_blocks_when_rr_is_below_threshold() {
+        let mut execution_config = LlmExecutionConfig::default();
+        execution_config.min_rr = 2.0;
+        let intent = TradeIntent {
+            decision: TradeDecision::Long,
+            entry_price: Some(2000.0),
+            take_profit: Some(2015.0),
+            stop_loss: Some(1990.0),
+            leverage: Some(5.0),
+            risk_reward_ratio: Some(1.5),
+            horizon: Some("4h".to_string()),
+            swing_logic: Some("test".to_string()),
+            reason: "test".to_string(),
+        };
+
+        let gate = evaluate_trade_rr_gate(&execution_config, &intent)
+            .expect("rr gate should evaluate")
+            .expect("rr gate should apply");
+
+        assert!(!gate.passed);
+        assert!((gate.risk_reward_ratio - 1.5).abs() < 1e-9);
+        assert!((gate.min_rr - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn evaluate_trade_rr_gate_passes_when_rr_meets_threshold() {
+        let mut execution_config = LlmExecutionConfig::default();
+        execution_config.min_rr = 2.0;
+        let intent = TradeIntent {
+            decision: TradeDecision::Long,
+            entry_price: Some(2000.0),
+            take_profit: Some(2020.0),
+            stop_loss: Some(1990.0),
+            leverage: Some(5.0),
+            risk_reward_ratio: Some(2.0),
+            horizon: Some("4h".to_string()),
+            swing_logic: Some("test".to_string()),
+            reason: "test".to_string(),
+        };
+
+        let gate = evaluate_trade_rr_gate(&execution_config, &intent)
+            .expect("rr gate should evaluate")
+            .expect("rr gate should apply");
+
+        assert!(gate.passed);
+        assert!((gate.risk_reward_ratio - 2.0).abs() < 1e-9);
+        assert!((gate.reward_distance - 20.0).abs() < 1e-9);
+        assert!((gate.risk_distance - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn build_invocation_input_preserves_raw_indicators_without_injection() {
         let bundle = LatestBundle {
             raw: MinuteBundleEnvelope {
                 msg_type: "bundle".to_string(),
@@ -7147,7 +5496,7 @@ mod tests {
                 published_at: None,
                 indicators: json!({}),
             },
-            filtered_indicators: json!({
+            indicators: json!({
                 "kline_history": {
                     "payload": {
                         "intervals": {
@@ -7179,27 +5528,62 @@ mod tests {
 
         let input = build_invocation_input(&bundle, false, false, None, None, None);
 
+        assert!(input.indicators.get("pre_computed_v").is_none());
+        assert_eq!(input.indicators, bundle.indicators);
+    }
+
+    #[test]
+    fn build_persist_only_input_preserves_full_raw_indicator_bundle() {
+        let bundle = LatestBundle {
+            raw: MinuteBundleEnvelope {
+                msg_type: "bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket: Utc::now(),
+                window_code: "1m".to_string(),
+                indicator_count: 3,
+                published_at: None,
+                indicators: json!({}),
+            },
+            indicators: json!({
+                "absorption": {"payload": {"recent_7d": {"events": []}}},
+                "fvg": {"payload": {"by_window": {"15m": {}, "4h": {}}}},
+                "cvd_pack": {"payload": {"by_window": {"15m": {"series": []}}}}
+            }),
+            missing_indicator_codes: vec![],
+            received_at: Utc::now(),
+        };
+
+        let input = build_persist_only_input(&bundle);
+
+        let mut keys = input
+            .indicators
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
         assert_eq!(
-            input
-                .indicators
-                .pointer("/pre_computed_v/status")
-                .and_then(Value::as_str),
-            Some("ok")
+            keys,
+            vec![
+                "absorption".to_string(),
+                "cvd_pack".to_string(),
+                "fvg".to_string()
+            ]
         );
         assert_eq!(
             input
                 .indicators
-                .pointer("/pre_computed_v/v_4h")
-                .and_then(Value::as_f64),
-            Some(10.0)
+                .pointer("/fvg/payload/by_window/15m")
+                .map(|_| true),
+            Some(true)
         );
-        assert_eq!(
-            input
-                .indicators
-                .pointer("/pre_computed_v/v_1d")
-                .and_then(Value::as_f64),
-            Some(40.0)
-        );
+        assert!(input.missing_indicator_codes.is_empty());
+        assert!(!input.management_mode);
+        assert!(!input.pending_order_mode);
+        assert!(input.trading_state.is_none());
+        assert!(input.management_snapshot.is_none());
     }
 
     #[test]
@@ -7232,11 +5616,12 @@ mod tests {
                 available_balance: 800.0,
             };
 
-            let context_state =
-                Arc::new(Mutex::new(HashMap::<String, PositionContextState>::new()));
+            let runtime_lifecycle_state = Arc::new(Mutex::new(RuntimeLifecycleStore::default()));
             {
-                let mut guard = context_state.lock().await;
-                guard.insert(
+                let mut guard = runtime_lifecycle_state.lock().await;
+                let symbol_state = guard.symbol_state_mut("ETHUSDT");
+                symbol_state.last_management_reason = Some("keep pending".to_string());
+                symbol_state.contexts.insert(
                     "ETHUSDT:BOTH".to_string(),
                     PositionContextState {
                         original_qty: 0.05,
@@ -7262,13 +5647,10 @@ mod tests {
                 );
             }
 
-            let snapshot = sync_and_build_position_context_snapshot(
-                Some(&state),
-                &context_state,
-                Some("keep pending".to_string()),
-            )
-            .await
-            .expect("position context snapshot");
+            let snapshot =
+                sync_and_build_position_context_snapshot(Some(&state), &runtime_lifecycle_state)
+                    .await
+                    .expect("position context snapshot");
 
             let entry_context = snapshot.entry_context.expect("backfilled entry_context");
             assert_eq!(
@@ -7319,19 +5701,17 @@ mod tests {
         fs::create_dir_all(&dir).expect("create temp model input dir");
         fs::write(dir.join(".gitignore"), "").expect("write .gitignore");
         fs::write(
-            dir.join("20260307T105900Z_ETHUSDT_entry_scheduled_bundle_20260307T110001000Z.json"),
+            dir.join("20260307T105900Z_ETHUSDT_entry_20260307T110001000Z.json"),
             "{}",
         )
         .expect("write old file");
         fs::write(
-            dir.join(
-                "20260307T110000Z_ETHUSDT_management_scheduled_bundle_20260307T110101000Z.json",
-            ),
+            dir.join("20260307T110000Z_ETHUSDT_management_20260307T110101000Z.json"),
             "{}",
         )
         .expect("write edge file");
         fs::write(
-            dir.join("20260307T111500Z_ETHUSDT_pending_management_scheduled_bundle_20260307T111601000Z.json"),
+            dir.join("20260307T111500Z_ETHUSDT_pending_management_20260307T111601000Z.json"),
             "{}",
         )
         .expect("write fresh file");
@@ -7348,13 +5728,13 @@ mod tests {
 
         assert_eq!(removed, 1);
         assert!(!dir
-            .join("20260307T105900Z_ETHUSDT_entry_scheduled_bundle_20260307T110001000Z.json")
+            .join("20260307T105900Z_ETHUSDT_entry_20260307T110001000Z.json")
             .exists());
         assert!(dir
-            .join("20260307T110000Z_ETHUSDT_management_scheduled_bundle_20260307T110101000Z.json")
+            .join("20260307T110000Z_ETHUSDT_management_20260307T110101000Z.json")
             .exists());
         assert!(dir
-            .join("20260307T111500Z_ETHUSDT_pending_management_scheduled_bundle_20260307T111601000Z.json")
+            .join("20260307T111500Z_ETHUSDT_pending_management_20260307T111601000Z.json")
             .exists());
         assert!(dir.join("not_a_model_input.json").exists());
         assert!(dir.join(".gitignore").exists());

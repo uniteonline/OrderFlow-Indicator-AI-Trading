@@ -71,7 +71,6 @@ pub fn build_indicator_runtime_options(
         kline_history_fill_1d_from_db: config.indicator.kline_history.fill_1d_from_db,
         fvg_windows: config.indicator.fvg.windows.clone(),
         fvg_fill_from_db: config.indicator.fvg.fill_from_db,
-        fvg_db_bars_1h: config.indicator.fvg.db_bars_1h,
         fvg_db_bars_4h: config.indicator.fvg.db_bars_4h,
         fvg_db_bars_1d: config.indicator.fvg.db_bars_1d,
         fvg_epsilon_gap_ticks: config.indicator.fvg.epsilon_gap_ticks,
@@ -593,7 +592,6 @@ pub async fn load_kline_history_supplement(
     ema_db_bars_1d: usize,
     fvg_fill_from_db: bool,
     fvg_windows: &[String],
-    fvg_db_bars_1h: usize,
     fvg_db_bars_4h: usize,
     fvg_db_bars_1d: usize,
     current_minute_close: DateTime<Utc>,
@@ -602,12 +600,9 @@ pub async fn load_kline_history_supplement(
         return KlineHistorySupplement::default();
     }
 
-    let fvg_needs_1h = fvg_fill_from_db && fvg_windows.iter().any(|code| code == "1h");
     let fvg_needs_4h = fvg_fill_from_db && fvg_windows.iter().any(|code| code == "4h");
     let fvg_needs_1d = fvg_fill_from_db && fvg_windows.iter().any(|code| code == "1d");
 
-    let in_mem_futures_1h =
-        build_interval_bar_records(history_futures, 60, usize::MAX, current_minute_close);
     let in_mem_futures_1d =
         build_interval_bar_records(history_futures, 1440, usize::MAX, current_minute_close);
     let in_mem_spot_1d =
@@ -617,7 +612,6 @@ pub async fn load_kline_history_supplement(
     let in_mem_spot_4h =
         build_interval_bar_records(history_spot, 240, usize::MAX, current_minute_close);
 
-    let required_futures_1h = if fvg_needs_1h { fvg_db_bars_1h } else { 0 };
     let required_futures_1d = if fill_1d_from_db { bars_1d } else { 0 }
         .max(if ema_fill_from_db { ema_db_bars_1d } else { 0 })
         .max(if fvg_needs_1d { fvg_db_bars_1d } else { 0 });
@@ -627,20 +621,17 @@ pub async fn load_kline_history_supplement(
         .max(if fvg_needs_4h { fvg_db_bars_4h } else { 0 });
     let required_spot_4h = bars_4h;
 
-    let in_mem_futures_1h_count = in_mem_futures_1h.len();
     let in_mem_futures_count = in_mem_futures_1d.len();
     let in_mem_spot_count = in_mem_spot_1d.len();
     let in_mem_futures_4h_count = in_mem_futures_4h.len();
     let in_mem_spot_4h_count = in_mem_spot_4h.len();
 
-    let futures_1h_missing = required_futures_1h.saturating_sub(in_mem_futures_1h_count);
     let futures_1d_missing = required_futures_1d.saturating_sub(in_mem_futures_count);
     let spot_1d_missing = required_spot_1d.saturating_sub(in_mem_spot_count);
     let futures_4h_missing = required_futures_4h.saturating_sub(in_mem_futures_4h_count);
     let spot_4h_missing = required_spot_4h.saturating_sub(in_mem_spot_4h_count);
 
-    if futures_1h_missing == 0
-        && futures_1d_missing == 0
+    if futures_1d_missing == 0
         && spot_1d_missing == 0
         && futures_4h_missing == 0
         && spot_4h_missing == 0
@@ -648,10 +639,6 @@ pub async fn load_kline_history_supplement(
         return KlineHistorySupplement::default();
     }
 
-    let futures_1h_oldest_open = in_mem_futures_1h
-        .first()
-        .map(|b| b.open_time)
-        .unwrap_or(current_minute_close);
     let futures_oldest_open = in_mem_futures_1d
         .first()
         .map(|b| b.open_time)
@@ -668,34 +655,6 @@ pub async fn load_kline_history_supplement(
         .first()
         .map(|b| b.open_time)
         .unwrap_or(current_minute_close);
-
-    let futures_1h_db = if futures_1h_missing > 0 {
-        match fetch_older_interval_bars(
-            pool,
-            symbol,
-            "futures",
-            "1h",
-            futures_1h_oldest_open,
-            futures_1h_missing,
-        )
-        .await
-        {
-            Ok(rows) => rows,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    symbol = %symbol,
-                    market = "futures",
-                    interval_code = "1h",
-                    limit = futures_1h_missing,
-                    "load kline supplement from DB failed"
-                );
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
 
     let futures_1d_db = if futures_1d_missing > 0 {
         match fetch_older_interval_bars(
@@ -810,7 +769,6 @@ pub async fn load_kline_history_supplement(
     };
 
     KlineHistorySupplement {
-        futures_1h_db,
         futures_4h_db,
         futures_1d_db,
         spot_4h_db,
@@ -1130,7 +1088,6 @@ async fn process_window_bundle(
         runtime_options.ema_db_bars_1d,
         runtime_options.fvg_fill_from_db,
         &runtime_options.fvg_windows,
-        runtime_options.fvg_db_bars_1h,
         runtime_options.fvg_db_bars_4h,
         runtime_options.fvg_db_bars_1d,
         minute + ChronoDuration::minutes(1),

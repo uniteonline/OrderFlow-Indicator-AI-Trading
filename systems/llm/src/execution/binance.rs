@@ -3311,6 +3311,7 @@ mod tests {
             is_full_exit: Some(false),
             new_tp: Some(2100.0),
             new_sl: Some(2047.0),
+            close_price: None,
             reason: "test".to_string(),
         };
 
@@ -3330,6 +3331,7 @@ mod tests {
             is_full_exit: Some(false),
             new_tp: Some(2105.0),
             new_sl: Some(2047.0),
+            close_price: None,
             reason: "test".to_string(),
         };
 
@@ -3350,6 +3352,7 @@ mod tests {
             is_full_exit: Some(false),
             new_tp: Some(2100.0),
             new_sl: Some(2047.0),
+            close_price: None,
             reason: "test".to_string(),
         };
 
@@ -3393,6 +3396,7 @@ mod tests {
             new_entry: Some(1947.5),
             new_tp: None,
             new_sl: Some(1941.5),
+            new_leverage: None,
             reason: "test".to_string(),
         };
 

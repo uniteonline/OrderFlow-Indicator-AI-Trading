@@ -22,6 +22,54 @@ const RAW_AUDIT_LVN_CAP: usize = 24;
 /// Multi-window specs: (window_code, bar_count).
 const MULTI_WINDOWS: &[(&str, usize)] = &[("15m", 15), ("4h", 240), ("1d", 1440), ("3d", 4320)];
 
+#[derive(Clone, Copy)]
+struct PvsV2WindowConfig {
+    rows: usize,
+    hvn_pct_of_poc: f64,
+    lvn_pct_of_poc: f64,
+    strength: usize,
+    min_zone_width_bins: usize,
+}
+
+#[derive(Clone)]
+struct BinnedProfileLevel {
+    index: usize,
+    lower_tick: i64,
+    upper_tick: i64,
+    buy_volume: f64,
+    sell_volume: f64,
+}
+
+impl BinnedProfileLevel {
+    fn midpoint_price(&self) -> f64 {
+        (self.lower_tick + self.upper_tick) as f64 / 200.0
+    }
+
+    fn volume(&self) -> f64 {
+        self.buy_volume + self.sell_volume
+    }
+
+    fn delta(&self) -> f64 {
+        self.buy_volume - self.sell_volume
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BinZone {
+    start_idx: usize,
+    end_idx: usize,
+}
+
+#[derive(Clone)]
+struct PvsV2Analysis {
+    bins: Vec<BinnedProfileLevel>,
+    poc_idx: usize,
+    poc_volume: f64,
+    value_area_bins: HashSet<usize>,
+    hvn_zones: Vec<BinZone>,
+    lvn_zones: Vec<BinZone>,
+}
+
 pub struct I01PriceVolumeStructure;
 
 impl Indicator for I01PriceVolumeStructure {
@@ -105,7 +153,7 @@ impl Indicator for I01PriceVolumeStructure {
             let w_zscore = zscore(window_total, prior_vols);
             let w_dryup = w_zscore.map(|z| z <= -DRYUP_Z_THRESHOLD).unwrap_or(false);
 
-            let mut w_payload = build_pvs_payload(&agg, window_total, w_zscore, w_dryup);
+            let mut w_payload = build_pvs_v2_payload(wcode, &agg, window_total, w_zscore, w_dryup);
             if let Some(obj) = w_payload.as_object_mut() {
                 obj.insert("window_bars_used".into(), json!(window_bars_used));
             }
@@ -295,8 +343,469 @@ fn build_pvs_payload(
     })
 }
 
+fn pvs_v2_window_config(window_code: &str) -> Option<PvsV2WindowConfig> {
+    match window_code {
+        "15m" => Some(PvsV2WindowConfig {
+            rows: 24,
+            hvn_pct_of_poc: 0.82,
+            lvn_pct_of_poc: 0.18,
+            strength: 9,
+            min_zone_width_bins: 2,
+        }),
+        "4h" => Some(PvsV2WindowConfig {
+            rows: 20,
+            hvn_pct_of_poc: 0.76,
+            lvn_pct_of_poc: 0.24,
+            strength: 11,
+            min_zone_width_bins: 2,
+        }),
+        "1d" => Some(PvsV2WindowConfig {
+            rows: 16,
+            hvn_pct_of_poc: 0.72,
+            lvn_pct_of_poc: 0.28,
+            strength: 13,
+            min_zone_width_bins: 1,
+        }),
+        "3d" => Some(PvsV2WindowConfig {
+            rows: 14,
+            hvn_pct_of_poc: 0.68,
+            lvn_pct_of_poc: 0.32,
+            strength: 16,
+            min_zone_width_bins: 1,
+        }),
+        _ => None,
+    }
+}
+
+fn build_pvs_v2_payload(
+    window_code: &str,
+    profile: &BTreeMap<i64, LevelAgg>,
+    total_volume: f64,
+    volume_z: Option<f64>,
+    volume_dryup: bool,
+) -> serde_json::Value {
+    let Some(analysis) = analyze_pvs_v2(window_code, profile) else {
+        return json!({
+            "bar_volume": total_volume,
+            "poc_price": null,
+            "poc_volume": null,
+            "val": null,
+            "vah": null,
+            "value_area_levels": [],
+            "hvn_levels": [],
+            "lvn_levels": [],
+            "volume_zscore": volume_z,
+            "volume_dryup": volume_dryup,
+            "levels": []
+        });
+    };
+
+    let val = analysis
+        .value_area_bins
+        .iter()
+        .min()
+        .map(|idx| analysis.bins[*idx].lower_tick as f64 / 100.0);
+    let vah = analysis
+        .value_area_bins
+        .iter()
+        .max()
+        .map(|idx| analysis.bins[*idx].upper_tick as f64 / 100.0);
+
+    let mut rank_order = analysis
+        .bins
+        .iter()
+        .map(|bin| (bin.index as i64, bin.volume()))
+        .collect::<Vec<_>>();
+    rank_order.sort_by(|a, b| compare_ranked_volume(*a, *b));
+    let rank_map: BTreeMap<usize, i32> = rank_order
+        .iter()
+        .enumerate()
+        .map(|(i, (idx, _))| (*idx as usize, (i + 1) as i32))
+        .collect();
+
+    let levels = analysis
+        .bins
+        .iter()
+        .map(|bin| {
+            json!({
+                "price_level": bin.midpoint_price(),
+                "level_rank": rank_map.get(&bin.index).copied(),
+                "buy_volume": bin.buy_volume,
+                "sell_volume": bin.sell_volume,
+                "volume": bin.volume(),
+                "delta": bin.delta(),
+                "is_hvn": zone_contains_index(&analysis.hvn_zones, bin.index),
+                "is_lvn": zone_contains_index(&analysis.lvn_zones, bin.index),
+                "is_in_value_area": analysis.value_area_bins.contains(&bin.index)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let value_area_levels = analysis
+        .bins
+        .iter()
+        .filter(|bin| analysis.value_area_bins.contains(&bin.index))
+        .map(|bin| {
+            json!({
+                "price_level": bin.midpoint_price(),
+                "volume": bin.volume()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "bar_volume": total_volume,
+        "poc_price": analysis.bins[analysis.poc_idx].midpoint_price(),
+        "poc_volume": analysis.poc_volume,
+        "val": val,
+        "vah": vah,
+        "value_area_levels": value_area_levels,
+        "hvn_levels": zone_midpoints(&analysis.bins, &analysis.hvn_zones),
+        "lvn_levels": zone_midpoints(&analysis.bins, &analysis.lvn_zones),
+        "volume_zscore": volume_z,
+        "volume_dryup": volume_dryup,
+        "levels": levels
+    })
+}
+
+fn analyze_pvs_v2(window_code: &str, profile: &BTreeMap<i64, LevelAgg>) -> Option<PvsV2Analysis> {
+    let config = pvs_v2_window_config(window_code)?;
+    let bins = build_binned_profile(profile, config.rows);
+    if bins.is_empty() {
+        return None;
+    }
+
+    let smoothed = smooth_bin_volumes(&bins);
+    let (poc_idx, poc_volume) = smoothed
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        })
+        .unwrap_or((0, 0.0));
+
+    let value_area_bins = build_value_area_bins(&bins, poc_idx);
+    let hvn_zones = build_node_zones(&smoothed, poc_volume, config, true);
+    let lvn_zones = build_node_zones(&smoothed, poc_volume, config, false);
+
+    Some(PvsV2Analysis {
+        bins,
+        poc_idx,
+        poc_volume,
+        value_area_bins,
+        hvn_zones,
+        lvn_zones,
+    })
+}
+
+fn build_binned_profile(
+    profile: &BTreeMap<i64, LevelAgg>,
+    requested_rows: usize,
+) -> Vec<BinnedProfileLevel> {
+    if profile.is_empty() || requested_rows == 0 {
+        return Vec::new();
+    }
+
+    let min_tick = *profile.keys().next().unwrap_or(&0);
+    let max_tick = *profile.keys().next_back().unwrap_or(&min_tick);
+    let span_ticks = (max_tick - min_tick + 1).max(1) as usize;
+    let actual_rows = requested_rows.min(span_ticks.max(1));
+    let bin_width_ticks = span_ticks.div_ceil(actual_rows).max(1);
+
+    let mut bins = (0..actual_rows)
+        .map(|index| {
+            let lower_tick = min_tick + (index * bin_width_ticks) as i64;
+            let upper_tick = if index + 1 == actual_rows {
+                max_tick
+            } else {
+                (lower_tick + bin_width_ticks as i64 - 1).min(max_tick)
+            };
+            BinnedProfileLevel {
+                index,
+                lower_tick,
+                upper_tick,
+                buy_volume: 0.0,
+                sell_volume: 0.0,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for (&tick, level) in profile {
+        let bin_index = (((tick - min_tick) as usize) / bin_width_ticks).min(actual_rows - 1);
+        bins[bin_index].buy_volume += level.buy_qty;
+        bins[bin_index].sell_volume += level.sell_qty;
+    }
+
+    bins
+}
+
+fn smooth_bin_volumes(bins: &[BinnedProfileLevel]) -> Vec<f64> {
+    bins.iter()
+        .enumerate()
+        .map(|(index, _)| {
+            let prev = if index > 0 {
+                bins[index - 1].volume()
+            } else {
+                bins[index].volume()
+            };
+            let cur = bins[index].volume();
+            let next = if index + 1 < bins.len() {
+                bins[index + 1].volume()
+            } else {
+                bins[index].volume()
+            };
+            (prev + 2.0 * cur + next) / 4.0
+        })
+        .collect()
+}
+
+fn build_value_area_bins(bins: &[BinnedProfileLevel], poc_idx: usize) -> HashSet<usize> {
+    let total_volume = bins.iter().map(BinnedProfileLevel::volume).sum::<f64>();
+    let target = total_volume * VALUE_AREA_RATIO;
+    let mut acc = bins
+        .get(poc_idx)
+        .map(BinnedProfileLevel::volume)
+        .unwrap_or(0.0);
+    let mut out = HashSet::new();
+    out.insert(poc_idx);
+
+    let mut left = poc_idx.checked_sub(1);
+    let mut right = poc_idx + 1;
+    while acc < target && (left.is_some() || right < bins.len()) {
+        let lv = left.map(|idx| bins[idx].volume()).unwrap_or(-1.0);
+        let rv = if right < bins.len() {
+            bins[right].volume()
+        } else {
+            -1.0
+        };
+        if rv >= lv && right < bins.len() {
+            acc += bins[right].volume();
+            out.insert(right);
+            right += 1;
+        } else if let Some(left_idx) = left {
+            acc += bins[left_idx].volume();
+            out.insert(left_idx);
+            left = left_idx.checked_sub(1);
+        } else {
+            break;
+        }
+    }
+
+    out
+}
+
+fn build_node_zones(
+    smoothed: &[f64],
+    poc_volume: f64,
+    config: PvsV2WindowConfig,
+    is_hvn: bool,
+) -> Vec<BinZone> {
+    if smoothed.is_empty() || poc_volume <= 0.0 {
+        return Vec::new();
+    }
+
+    let threshold = if is_hvn {
+        config.hvn_pct_of_poc * poc_volume
+    } else {
+        config.lvn_pct_of_poc * poc_volume
+    };
+
+    let candidate_bins = (0..smoothed.len())
+        .filter(|&idx| {
+            if is_hvn {
+                smoothed[idx] >= threshold && is_strict_local_max(smoothed, idx, config.strength)
+            } else {
+                smoothed[idx] <= threshold && is_strict_local_min(smoothed, idx, config.strength)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut zones: Vec<BinZone> = Vec::new();
+    for idx in candidate_bins {
+        if let Some(last) = zones.last_mut() {
+            if idx == last.end_idx + 1 {
+                last.end_idx = idx;
+                continue;
+            }
+        }
+        zones.push(BinZone {
+            start_idx: idx,
+            end_idx: idx,
+        });
+    }
+
+    zones
+        .into_iter()
+        .filter(|zone| zone.end_idx + 1 - zone.start_idx >= config.min_zone_width_bins)
+        .collect()
+}
+
+fn is_strict_local_max(values: &[f64], idx: usize, strength: usize) -> bool {
+    let start = idx.saturating_sub(strength);
+    let end = (idx + strength).min(values.len().saturating_sub(1));
+    if start == idx && end == idx {
+        return false;
+    }
+    let value = values[idx];
+    (start..=end).all(|other| other == idx || value > values[other])
+}
+
+fn is_strict_local_min(values: &[f64], idx: usize, strength: usize) -> bool {
+    let start = idx.saturating_sub(strength);
+    let end = (idx + strength).min(values.len().saturating_sub(1));
+    if start == idx && end == idx {
+        return false;
+    }
+    let value = values[idx];
+    (start..=end).all(|other| other == idx || value < values[other])
+}
+
+fn zone_midpoints(bins: &[BinnedProfileLevel], zones: &[BinZone]) -> Vec<f64> {
+    zones
+        .iter()
+        .map(|zone| {
+            let lower_tick = bins[zone.start_idx].lower_tick;
+            let upper_tick = bins[zone.end_idx].upper_tick;
+            (lower_tick + upper_tick) as f64 / 200.0
+        })
+        .collect()
+}
+
+fn zone_contains_index(zones: &[BinZone], index: usize) -> bool {
+    zones
+        .iter()
+        .any(|zone| index >= zone.start_idx && index <= zone.end_idx)
+}
+
+fn build_pvs_v2_level_rows(
+    indicator_code: &'static str,
+    window_code: &'static str,
+    profile: &BTreeMap<i64, LevelAgg>,
+    _total_volume: f64,
+) -> Vec<IndicatorLevelRow> {
+    let Some(analysis) = analyze_pvs_v2(window_code, profile) else {
+        return Vec::new();
+    };
+
+    let val_idx = analysis.value_area_bins.iter().min().copied();
+    let vah_idx = analysis.value_area_bins.iter().max().copied();
+
+    let mut rank_order = analysis
+        .bins
+        .iter()
+        .map(|bin| (bin.index, bin.volume()))
+        .collect::<Vec<_>>();
+    rank_order.sort_by(|a, b| compare_ranked_volume((a.0 as i64, a.1), (b.0 as i64, b.1)));
+    let rank_map: BTreeMap<usize, i32> = rank_order
+        .iter()
+        .enumerate()
+        .map(|(i, (idx, _))| (*idx, (i + 1) as i32))
+        .collect();
+
+    let audit_subset = select_raw_audit_bins(
+        &rank_order,
+        &analysis.bins,
+        &analysis.hvn_zones,
+        &analysis.lvn_zones,
+        analysis.poc_idx,
+        val_idx,
+        vah_idx,
+    );
+
+    analysis
+        .bins
+        .iter()
+        .filter(|bin| audit_subset.contains(&bin.index))
+        .map(|bin| IndicatorLevelRow {
+            indicator_code,
+            window_code,
+            price_level: bin.midpoint_price(),
+            level_rank: rank_map.get(&bin.index).copied(),
+            metrics_json: json!({
+                "buy_volume": bin.buy_volume,
+                "sell_volume": bin.sell_volume,
+                "volume": bin.volume(),
+                "delta": bin.delta(),
+                "is_poc": bin.index == analysis.poc_idx,
+                "is_val": Some(bin.index) == val_idx,
+                "is_vah": Some(bin.index) == vah_idx,
+                "is_hvn": zone_contains_index(&analysis.hvn_zones, bin.index),
+                "is_lvn": zone_contains_index(&analysis.lvn_zones, bin.index),
+                "is_in_value_area": analysis.value_area_bins.contains(&bin.index),
+                "audit_capture_policy": "structural_top_ranked_subset"
+            }),
+        })
+        .collect()
+}
+
+fn select_raw_audit_bins(
+    rank_order: &[(usize, f64)],
+    bins: &[BinnedProfileLevel],
+    hvn_zones: &[BinZone],
+    lvn_zones: &[BinZone],
+    poc_idx: usize,
+    val_idx: Option<usize>,
+    vah_idx: Option<usize>,
+) -> HashSet<usize> {
+    let mut out = HashSet::new();
+    out.insert(poc_idx);
+    if let Some(idx) = val_idx {
+        out.insert(idx);
+    }
+    if let Some(idx) = vah_idx {
+        out.insert(idx);
+    }
+
+    for (idx, _) in rank_order.iter().take(RAW_AUDIT_TOP_RANKS_MULTI_WINDOW) {
+        out.insert(*idx);
+    }
+
+    for zone in hvn_zones.iter().take(RAW_AUDIT_HVN_CAP) {
+        for idx in zone.start_idx..=zone.end_idx {
+            out.insert(idx);
+        }
+    }
+
+    let mut lvn_ranked = lvn_zones
+        .iter()
+        .map(|zone| {
+            let min_volume = (zone.start_idx..=zone.end_idx)
+                .map(|idx| bins[idx].volume())
+                .fold(f64::INFINITY, f64::min);
+            (*zone, min_volume)
+        })
+        .collect::<Vec<_>>();
+    lvn_ranked.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| a.0.start_idx.cmp(&b.0.start_idx))
+    });
+    for (zone, _) in lvn_ranked.into_iter().take(RAW_AUDIT_LVN_CAP) {
+        for idx in zone.start_idx..=zone.end_idx {
+            out.insert(idx);
+        }
+    }
+
+    out
+}
+
 /// Build per-level DB rows for the 1m snapshot window.
 fn build_level_rows(
+    indicator_code: &'static str,
+    window_code: &'static str,
+    profile: &BTreeMap<i64, LevelAgg>,
+    total_volume: f64,
+) -> Vec<IndicatorLevelRow> {
+    if pvs_v2_window_config(window_code).is_some() {
+        return build_pvs_v2_level_rows(indicator_code, window_code, profile, total_volume);
+    }
+    build_raw_level_rows(indicator_code, window_code, profile, total_volume)
+}
+
+fn build_raw_level_rows(
     indicator_code: &'static str,
     window_code: &'static str,
     profile: &BTreeMap<i64, LevelAgg>,
@@ -558,8 +1067,9 @@ fn compare_ranked_volume(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_level_rows, build_pvs_payload, I01PriceVolumeStructure, MULTI_WINDOWS,
-        RAW_AUDIT_HVN_CAP, RAW_AUDIT_LVN_CAP, RAW_AUDIT_TOP_RANKS_MULTI_WINDOW,
+        build_level_rows, build_node_zones, build_pvs_payload, I01PriceVolumeStructure,
+        PvsV2WindowConfig, MULTI_WINDOWS, RAW_AUDIT_HVN_CAP, RAW_AUDIT_LVN_CAP,
+        RAW_AUDIT_TOP_RANKS_MULTI_WINDOW,
     };
     use crate::indicators::context::{DivergenceSigTestMode, IndicatorContext};
     use crate::indicators::indicator_trait::Indicator;
@@ -617,9 +1127,13 @@ mod tests {
             kline_history_bars_4h: 120,
             kline_history_bars_1d: 120,
             kline_history_fill_1d_from_db: true,
-            fvg_windows: vec!["1h".to_string(), "4h".to_string(), "1d".to_string()],
+            fvg_windows: vec![
+                "15m".to_string(),
+                "4h".to_string(),
+                "1d".to_string(),
+                "3d".to_string(),
+            ],
             fvg_fill_from_db: true,
-            fvg_db_bars_1h: 256,
             fvg_db_bars_4h: 256,
             fvg_db_bars_1d: 256,
             fvg_epsilon_gap_ticks: 2,
@@ -630,7 +1144,6 @@ mod tests {
             fvg_max_gap_atr_ratio: 1.20,
             fvg_mitigated_fill_threshold: 0.80,
             fvg_invalid_close_bars: 1,
-            kline_history_futures_1h_db: Vec::new(),
             kline_history_futures_4h_db: Vec::new(),
             kline_history_futures_1d_db: Vec::new(),
             kline_history_spot_4h_db: Vec::new(),
@@ -840,9 +1353,13 @@ mod tests {
             kline_history_bars_4h: 120,
             kline_history_bars_1d: 120,
             kline_history_fill_1d_from_db: true,
-            fvg_windows: vec!["1h".to_string(), "4h".to_string(), "1d".to_string()],
+            fvg_windows: vec![
+                "15m".to_string(),
+                "4h".to_string(),
+                "1d".to_string(),
+                "3d".to_string(),
+            ],
             fvg_fill_from_db: true,
-            fvg_db_bars_1h: 256,
             fvg_db_bars_4h: 256,
             fvg_db_bars_1d: 256,
             fvg_epsilon_gap_ticks: 2,
@@ -853,7 +1370,6 @@ mod tests {
             fvg_max_gap_atr_ratio: 1.20,
             fvg_mitigated_fill_threshold: 0.80,
             fvg_invalid_close_bars: 1,
-            kline_history_futures_1h_db: Vec::new(),
             kline_history_futures_4h_db: Vec::new(),
             kline_history_futures_1d_db: Vec::new(),
             kline_history_spot_4h_db: Vec::new(),
@@ -1017,9 +1533,13 @@ mod tests {
             kline_history_bars_4h: 120,
             kline_history_bars_1d: 120,
             kline_history_fill_1d_from_db: true,
-            fvg_windows: vec!["1h".to_string(), "4h".to_string(), "1d".to_string()],
+            fvg_windows: vec![
+                "15m".to_string(),
+                "4h".to_string(),
+                "1d".to_string(),
+                "3d".to_string(),
+            ],
             fvg_fill_from_db: true,
-            fvg_db_bars_1h: 256,
             fvg_db_bars_4h: 256,
             fvg_db_bars_1d: 256,
             fvg_epsilon_gap_ticks: 2,
@@ -1030,7 +1550,6 @@ mod tests {
             fvg_max_gap_atr_ratio: 1.20,
             fvg_mitigated_fill_threshold: 0.80,
             fvg_invalid_close_bars: 1,
-            kline_history_futures_1h_db: Vec::new(),
             kline_history_futures_4h_db: Vec::new(),
             kline_history_futures_1d_db: Vec::new(),
             kline_history_spot_4h_db: Vec::new(),
@@ -1121,5 +1640,26 @@ mod tests {
         assert_eq!(levels[0]["level_rank"].as_i64(), Some(1));
         assert_eq!(levels[1]["price_level"].as_f64(), Some(1.01));
         assert_eq!(levels[1]["level_rank"].as_i64(), Some(2));
+    }
+
+    #[test]
+    fn pvs_v2_zones_do_not_expand_beyond_candidate_bins() {
+        let smoothed = vec![0.1, 1.0, 0.85, 0.1];
+        let zones = build_node_zones(
+            &smoothed,
+            1.0,
+            PvsV2WindowConfig {
+                rows: 4,
+                hvn_pct_of_poc: 0.8,
+                lvn_pct_of_poc: 0.2,
+                strength: 1,
+                min_zone_width_bins: 1,
+            },
+            true,
+        );
+
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].start_idx, 1);
+        assert_eq!(zones[0].end_idx, 1);
     }
 }

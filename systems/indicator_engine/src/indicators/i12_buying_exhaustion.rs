@@ -117,14 +117,6 @@ pub(crate) fn detect_exhaustion_all_history(ctx: &IndicatorContext) -> Vec<Exhau
     out
 }
 
-pub(crate) fn detect_exhaustion_events(ctx: &IndicatorContext) -> Vec<ExhaustionEventData> {
-    let current_available_ts = ctx.ts_bucket + Duration::minutes(1);
-    detect_exhaustion_all_history(ctx)
-        .into_iter()
-        .filter(|event| event.confirm_ts == current_available_ts)
-        .collect()
-}
-
 pub(crate) fn exhaustion_event_json(
     symbol: &str,
     indicator_code: &'static str,
@@ -214,12 +206,6 @@ pub(crate) fn append_exhaustion_rows(
             payload_json,
         });
     }
-}
-
-pub(crate) fn parse_rfc3339_utc(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|ts| ts.with_timezone(&chrono::Utc))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -536,15 +522,11 @@ impl Indicator for I12BuyingExhaustion {
                 indicator_code: self.code(),
                 window_code: "1m",
                 payload_json: json!({
-                    "event_count": window_view.current_events.len(),
-                    "events": window_view.current_events,
-                    "latest": window_view.latest_current,
                     "recent_7d": build_recent_7d_payload(
                         window_view.recent_events,
                         lookback_covered_minutes,
                         "in_memory_minute_history"
-                    ),
-                    "latest_7d": window_view.latest_recent
+                    )
                 }),
             }),
             ..Default::default()

@@ -166,9 +166,10 @@ fn closed_htf_bars(
     current_minute_close: DateTime<Utc>,
 ) -> Vec<KlineHistoryBar> {
     let tf_minutes = match tf {
-        "1h" => 60,
+        "15m" => 15,
         "4h" => 240,
         "1d" => 1440,
+        "3d" => 4320,
         _ => return Vec::new(),
     };
     let mut merged = BTreeMap::new();
@@ -197,7 +198,6 @@ fn closed_htf_bars(
 
 fn fvg_db_bars<'a>(ctx: &'a IndicatorContext, tf: &str) -> &'a [KlineHistoryBar] {
     match tf {
-        "1h" => &ctx.kline_history_futures_1h_db,
         "4h" => &ctx.kline_history_futures_4h_db,
         "1d" => &ctx.kline_history_futures_1d_db,
         _ => &[],
@@ -507,9 +507,10 @@ fn is_active_state(state: &str) -> bool {
 
 fn as_fvg_window(code: &str) -> Option<&'static str> {
     match code {
-        "1h" => Some("1h"),
+        "15m" => Some("15m"),
         "4h" => Some("4h"),
         "1d" => Some("1d"),
+        "3d" => Some("3d"),
         _ => None,
     }
 }

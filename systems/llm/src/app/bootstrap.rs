@@ -56,6 +56,8 @@ pub async fn bootstrap() -> Result<AppContext> {
         execution_hedge_mode = config.llm.execution.hedge_mode,
         execution_entry_sl_remap_enabled = config.llm.execution.entry_sl_remap.enabled,
         execution_entry_to_sl_distance_pct = config.llm.execution.entry_sl_remap.entry_to_sl_distance_pct,
+        execution_min_distance_v = config.llm.execution.min_distance_v,
+        execution_min_rr = config.llm.execution.min_rr,
         claude_batch_poll_interval_secs = config.api.claude.batch_poll_interval_secs,
         model_count = enabled_models.len(),
         models = %enabled_models.join(","),
@@ -118,6 +120,8 @@ pub async fn bootstrap() -> Result<AppContext> {
         execution_hedge_mode = config.llm.execution.hedge_mode,
         execution_entry_sl_remap_enabled = config.llm.execution.entry_sl_remap.enabled,
         execution_entry_to_sl_distance_pct = config.llm.execution.entry_sl_remap.entry_to_sl_distance_pct,
+        execution_min_distance_v = config.llm.execution.min_distance_v,
+        execution_min_rr = config.llm.execution.min_rr,
         rest_proxy_enabled = rest_proxy_url.is_some(),
         producer_instance_id = %producer_instance_id,
         "llm bootstrap completed"

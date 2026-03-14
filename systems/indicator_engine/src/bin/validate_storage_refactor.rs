@@ -1398,7 +1398,6 @@ async fn compute_snapshots(
         runtime_options.ema_db_bars_1d,
         runtime_options.fvg_fill_from_db,
         &runtime_options.fvg_windows,
-        runtime_options.fvg_db_bars_1h,
         runtime_options.fvg_db_bars_4h,
         runtime_options.fvg_db_bars_1d,
         bundle.ts_bucket + ChronoDuration::minutes(1),
@@ -1415,9 +1414,11 @@ async fn compute_snapshots(
             .then_with(|| a.window_code.cmp(b.window_code))
     });
 
-    if snapshots.len() != 23 {
+    let expected_snapshot_count = registry.len();
+    if snapshots.len() != expected_snapshot_count {
         bail!(
-            "expected 23 indicator snapshots at minute {}, got {}",
+            "expected {} indicator snapshots at minute {}, got {}",
+            expected_snapshot_count,
             bundle.ts_bucket,
             snapshots.len()
         );
@@ -1442,7 +1443,7 @@ fn compare_snapshot_sets(
 ) -> Result<()> {
     let old_map = snapshot_map(old_snapshots);
     let new_map = snapshot_map(new_snapshots);
-    if old_map.len() != 23 || new_map.len() != 23 {
+    if old_map.len() != new_map.len() {
         bail!(
             "minute {} snapshot coverage mismatch old={} new={}",
             minute,

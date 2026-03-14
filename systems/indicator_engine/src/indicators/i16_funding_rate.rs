@@ -33,19 +33,16 @@ impl Indicator for I16FundingRate {
         let mark_price_last = mark_price_last_pair.map(|(_, v)| v);
         let mark_price_last_ts = mark_price_last_pair.map(|(ts, _)| ts.to_rfc3339());
         let mark_price_twap = ctx.mark_twap_1m().or(mark_price_last);
-        let mut changes_sorted = ctx.funding_changes_in_window.iter().collect::<Vec<_>>();
-        changes_sorted.sort_by_key(|c| c.ts_change);
-        let changes = changes_sorted
+        let recent_cutoff = end - Duration::days(7);
+        let mut recent_changes = ctx
+            .funding_changes_recent
             .iter()
-            .map(|c| {
-                json!({
-                    "change_ts": c.ts_change.to_rfc3339(),
-                    "funding_prev": c.prev,
-                    "funding_new": c.new,
-                    "funding_delta": c.delta,
-                    "mark_price_at_change": c.mark_price_at_change
-                })
-            })
+            .filter(|c| c.ts_change >= recent_cutoff && c.ts_change < end)
+            .collect::<Vec<_>>();
+        recent_changes.sort_by_key(|c| c.ts_change);
+        let recent_7d = recent_changes
+            .iter()
+            .map(|c| funding_change_json(c))
             .collect::<Vec<_>>();
 
         IndicatorComputation {
@@ -59,8 +56,7 @@ impl Indicator for I16FundingRate {
                     "mark_price_last": mark_price_last,
                     "mark_price_last_ts": mark_price_last_ts,
                     "mark_price_twap": mark_price_twap,
-                    "change_count": changes.len(),
-                    "changes": changes,
+                    "recent_7d": recent_7d,
                     "by_window": Value::Object(by_window)
                 }),
             }),
@@ -124,15 +120,7 @@ fn compute_window_metrics(ctx: &IndicatorContext, mins: i64, label: &str) -> Val
     changes_in_win.sort_by_key(|c| c.ts_change);
     let changes = changes_in_win
         .iter()
-        .map(|c| {
-            json!({
-                "change_ts": c.ts_change.to_rfc3339(),
-                "funding_prev": c.prev,
-                "funding_new": c.new,
-                "funding_delta": c.delta,
-                "mark_price_at_change": c.mark_price_at_change
-            })
-        })
+        .map(|c| funding_change_json(c))
         .collect::<Vec<_>>();
 
     json!({
@@ -145,6 +133,16 @@ fn compute_window_metrics(ctx: &IndicatorContext, mins: i64, label: &str) -> Val
         "mark_price_twap": mark_price_twap,
         "change_count": changes.len(),
         "changes": changes
+    })
+}
+
+fn funding_change_json(change: &crate::runtime::state_store::FundingChange) -> Value {
+    json!({
+        "change_ts": change.ts_change.to_rfc3339(),
+        "funding_prev": change.prev,
+        "funding_new": change.new,
+        "funding_delta": change.delta,
+        "mark_price_at_change": change.mark_price_at_change
     })
 }
 
