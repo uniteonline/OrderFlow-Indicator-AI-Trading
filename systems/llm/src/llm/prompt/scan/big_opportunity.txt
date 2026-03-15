@@ -33,26 +33,22 @@ Return JSON only. No markdown. No extra top-level keys.
     "15m": {
       "trend": "Bullish" or "Bearish" or "Sideways",
       "signal_agreement": "strong" or "mixed" or "conflicted",
-      "range": { "support": <number>, "resistance": <number> },
-      "story": "<full reasoning: all material indicator fields and values used, contradicting signals named and explained>"
+      "range": { "support": <number>, "resistance": <number> }
     },
     "4h": {
       "trend": "Bullish" or "Bearish" or "Sideways",
       "signal_agreement": "strong" or "mixed" or "conflicted",
-      "range": { "support": <number>, "resistance": <number> },
-      "story": "<full reasoning: all material indicator fields and values used, contradicting signals named and explained>"
+      "range": { "support": <number>, "resistance": <number> }
     },
     "1d": {
       "trend": "Bullish" or "Bearish" or "Sideways",
       "signal_agreement": "strong" or "mixed" or "conflicted",
-      "range": { "support": <number>, "resistance": <number> },
-      "story": "<full reasoning: all material indicator fields and values used, contradicting signals named and explained>"
+      "range": { "support": <number>, "resistance": <number> }
     }
   },
   "flow_context": {
     "dominant_bias": "bullish" or "bearish" or "neutral",
-    "key_signals": ["<signal 1>", "<signal 2>"],
-    "story": "<cross-timeframe flow assessment citing specific fields and values>"
+    "key_signals": ["<signal 1>", "<signal 2>"]
   },
   "market_narrative": "<how 15m/4h/1d relate and what the dominant context is>"
 }

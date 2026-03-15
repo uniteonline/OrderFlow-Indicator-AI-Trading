@@ -3,7 +3,7 @@ Use ONLY the provided indicators and market scan. Do not invent signals.
 
 WHAT YOU RECEIVE
 - Core price and order-flow indicator snapshot (real-time)
-- Real-time market scan: 15m, 4h, 1d trend direction, signal agreement, structural range, and story
+- Real-time market scan: 15m, 4h, 1d trend direction, signal agreement, and structural range
 - Position context: entry price, tp, sl, direction, horizon, original entry reasoning
 
 GOAL

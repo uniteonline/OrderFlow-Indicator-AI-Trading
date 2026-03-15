@@ -311,13 +311,21 @@ fn build_prompt_pair(
         prompt::user_prompt_prefix(input.management_mode, input.pending_order_mode, entry_stage,),
         input_json
     );
-    if matches!(entry_stage, prompt::EntryPromptStage::Finalize) {
-        let scan = prior_scan.ok_or_else(|| {
+    let sanitized_prior_scan = if matches!(entry_stage, prompt::EntryPromptStage::Finalize) {
+        Some(sanitize_scan_for_stage2(prior_scan.ok_or_else(|| {
             provider_failure_plain(anyhow!("finalize stage requires prior market scan json"))
-        })?;
-        let scan_json = serde_json::to_string(scan)
-            .context("serialize market scan json")
-            .map_err(provider_failure_plain)?;
+        })?))
+    } else {
+        None
+    };
+    if matches!(entry_stage, prompt::EntryPromptStage::Finalize) {
+        let scan_json = serde_json::to_string(
+            sanitized_prior_scan
+                .as_ref()
+                .expect("finalize stage should produce sanitized scan"),
+        )
+        .context("serialize market scan json")
+        .map_err(provider_failure_plain)?;
         user.push_str("\n\nSTAGE_1_MARKET_SCAN_JSON:\n");
         user.push_str(&scan_json);
     }
@@ -325,7 +333,7 @@ fn build_prompt_pair(
         stage: entry_stage_name(entry_stage).to_string(),
         prompt_input,
         stage_1_setup_scan_json: if matches!(entry_stage, prompt::EntryPromptStage::Finalize) {
-            prior_scan.cloned()
+            sanitized_prior_scan
         } else {
             None
         },
@@ -404,11 +412,6 @@ fn validate_scan_output(value: &Value) -> Result<()> {
                 tf
             ));
         }
-        tf_obj
-            .get("story")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow!("scan timeframe_analysis.{}.story must be non-empty", tf))?;
     }
     value
         .get("flow_context")
@@ -423,6 +426,30 @@ fn validate_scan_output(value: &Value) -> Result<()> {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!("scan market_narrative must be non-empty"))?;
     Ok(())
+}
+
+fn sanitize_scan_for_stage2(value: &Value) -> Value {
+    let mut sanitized = value.clone();
+    if let Some(timeframe_analysis) = sanitized
+        .get_mut("timeframe_analysis")
+        .and_then(Value::as_object_mut)
+    {
+        for tf in ["15m", "4h", "1d"] {
+            if let Some(tf_obj) = timeframe_analysis
+                .get_mut(tf)
+                .and_then(Value::as_object_mut)
+            {
+                tf_obj.remove("story");
+            }
+        }
+    }
+    if let Some(flow_context) = sanitized
+        .get_mut("flow_context")
+        .and_then(Value::as_object_mut)
+    {
+        flow_context.remove("story");
+    }
+    sanitized
 }
 
 pub async fn invoke_models(
@@ -1192,9 +1219,9 @@ fn qwen_output_contract(
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `decision`, `reason`, and `params`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- Allowed decisions: VALID, INVALID, ADJUST.\n- `params` must always be present.\n- For VALID: keep `params` present; action fields may be null.\n- For INVALID: set `params.close_price` to a number or null.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], [\"tp\",\"sl\"], [\"add\"], or [\"reduce\"]), and corresponding values: `new_tp`/`new_sl` for tp/sl adjustments, `qty_ratio` (number 0-1) for add/reduce.\n".to_string()
     } else if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
         if is_medium_large(prompt_template) {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `timeframe_analysis`, `flow_context`, and `market_narrative`.\n- `timeframe_analysis` must contain exactly `15m`, `4h`, and `1d`.\n- Each timeframe must include `trend`, `signal_agreement`, `range`, and `story`.\n- `flow_context` must include `dominant_bias`, `key_signals`, and `story`.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `timeframe_analysis`, `flow_context`, and `market_narrative`.\n- `timeframe_analysis` must contain exactly `15m`, `4h`, and `1d`.\n- Each timeframe must include `trend`, `signal_agreement`, and `range`.\n- `flow_context` must include `dominant_bias` and `key_signals`.\n".to_string()
         } else {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `timeframe_analysis`, `flow_context`, and `market_narrative`.\n- `timeframe_analysis` must contain exactly `15m`, `4h`, and `1d`.\n- Each timeframe must include `trend`, `signal_agreement`, `range`, and `story`.\n- `flow_context` must include `dominant_bias`, `key_signals`, and `story`.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `timeframe_analysis`, `flow_context`, and `market_narrative`.\n- `timeframe_analysis` must contain exactly `15m`, `4h`, and `1d`.\n- Each timeframe must include `trend`, `signal_agreement`, and `range`.\n- `flow_context` must include `dominant_bias` and `key_signals`.\n".to_string()
         }
     } else {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must be `decision`, `reason`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, and `params.horizon` to null.\n".to_string()
@@ -1338,11 +1365,10 @@ fn qwen_entry_scan_response_schema() -> Value {
             },
             "flow_context": {
                 "type": "object",
-                "required": ["dominant_bias", "key_signals", "story"],
+                "required": ["dominant_bias", "key_signals"],
                 "properties": {
                     "dominant_bias": { "type": "string" },
-                    "key_signals": { "type": "array", "items": { "type": "string" } },
-                    "story": { "type": "string" }
+                    "key_signals": { "type": "array", "items": { "type": "string" } }
                 }
             },
             "market_narrative": { "type": "string" }
@@ -1399,11 +1425,10 @@ fn custom_llm_entry_scan_response_schema() -> Value {
             "flow_context": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["dominant_bias", "key_signals", "story"],
+                "required": ["dominant_bias", "key_signals"],
                 "properties": {
                     "dominant_bias": { "type": "string" },
-                    "key_signals": { "type": "array", "items": { "type": "string" } },
-                    "story": { "type": "string" }
+                    "key_signals": { "type": "array", "items": { "type": "string" } }
                 }
             },
             "market_narrative": { "type": "string" }
@@ -2167,11 +2192,10 @@ fn grok_entry_scan_response_schema() -> Value {
             "flow_context": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["dominant_bias", "key_signals", "story"],
+                "required": ["dominant_bias", "key_signals"],
                 "properties": {
                     "dominant_bias": { "type": "string" },
-                    "key_signals": { "type": "array", "items": { "type": "string" } },
-                    "story": { "type": "string" }
+                    "key_signals": { "type": "array", "items": { "type": "string" } }
                 }
             },
             "market_narrative": { "type": "string" }
@@ -2270,7 +2294,7 @@ fn scan_timeframe_schema_grok() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["trend", "signal_agreement", "range", "story"],
+        "required": ["trend", "signal_agreement", "range"],
         "properties": {
             "trend": { "type": "string", "enum": ["Bullish", "Bearish", "Sideways"] },
             "signal_agreement": { "type": "string", "enum": ["strong", "mixed", "conflicted"] },
@@ -2282,8 +2306,7 @@ fn scan_timeframe_schema_grok() -> Value {
                     "support": { "type": "number" },
                     "resistance": { "type": "number" }
                 }
-            },
-            "story": { "type": "string" }
+            }
         }
     })
 }
@@ -2292,7 +2315,7 @@ fn scan_timeframe_schema_openai() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["trend", "signal_agreement", "range", "story"],
+        "required": ["trend", "signal_agreement", "range"],
         "properties": {
             "trend": { "type": "string", "enum": ["Bullish", "Bearish", "Sideways"] },
             "signal_agreement": { "type": "string", "enum": ["strong", "mixed", "conflicted"] },
@@ -2304,8 +2327,7 @@ fn scan_timeframe_schema_openai() -> Value {
                     "support": { "type": "number" },
                     "resistance": { "type": "number" }
                 }
-            },
-            "story": { "type": "string" }
+            }
         }
     })
 }
@@ -2323,10 +2345,9 @@ fn scan_timeframe_schema_gemini() -> Value {
                     "resistance": { "type": "NUMBER" }
                 },
                 "required": ["support", "resistance"]
-            },
-            "story": { "type": "STRING" }
+            }
         },
-        "required": ["trend", "signal_agreement", "range", "story"]
+        "required": ["trend", "signal_agreement", "range"]
     })
 }
 
@@ -2349,11 +2370,10 @@ fn ml_grok_entry_scan_schema() -> Value {
             "flow_context": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["dominant_bias", "key_signals", "story"],
+                "required": ["dominant_bias", "key_signals"],
                 "properties": {
                     "dominant_bias": { "type": "string" },
-                    "key_signals": { "type": "array", "items": { "type": "string" } },
-                    "story": { "type": "string" }
+                    "key_signals": { "type": "array", "items": { "type": "string" } }
                 }
             },
             "market_narrative": { "type": "string" }
@@ -2435,10 +2455,9 @@ fn ml_gemini_entry_scan_schema() -> Value {
                 "type": "OBJECT",
                 "properties": {
                     "dominant_bias": { "type": "STRING" },
-                    "key_signals": { "type": "ARRAY", "items": { "type": "STRING" } },
-                    "story": { "type": "STRING" }
+                    "key_signals": { "type": "ARRAY", "items": { "type": "STRING" } }
                 },
-                "required": ["dominant_bias", "key_signals", "story"]
+                "required": ["dominant_bias", "key_signals"]
             },
             "market_narrative": { "type": "STRING" }
         },
@@ -2515,11 +2534,10 @@ fn ml_qwen_entry_scan_schema() -> Value {
             },
             "flow_context": {
                 "type": "object",
-                "required": ["dominant_bias", "key_signals", "story"],
+                "required": ["dominant_bias", "key_signals"],
                 "properties": {
                     "dominant_bias": { "type": "string" },
-                    "key_signals": { "type": "array", "items": { "type": "string" } },
-                    "story": { "type": "string" }
+                    "key_signals": { "type": "array", "items": { "type": "string" } }
                 }
             },
             "market_narrative": { "type": "string" }
@@ -2574,11 +2592,10 @@ fn ml_custom_llm_entry_scan_schema() -> Value {
             "flow_context": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["dominant_bias", "key_signals", "story"],
+                "required": ["dominant_bias", "key_signals"],
                 "properties": {
                     "dominant_bias": { "type": "string" },
-                    "key_signals": { "type": "array", "items": { "type": "string" } },
-                    "story": { "type": "string" }
+                    "key_signals": { "type": "array", "items": { "type": "string" } }
                 }
             },
             "market_narrative": { "type": "string" }
@@ -2680,10 +2697,9 @@ fn gemini_entry_scan_response_schema() -> Value {
                 "type": "OBJECT",
                 "properties": {
                     "dominant_bias": { "type": "STRING" },
-                    "key_signals": { "type": "ARRAY", "items": { "type": "STRING" } },
-                    "story": { "type": "STRING" }
+                    "key_signals": { "type": "ARRAY", "items": { "type": "STRING" } }
                 },
-                "required": ["dominant_bias", "key_signals", "story"]
+                "required": ["dominant_bias", "key_signals"]
             },
             "market_narrative": { "type": "STRING" }
         },
@@ -3516,26 +3532,22 @@ mod tests {
                 "15m": {
                     "trend": "Bullish",
                     "signal_agreement": "strong",
-                    "range": {"support": 1994.0, "resistance": 2018.0},
-                    "story": "15m structure remains constructive"
+                    "range": {"support": 1994.0, "resistance": 2018.0}
                 },
                 "4h": {
                     "trend": "Bullish",
                     "signal_agreement": "mixed",
-                    "range": {"support": 1988.0, "resistance": 2035.0},
-                    "story": "4h value migration still intact"
+                    "range": {"support": 1988.0, "resistance": 2035.0}
                 },
                 "1d": {
                     "trend": "Sideways",
                     "signal_agreement": "mixed",
-                    "range": {"support": 1960.0, "resistance": 2050.0},
-                    "story": "daily auction remains rotational"
+                    "range": {"support": 1960.0, "resistance": 2050.0}
                 }
             },
             "flow_context": {
                 "dominant_bias": "bullish",
-                "key_signals": ["bid wall intact", "delta recovering"],
-                "story": "flow still leans mildly long"
+                "key_signals": ["bid wall intact", "delta recovering"]
             },
             "market_narrative": "15m and 4h constructive, 1d rotational"
         })
@@ -4107,6 +4119,7 @@ mod tests {
                 contract.contains("`timeframe_analysis`, `flow_context`, and `market_narrative`")
             );
             assert!(!contract.contains("`decision`, `reason`, and `scan`"));
+            assert!(!contract.contains("story"));
         }
     }
 
@@ -4132,14 +4145,13 @@ mod tests {
         };
         let scan = json!({
             "timeframe_analysis": {
-                "15m": { "trend": "Bullish", "signal_agreement": "mixed", "range": {"support": 2030.0, "resistance": 2060.0}, "story": "price above rvwap" },
-                "4h": { "trend": "Bullish", "signal_agreement": "strong", "range": {"support": 2020.0, "resistance": 2080.0}, "story": "4h structure bullish" },
-                "1d": { "trend": "Sideways", "signal_agreement": "mixed", "range": {"support": 2000.0, "resistance": 2100.0}, "story": "daily range rotation" }
+                "15m": { "trend": "Bullish", "signal_agreement": "mixed", "range": {"support": 2030.0, "resistance": 2060.0} },
+                "4h": { "trend": "Bullish", "signal_agreement": "strong", "range": {"support": 2020.0, "resistance": 2080.0} },
+                "1d": { "trend": "Sideways", "signal_agreement": "mixed", "range": {"support": 2000.0, "resistance": 2100.0} }
             },
             "flow_context": {
                 "dominant_bias": "bullish",
-                "key_signals": ["positive cvd", "whale buy"],
-                "story": "flow tilted long"
+                "key_signals": ["positive cvd", "whale buy"]
             },
             "market_narrative": "4h and 15m bullish, 1d neutral — tactical long bias"
         });
@@ -4204,14 +4216,13 @@ mod tests {
         };
         let scan = json!({
             "timeframe_analysis": {
-                "15m": { "trend": "Bullish", "signal_agreement": "strong", "range": {"support": 1995.0, "resistance": 2025.0}, "story": "price holding above orderbook_depth bid wall, obi positive" },
-                "4h": { "trend": "Bullish", "signal_agreement": "strong", "range": {"support": 1990.0, "resistance": 2030.0}, "story": "4h structure bullish, tpo_market_profile poc at 2004" },
-                "1d": { "trend": "Sideways", "signal_agreement": "mixed", "range": {"support": 1980.0, "resistance": 2040.0}, "story": "daily range rotation, rvwap_sigma_bands neutral" }
+                "15m": { "trend": "Bullish", "signal_agreement": "strong", "range": {"support": 1995.0, "resistance": 2025.0} },
+                "4h": { "trend": "Bullish", "signal_agreement": "strong", "range": {"support": 1990.0, "resistance": 2030.0} },
+                "1d": { "trend": "Sideways", "signal_agreement": "mixed", "range": {"support": 1980.0, "resistance": 2040.0} }
             },
             "flow_context": {
                 "dominant_bias": "bullish",
-                "key_signals": ["bid wall holding", "positive obi"],
-                "story": "orderbook_depth bid wall at 1998 acting as support, flow tilted long"
+                "key_signals": ["bid wall holding", "positive obi"]
             },
             "market_narrative": "15m and 4h bullish off dom liquidity wall, 1d neutral — tactical long bias"
         });
@@ -4428,14 +4439,13 @@ mod tests {
         };
         let scan = json!({
             "timeframe_analysis": {
-                "15m": { "trend": "Bullish", "signal_agreement": "mixed", "range": {"support": 1990.0, "resistance": 2015.0}, "story": "price_volume_structure val at 1990 holding as support" },
-                "4h": { "trend": "Bullish", "signal_agreement": "strong", "range": {"support": 1985.0, "resistance": 2020.0}, "story": "4h value area structure intact, kline_history confirms" },
-                "1d": { "trend": "Bullish", "signal_agreement": "mixed", "range": {"support": 1980.0, "resistance": 2025.0}, "story": "daily structure remains bullish" }
+                "15m": { "trend": "Bullish", "signal_agreement": "mixed", "range": {"support": 1990.0, "resistance": 2015.0} },
+                "4h": { "trend": "Bullish", "signal_agreement": "strong", "range": {"support": 1985.0, "resistance": 2020.0} },
+                "1d": { "trend": "Bullish", "signal_agreement": "mixed", "range": {"support": 1980.0, "resistance": 2025.0} }
             },
             "flow_context": {
                 "dominant_bias": "bullish",
-                "key_signals": ["value area re-fill", "flow long"],
-                "story": "price_volume_structure value migration setup"
+                "key_signals": ["value area re-fill", "flow long"]
             },
             "market_narrative": "15m and 4h bullish with value area re-fill setup — tactical long near val 1990"
         });
@@ -4476,6 +4486,16 @@ mod tests {
                 .and_then(Value::as_str),
             Some("bullish")
         );
+        assert!(capture
+            .stage_1_setup_scan_json
+            .as_ref()
+            .and_then(|value| value.pointer("/flow_context/story"))
+            .is_none());
+        assert!(capture
+            .stage_1_setup_scan_json
+            .as_ref()
+            .and_then(|value| value.pointer("/timeframe_analysis/15m/story"))
+            .is_none());
         assert_eq!(
             capture
                 .prompt_input
@@ -4799,6 +4819,16 @@ mod tests {
             Some(20)
         );
         assert!(capture.prompt_input.pointer("/finalize_focus").is_some());
+        assert!(capture
+            .stage_1_setup_scan_json
+            .as_ref()
+            .and_then(|value| value.pointer("/flow_context/story"))
+            .is_none());
+        assert!(capture
+            .stage_1_setup_scan_json
+            .as_ref()
+            .and_then(|value| value.pointer("/timeframe_analysis/15m/story"))
+            .is_none());
     }
 
     #[test]
