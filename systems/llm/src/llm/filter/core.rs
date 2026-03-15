@@ -1128,8 +1128,19 @@ mod tests {
                 .pointer("/indicators/orderbook_depth/payload/top_liquidity_levels")
                 .and_then(Value::as_array)
                 .map(Vec::len),
-            Some(80)
+            Some(20)
         );
+        let top_liquidity_levels = value
+            .pointer("/indicators/orderbook_depth/payload/top_liquidity_levels")
+            .and_then(Value::as_array)
+            .expect("entry top_liquidity_levels");
+        assert!(top_liquidity_levels.iter().all(|entry| {
+            entry
+                .get("price_level")
+                .and_then(Value::as_f64)
+                .map(|price| (1961.96..=2042.04).contains(&price))
+                .unwrap_or(false)
+        }));
         assert!(value
             .pointer("/indicators/orderbook_depth/payload/liquidity_walls/bid_walls")
             .is_some());
@@ -1198,6 +1209,9 @@ mod tests {
         );
         assert!(value
             .pointer("/indicators/funding_rate/payload/funding_trend_stats/avg_7d")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/funding_rate/payload/funding_summary/ema_8h")
             .is_some());
         assert_eq!(
             value
@@ -1295,6 +1309,68 @@ mod tests {
             .and_then(Value::as_f64)
             .expect("last va price");
         assert!(first_price >= last_price);
+    }
+
+    #[test]
+    fn entry_core_orderbook_top_levels_expand_to_three_pct_when_two_pct_too_sparse() {
+        let mut indicators = build_sample_indicators();
+        let levels = vec![
+            json!({"price_level": 2060.0, "bid_liquidity": 900.0, "ask_liquidity": 0.0, "total_liquidity": 900.0, "net_liquidity": 900.0, "level_imbalance": 1.0}),
+            json!({"price_level": 2065.0, "bid_liquidity": 850.0, "ask_liquidity": 0.0, "total_liquidity": 850.0, "net_liquidity": 850.0, "level_imbalance": 1.0}),
+            json!({"price_level": 2070.0, "bid_liquidity": 800.0, "ask_liquidity": 0.0, "total_liquidity": 800.0, "net_liquidity": 800.0, "level_imbalance": 1.0}),
+            json!({"price_level": 2075.0, "bid_liquidity": 780.0, "ask_liquidity": 0.0, "total_liquidity": 780.0, "net_liquidity": 780.0, "level_imbalance": 1.0}),
+            json!({"price_level": 2080.0, "bid_liquidity": 760.0, "ask_liquidity": 0.0, "total_liquidity": 760.0, "net_liquidity": 760.0, "level_imbalance": 1.0}),
+            json!({"price_level": 2085.0, "bid_liquidity": 740.0, "ask_liquidity": 0.0, "total_liquidity": 740.0, "net_liquidity": 740.0, "level_imbalance": 1.0}),
+            json!({"price_level": 2090.0, "bid_liquidity": 720.0, "ask_liquidity": 0.0, "total_liquidity": 720.0, "net_liquidity": 720.0, "level_imbalance": 1.0}),
+            json!({"price_level": 2095.0, "bid_liquidity": 700.0, "ask_liquidity": 0.0, "total_liquidity": 700.0, "net_liquidity": 700.0, "level_imbalance": 1.0}),
+            json!({"price_level": 2105.0, "bid_liquidity": 0.0, "ask_liquidity": 690.0, "total_liquidity": 690.0, "net_liquidity": -690.0, "level_imbalance": -1.0}),
+            json!({"price_level": 2110.0, "bid_liquidity": 0.0, "ask_liquidity": 680.0, "total_liquidity": 680.0, "net_liquidity": -680.0, "level_imbalance": -1.0}),
+            json!({"price_level": 2115.0, "bid_liquidity": 0.0, "ask_liquidity": 670.0, "total_liquidity": 670.0, "net_liquidity": -670.0, "level_imbalance": -1.0}),
+            json!({"price_level": 2120.0, "bid_liquidity": 0.0, "ask_liquidity": 660.0, "total_liquidity": 660.0, "net_liquidity": -660.0, "level_imbalance": -1.0}),
+        ];
+        indicators
+            .get_mut("orderbook_depth")
+            .and_then(Value::as_object_mut)
+            .and_then(|indicator| indicator.get_mut("payload"))
+            .and_then(Value::as_object_mut)
+            .expect("orderbook payload")
+            .insert("levels".to_string(), Value::Array(levels));
+        indicators
+            .get_mut("avwap")
+            .and_then(Value::as_object_mut)
+            .and_then(|indicator| indicator.get_mut("payload"))
+            .and_then(Value::as_object_mut)
+            .expect("avwap payload")
+            .insert("fut_mark_price".to_string(), Value::from(2100.0));
+        indicators
+            .get_mut("funding_rate")
+            .and_then(Value::as_object_mut)
+            .and_then(|indicator| indicator.get_mut("payload"))
+            .and_then(Value::as_object_mut)
+            .expect("funding payload")
+            .insert("mark_price_last".to_string(), Value::from(2100.0));
+
+        let input = sample_input(indicators, false, false);
+        let value = CoreFilter::build_value(&input).expect("build entry core value");
+
+        let top_levels = value
+            .pointer("/indicators/orderbook_depth/payload/top_liquidity_levels")
+            .and_then(Value::as_array)
+            .expect("entry top levels");
+        assert_eq!(top_levels.len(), 12);
+        assert!(top_levels.iter().all(|entry| {
+            entry
+                .get("price_level")
+                .and_then(Value::as_f64)
+                .map(|price| (2037.0..=2163.0).contains(&price))
+                .unwrap_or(false)
+        }));
+        assert!(top_levels
+            .iter()
+            .any(|entry| entry.get("price_level").and_then(Value::as_f64) == Some(2060.0)));
+        assert!(top_levels
+            .iter()
+            .any(|entry| entry.get("price_level").and_then(Value::as_f64) == Some(2120.0)));
     }
 
     #[test]

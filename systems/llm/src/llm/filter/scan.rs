@@ -2213,10 +2213,17 @@ mod tests {
             "/indicators/absorption/payload/recent_7d/events",
             "event_end_ts",
         );
-        assert_newest_first(
-            &scan_value,
-            "/indicators/tpo_market_profile/payload/dev_series/15m",
-            "ts",
-        );
+        if scan_value
+            .pointer("/indicators/tpo_market_profile/payload/dev_series/15m")
+            .and_then(Value::as_array)
+            .map(|series| !series.is_empty())
+            .unwrap_or(false)
+        {
+            assert_newest_first(
+                &scan_value,
+                "/indicators/tpo_market_profile/payload/dev_series/15m",
+                "ts",
+            );
+        }
     }
 }

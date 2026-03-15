@@ -18,6 +18,9 @@ pub(super) const EVENT_INDICATOR_RULES: &[(&str, usize)] = &[
 
 const HTF_IMBALANCE_CLUSTER_STEP_RATIO: f64 = 0.005;
 const ORDERBOOK_NEAR_MARK_PCT: f64 = 0.20;
+const ENTRY_ORDERBOOK_TOP_LEVEL_PRIMARY_PCT: f64 = 0.02;
+const ENTRY_ORDERBOOK_TOP_LEVEL_FALLBACK_PCT: f64 = 0.03;
+const ENTRY_ORDERBOOK_TOP_LEVEL_MIN_COUNT: usize = 10;
 const DETAILED_TOP_VOLUME_LEVELS: usize = 10;
 const DETAILED_IMBALANCE_LEVELS_PER_SIDE: usize = 20;
 const DEFENSIVE_IMBALANCE_LEVELS_PER_SIDE: usize = 10;
@@ -414,6 +417,15 @@ pub(super) fn filter_orderbook_depth_entry_v3(
     };
     let mut result = filter_orderbook_depth(payload, mark_price, top_limit);
     if let Some(result_obj) = result.as_object_mut() {
+        let top_liquidity_levels = payload_obj
+            .get("levels")
+            .and_then(Value::as_array)
+            .map(|levels| build_entry_top_liquidity_levels(levels, mark_price, top_limit))
+            .unwrap_or_default();
+        result_obj.insert(
+            "top_liquidity_levels".to_string(),
+            Value::Array(top_liquidity_levels),
+        );
         let liquidity_walls = payload_obj
             .get("levels")
             .and_then(Value::as_array)
@@ -767,6 +779,10 @@ pub(super) fn filter_funding_rate_entry_v3(payload: &Value) -> Value {
     result.insert(
         "funding_trend_stats".to_string(),
         build_funding_trend_stats(&funding_trend_hourly),
+    );
+    result.insert(
+        "funding_summary".to_string(),
+        build_funding_summary_alias(payload.get("recent_7d").and_then(Value::as_array)),
     );
 
     Value::Object(result)
@@ -1414,9 +1430,27 @@ fn build_top_liquidity_levels(
     mark_price: Option<f64>,
     limit: usize,
 ) -> Vec<Value> {
-    let lower_bound = mark_price.map(|price| price * (1.0 - ORDERBOOK_NEAR_MARK_PCT));
-    let upper_bound = mark_price.map(|price| price * (1.0 + ORDERBOOK_NEAR_MARK_PCT));
+    build_top_liquidity_levels_with_distance(levels, mark_price, limit, ORDERBOOK_NEAR_MARK_PCT)
+}
 
+fn build_top_liquidity_levels_with_distance(
+    levels: &[Value],
+    mark_price: Option<f64>,
+    limit: usize,
+    distance_pct: f64,
+) -> Vec<Value> {
+    let lower_bound = mark_price.map(|price| price * (1.0 - distance_pct));
+    let upper_bound = mark_price.map(|price| price * (1.0 + distance_pct));
+
+    build_top_liquidity_levels_in_bounds(levels, lower_bound, upper_bound, limit)
+}
+
+fn build_top_liquidity_levels_in_bounds(
+    levels: &[Value],
+    lower_bound: Option<f64>,
+    upper_bound: Option<f64>,
+    limit: usize,
+) -> Vec<Value> {
     let mut sorted = levels
         .iter()
         .filter_map(|entry| entry.as_object().cloned())
@@ -1458,6 +1492,33 @@ fn build_top_liquidity_levels(
             })
         })
         .collect()
+}
+
+fn build_entry_top_liquidity_levels(
+    levels: &[Value],
+    mark_price: Option<f64>,
+    limit: usize,
+) -> Vec<Value> {
+    let primary = build_top_liquidity_levels_with_distance(
+        levels,
+        mark_price,
+        limit,
+        ENTRY_ORDERBOOK_TOP_LEVEL_PRIMARY_PCT,
+    );
+    if mark_price.is_none() || primary.len() >= ENTRY_ORDERBOOK_TOP_LEVEL_MIN_COUNT {
+        return primary;
+    }
+    let fallback = build_top_liquidity_levels_with_distance(
+        levels,
+        mark_price,
+        limit,
+        ENTRY_ORDERBOOK_TOP_LEVEL_FALLBACK_PCT,
+    );
+    if fallback.is_empty() {
+        primary
+    } else {
+        fallback
+    }
 }
 
 fn build_liquidity_walls(levels: &[Value], mid_price: Option<f64>) -> Value {
@@ -1788,6 +1849,124 @@ fn build_funding_trend_stats(hourly: &[Value]) -> Value {
         "slope_per_hour": slope_per_hour,
         "pct_negative_hours": pct_negative_hours,
     })
+}
+
+fn build_funding_summary_alias(recent_events: Option<&Vec<Value>>) -> Value {
+    let Some(events) = recent_events else {
+        return json!({
+            "ema_8h": Value::Null,
+            "ema_24h": Value::Null,
+            "z_score_7d": Value::Null,
+            "consecutive_direction_hours": 0,
+        });
+    };
+
+    let mut parsed = events
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(|entry| {
+            Some((
+                entry.get("change_ts")?.as_str()?.to_string(),
+                entry.get("funding_new")?.as_f64()?,
+            ))
+        })
+        .collect::<Vec<_>>();
+    parsed.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut hourly: BTreeMap<String, (f64, usize)> = BTreeMap::new();
+    let mut all_values = Vec::new();
+    for (ts, funding_new) in &parsed {
+        all_values.push(*funding_new);
+        let Some(bucket_key) = hour_bucket_iso(ts) else {
+            continue;
+        };
+        let bucket = hourly.entry(bucket_key).or_insert((0.0, 0));
+        bucket.0 += *funding_new;
+        bucket.1 += 1;
+    }
+
+    let hourly_values = hourly
+        .into_iter()
+        .map(|(_, (sum, count))| if count > 0 { sum / count as f64 } else { 0.0 })
+        .collect::<Vec<_>>();
+    let last_8h = take_tail_values(&hourly_values, 8);
+    let last_24h = take_tail_values(&hourly_values, 24);
+    let ema_8h = ema_value(&last_8h);
+    let ema_24h = ema_value(&last_24h);
+    let latest = all_values.last().copied();
+    let z_score_7d = z_score_value(latest, &all_values);
+    let consecutive_direction_hours = consecutive_direction_hours_value(&hourly_values);
+
+    json!({
+        "ema_8h": ema_8h,
+        "ema_24h": ema_24h,
+        "z_score_7d": z_score_7d,
+        "consecutive_direction_hours": consecutive_direction_hours,
+    })
+}
+
+fn take_tail_values(values: &[f64], limit: usize) -> Vec<f64> {
+    if values.len() <= limit {
+        values.to_vec()
+    } else {
+        values[values.len() - limit..].to_vec()
+    }
+}
+
+fn ema_value(values: &[f64]) -> Value {
+    if values.is_empty() {
+        return Value::Null;
+    }
+    let alpha = 2.0 / (values.len() as f64 + 1.0);
+    let mut ema_value = values[0];
+    for value in values.iter().skip(1) {
+        ema_value = alpha * *value + (1.0 - alpha) * ema_value;
+    }
+    json!(ema_value)
+}
+
+fn z_score_value(current: Option<f64>, values: &[f64]) -> Value {
+    let Some(current) = current else {
+        return Value::Null;
+    };
+    if values.is_empty() {
+        return Value::Null;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / values.len() as f64;
+    let std_dev = variance.sqrt();
+    if std_dev > f64::EPSILON {
+        json!((current - mean) / std_dev)
+    } else {
+        json!(0.0)
+    }
+}
+
+fn consecutive_direction_hours_value(values: &[f64]) -> i64 {
+    let Some(&latest) = values.last() else {
+        return 0;
+    };
+    let sign = latest.partial_cmp(&0.0).unwrap_or(Ordering::Equal);
+    if sign == Ordering::Equal {
+        return 0;
+    }
+    let mut count = 0_i64;
+    for value in values.iter().rev() {
+        if value.partial_cmp(&0.0).unwrap_or(Ordering::Equal) == sign {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    if sign == Ordering::Less {
+        -count
+    } else {
+        count
+    }
 }
 
 fn aggregate_liquidation_hourly(entries: &[Value]) -> Vec<Value> {

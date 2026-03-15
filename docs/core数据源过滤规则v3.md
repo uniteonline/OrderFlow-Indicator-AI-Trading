@@ -103,6 +103,7 @@ v3 的所有变更均来自对 entry_core 实测样本的字节级分析，**每
 **v3 规则**：
 1. `funding_trend_hourly` 截断为最近 **24 个小时桶**（newest-first）
 2. 新增 `funding_trend_stats` 对象，基于原始 140 桶计算：
+3. 为兼容复用 `scan` 字段读取逻辑，额外补一个 alias：`funding_summary`
 
 ```json
 "funding_trend_stats": {
@@ -238,8 +239,16 @@ v3 的所有变更均来自对 entry_core 实测样本的字节级分析，**每
 **理由**：
 
 - `liquidity_walls` 更适合模型直接理解近价支撑/阻力带
-- `top_liquidity_levels` 仍保留逐档高流动性锚点，适合微观定价
+- `top_liquidity_levels` 仅保留近价逐档高流动性锚点，适合微观定价
 - 两者服务不同，不视为重复字段
+
+**entry_core 附加过滤规则**：
+
+- 先按 `mark_price` / `microprice_fut` 附近 `±2%` 过滤 `top_liquidity_levels`
+- 在过滤结果里按 `total_liquidity` 降序保留最多 `20` 条
+- 如果 `±2%` 内不足 `10` 条，则自动放宽到 `±3%`
+
+这样可以避免把 `1900`、`1980` 这类远离当前短线结构的大额深度错当成 maker entry 的主要锚点，同时仍保留足够的近价流动性层做 `entry / tp / sl` 精细定价。
 
 ---
 

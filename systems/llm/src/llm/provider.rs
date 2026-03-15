@@ -4796,7 +4796,7 @@ mod tests {
                 .pointer("/indicators/orderbook_depth/payload/top_liquidity_levels")
                 .and_then(Value::as_array)
                 .map(Vec::len),
-            Some(80)
+            Some(20)
         );
         assert!(capture.prompt_input.pointer("/finalize_focus").is_some());
     }

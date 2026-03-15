@@ -11,6 +11,7 @@ use serde_json::{Map, Value};
 const AVWAP_LIMITS: &[(&str, usize)] = &[("15m", 5), ("4h", 3), ("1d", 2)];
 const KLINE_LIMITS: &[(&str, usize)] = &[("15m", 20), ("4h", 12), ("1d", 8)];
 const CVD_LIMITS: &[(&str, usize)] = &[("15m", 15), ("4h", 8), ("1d", 5)];
+const ENTRY_TOP_LIQUIDITY_LEVELS_LIMIT: usize = 20;
 const ENTRY_EVENT_INDICATOR_RULES: &[(&str, usize)] = &[
     ("absorption", 10),
     ("buying_exhaustion", 10),
@@ -84,7 +85,11 @@ pub(super) fn filter_indicators(source: &Map<String, Value>) -> Map<String, Valu
         filter_liquidation_density_entry_v3,
     );
     core_shared::insert_filtered_indicator(&mut indicators, source, "orderbook_depth", |payload| {
-        filter_orderbook_depth_entry_v3(payload, resolve_reference_mark_price(source), 80)
+        filter_orderbook_depth_entry_v3(
+            payload,
+            resolve_reference_mark_price(source),
+            ENTRY_TOP_LIQUIDITY_LEVELS_LIMIT,
+        )
     });
 
     for (code, keep_last) in ENTRY_EVENT_INDICATOR_RULES {
