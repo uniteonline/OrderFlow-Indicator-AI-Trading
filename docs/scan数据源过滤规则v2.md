@@ -93,10 +93,10 @@ v2 与 v1 设计原则完全一致，补充一条去重原则：
 
 > **去除原因**：新数据源下 `levels` 结构包含 9 个字段（`buy_volume`/`sell_volume`/`delta`/`volume`/`price_level`/`is_hvn`/`is_lvn`/`is_in_value_area`/`level_rank`），1d 窗口 4692 条 ≈ 993KB，是 scan 文件体积爆炸的唯一根因。`poc_price`/`vah`/`val`/`hvn_levels`/`lvn_levels` 已是 Volume Profile 的通用摘要；实测 hvn_levels 在多数窗口为空，新增 `va_top_levels` 补充 VA 内部最高量锚点（实测 1d top-5 均为整数关口如 2090/2080/2130/2100/2098），是 scan 唯一需要的 VA 内部结构信息。
 
-#### `fvg`（~27KB → v2 ~23KB）
+#### `fvg`（~27KB → v2 ~1KB）
 
 - **保留窗口**：`15m`、`4h`、`1d`（丢弃 `3d`）
-- **每个窗口保留**：`fvgs`（全量列表）、`active_bull_fvgs`、`active_bear_fvgs`、`nearest_bull_fvg`、`nearest_bear_fvg`、`is_ready`、`coverage_ratio`
+- **每个窗口保留**：`active_bull_fvgs`、`active_bear_fvgs`、`nearest_bull_fvg`、`nearest_bear_fvg`、`is_ready`、`coverage_ratio`
 - **兼容字段**：每个 FVG item 在保留原始 `upper` / `lower` 的同时，额外补 `fvg_top = upper`、`fvg_bottom = lower`，方便下游统一按边界语义读取
 - **v2 新增：每个 FVG item 去掉以下冗余字段**：
 
@@ -106,7 +106,7 @@ v2 与 v1 设计原则完全一致，补充一条去重原则：
   | `event_available_ts` | 数据管道内部时间戳，非业务字段 |
   | `tf` | 值恒等于所在 by_window 的窗口名（如 `"15m"`），上下文已知 |
 
-  适用范围：`active_bull_fvgs[]`、`active_bear_fvgs[]`、`nearest_bull_fvg`、`nearest_bear_fvg`、`fvgs[]` 内所有 item。
+  适用范围：`active_bull_fvgs[]`、`active_bear_fvgs[]`、`nearest_bull_fvg`、`nearest_bear_fvg` 内所有 item。
 
 ---
 
@@ -235,11 +235,11 @@ v2 与 v1 设计原则完全一致，补充一条去重原则：
 
 ### 3.7 事件列表类（v2 新增字段去重）
 
-**截断条数与 v1 完全一致，v2 只增加对保留事件的冗余字段去除。**
+`scan` 不再保留通用 `initiation`，只保留方向化后的 `bullish_initiation` / `bearish_initiation`；其余保留事件继续做 newest-first 截断和字段去重。
 
 #### v2 新增：事件 item 通用去重规则
 
-适用所有事件类指标（`absorption`、`bullish_absorption`、`bearish_absorption`、`buying_exhaustion`、`selling_exhaustion`、`initiation`、`bullish_initiation`、`bearish_initiation`）中 `recent_7d.events[]` 内的每条事件：
+适用所有事件类指标（`absorption`、`bullish_absorption`、`bearish_absorption`、`buying_exhaustion`、`selling_exhaustion`、`bullish_initiation`、`bearish_initiation`）中 `recent_7d.events[]` 内的每条事件：
 
 | 字段 | 去除原因 |
 |------|---------|
@@ -258,7 +258,7 @@ v2 与 v1 设计原则完全一致，补充一条去重原则：
 
 > 不同指标的事件字段集不完全相同（如 exhaustion 类无 `spot_rdelta_mean`），去重时忽略不存在的字段。
 
-**initiation 家族额外去重**（仅适用于 `initiation`、`bullish_initiation`、`bearish_initiation`）：
+**initiation 家族额外去重**（仅适用于 `bullish_initiation`、`bearish_initiation`）：
 
 | 字段 | 去除原因 |
 |------|---------|
@@ -269,18 +269,17 @@ v2 与 v1 设计原则完全一致，补充一条去重原则：
 | `spot_cvd_change` | `cvd_pack` 提供更完整的 CVD 数据 |
 | `spot_rdelta_1m_mean` | `spot_break_confirm` 已是聚合结论 |
 
-#### 各指标截断条数（与 v1 相同）
+#### 各指标截断条数
 
 | 指标 | 截断规则 | v2 估算大小 |
 |------|---------|-----------|
 | `absorption` | 最近 20 条 | ~12KB |
 | `buying_exhaustion` | 最近 20 条 | ~13KB |
 | `selling_exhaustion` | 最近 20 条 | ~13KB |
-| `initiation` | 全量（约 50 条） | ~32KB |
 | `bullish_absorption` | 最近 20 条 | ~12KB |
 | `bearish_absorption` | 最近 20 条 | ~12KB |
-| `bullish_initiation` | 全量（约 21 条） | ~13KB |
-| `bearish_initiation` | 最近 20 条 | ~13KB |
+| `bullish_initiation` | 最近 10 条 | ~6KB |
+| `bearish_initiation` | 最近 10 条 | ~6KB |
 
 > 保留 `recent_7d` 内的元信息字段：`event_count`、`history_source`、`lookback_coverage_ratio`、`lookback_covered_minutes`、`lookback_missing_minutes`、`lookback_requested_minutes`
 
@@ -289,7 +288,7 @@ v2 与 v1 设计原则完全一致，补充一条去重原则：
 路径与其他事件不同，保留结构与 v1 相同：
 - 顶层保留：`signal`、`signals`、`latest_7d`、`event_count`、`divergence_type`、`likely_driver`、`spot_lead_score`、`pivot_side`、`reason`
 - `recent_7d.event_count` + `recent_7d.events` 最近 **20** 条
-- `candidates` 按 `score` 降序前 **5** 条（保留 `type`、`score`、`sig_pass`、`price_start`、`price_end`、`likely_driver`、`fut_divergence_sign`）
+- 不再保留 `candidates`
 
 **v2 新增：`recent_7d.events[]` 每条去除以下冗余字段**：
 
@@ -318,7 +317,7 @@ v2 与 v1 设计原则完全一致，补充一条去重原则：
 | `high_volume_pulse` | ~1KB | ~1KB | — | |
 | `tpo_market_profile` | ~7KB | ~7KB | — | |
 | `price_volume_structure` | **~1,800KB** | **~2KB** | **~1,798KB** | (数据源变更) levels 1.84MB → 丢弃；va_top_levels 5条 ~0.5KB/窗口 |
-| `fvg` | ~29KB | ~24KB | ~5KB | (事件去重) |
+| `fvg` | ~29KB | ~1KB | ~28KB | (仅保留 active + nearest) |
 | `kline_history` | ~8KB | ~8KB | — | |
 | `cvd_pack` | ~22KB | ~22KB | — | |
 | `avwap` | ~3KB | ~3KB | — | |
@@ -331,12 +330,11 @@ v2 与 v1 设计原则完全一致，补充一条去重原则：
 | `absorption` | ~21KB | ~11KB | ~10KB | (事件去重含v2新增4字段) |
 | `buying_exhaustion` | ~23KB | ~12KB | ~11KB | (事件去重含v2新增4字段) |
 | `selling_exhaustion` | ~23KB | ~12KB | ~11KB | (事件去重含v2新增4字段) |
-| `initiation` | ~54KB | ~29KB | ~25KB | (事件去重含v2新增4字段) |
 | `bullish_absorption` | ~21KB | ~11KB | ~10KB | (事件去重含v2新增4字段) |
 | `bearish_absorption` | ~21KB | ~11KB | ~10KB | (事件去重含v2新增4字段) |
-| `bullish_initiation` | ~24KB | ~13KB | ~11KB | (事件去重含v2新增4字段) |
-| `bearish_initiation` | ~23KB | ~12KB | ~11KB | (事件去重含v2新增4字段) |
-| `divergence` | ~24KB | ~19KB | ~5KB | (事件去重) |
+| `bullish_initiation` | ~24KB | ~6KB | ~18KB | (仅保留最近10条) |
+| `bearish_initiation` | ~23KB | ~6KB | ~17KB | (仅保留最近10条) |
+| `divergence` | ~24KB | ~15KB | ~9KB | (去掉 candidates) |
 | **合计** | **~2,175KB** | **~219KB** | **~1,956KB** | 主要节省来自 PVS levels 丢弃 |
 
 ---
@@ -369,7 +367,7 @@ const EVENT_DROP_FIELDS: &[&str] = &[
 const FVG_DROP_FIELDS: &[&str] = &["fvg_id", "event_available_ts", "tf"];
 ```
 
-在 `filter_fvg` 中，对 `active_bull_fvgs`、`active_bear_fvgs`（各为数组）、`nearest_bull_fvg`、`nearest_bear_fvg`（各为单对象）、`fvgs` 数组内所有 item 调用 `prune_fvg_item_fields`，并补充兼容 alias：`fvg_top = upper`、`fvg_bottom = lower`。
+在 `filter_fvg` 中，仅对 `active_bull_fvgs`、`active_bear_fvgs`（各为数组）、`nearest_bull_fvg`、`nearest_bear_fvg`（各为单对象）调用 `prune_fvg_item_fields`，并补充兼容 alias：`fvg_top = upper`、`fvg_bottom = lower`。
 
 **v2 新增备注 14：Divergence event 字段去重实现**
 

@@ -228,18 +228,32 @@ fn build_entry_scan_trace_event(
     provider: &str,
     raw_text: &str,
     parsed_scan: Option<&Value>,
+    latency_ms: u64,
 ) -> Value {
     json!({
         "stage": entry_stage_name(prompt::EntryPromptStage::Scan),
         "provider": provider,
+        "latency_ms": latency_ms,
         "raw_response_text": raw_text,
         "parsed_scan": parsed_scan.cloned(),
     })
 }
 
-fn build_entry_finalize_trace_event(input: &ModelInvocationInput, prior_scan: &Value) -> Value {
+fn build_entry_finalize_trace_event(
+    input: &ModelInvocationInput,
+    prior_scan: &Value,
+    latency_ms: Option<u64>,
+) -> Value {
     json!({
         "stage": entry_stage_name(prompt::EntryPromptStage::Finalize),
+        "stage_mode": if input.pending_order_mode {
+            "pending_order"
+        } else if input.management_mode {
+            "management"
+        } else {
+            "entry"
+        },
+        "latency_ms": latency_ms,
         "scan_15m_trend": prior_scan.pointer("/timeframe_analysis/15m/trend").cloned().unwrap_or(Value::Null),
         "scan_4h_trend": prior_scan.pointer("/timeframe_analysis/4h/trend").cloned().unwrap_or(Value::Null),
         "scan_1d_trend": prior_scan.pointer("/timeframe_analysis/1d/trend").cloned().unwrap_or(Value::Null),
@@ -253,6 +267,10 @@ fn build_entry_finalize_trace_event(input: &ModelInvocationInput, prior_scan: &V
 
 fn is_entry_mode(input: &ModelInvocationInput) -> bool {
     !input.management_mode && !input.pending_order_mode
+}
+
+fn elapsed_ms_u64(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn provider_trace_with_prompt_input_capture(
@@ -425,6 +443,8 @@ pub async fn invoke_models(
             temperature: 0.1,
             max_tokens: 1200,
             enable_thinking: None,
+            stage1_reasoning: None,
+            stage2_reasoning: None,
             reasoning: None,
         });
     }
@@ -438,6 +458,8 @@ pub async fn invoke_models(
             temperature: 0.1,
             max_tokens: 1200,
             enable_thinking: None,
+            stage1_reasoning: None,
+            stage2_reasoning: None,
             reasoning: None,
         });
     }
@@ -451,6 +473,8 @@ pub async fn invoke_models(
             temperature: 0.1,
             max_tokens: 1200,
             enable_thinking: None,
+            stage1_reasoning: None,
+            stage2_reasoning: None,
             reasoning: None,
         });
     }
@@ -464,6 +488,8 @@ pub async fn invoke_models(
             temperature: 0.1,
             max_tokens: 1200,
             enable_thinking: None,
+            stage1_reasoning: None,
+            stage2_reasoning: None,
             reasoning: None,
         });
     }
@@ -647,6 +673,7 @@ async fn invoke_qwen_two_stage(
     input: &ModelInvocationInput,
     prompt_template: &str,
 ) -> Result<ProviderSuccess, ProviderFailure> {
+    let scan_started = Instant::now();
     let scan = invoke_qwen_stage(
         http_client,
         qwen_cfg,
@@ -657,20 +684,27 @@ async fn invoke_qwen_two_stage(
         None,
     )
     .await?;
+    let scan_latency_ms = elapsed_ms_u64(scan_started);
     let scan_value = parse_entry_scan_output("qwen", &scan.raw_text).map_err(|failure| {
         let mut trace = scan.trace.clone();
-        trace.push_entry_stage_event(build_entry_scan_trace_event("qwen", &scan.raw_text, None));
+        trace.push_entry_stage_event(build_entry_scan_trace_event(
+            "qwen",
+            &scan.raw_text,
+            None,
+            scan_latency_ms,
+        ));
         ProviderFailure {
             error: failure.error.context("market scan stage failed"),
             trace,
         }
     })?;
-    let scan_event = build_entry_scan_trace_event("qwen", &scan.raw_text, Some(&scan_value));
+    let scan_event =
+        build_entry_scan_trace_event("qwen", &scan.raw_text, Some(&scan_value), scan_latency_ms);
     let scan_prompt_inputs = scan
         .trace
         .output_entry_stage_prompt_inputs()
         .unwrap_or_default();
-    let finalize_event = build_entry_finalize_trace_event(input, &scan_value);
+    let finalize_started = Instant::now();
     let finalize = invoke_qwen_stage(
         http_client,
         qwen_cfg,
@@ -685,9 +719,21 @@ async fn invoke_qwen_two_stage(
         error: failure.error,
         trace: failure
             .trace
-            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()])
+            .prepend_entry_stage_events(&[
+                scan_event.clone(),
+                build_entry_finalize_trace_event(
+                    input,
+                    &scan_value,
+                    Some(elapsed_ms_u64(finalize_started)),
+                ),
+            ])
             .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })?;
+    let finalize_event = build_entry_finalize_trace_event(
+        input,
+        &scan_value,
+        Some(elapsed_ms_u64(finalize_started)),
+    );
 
     Ok(ProviderSuccess {
         raw_text: finalize.raw_text,
@@ -831,6 +877,7 @@ async fn invoke_custom_llm_two_stage(
     input: &ModelInvocationInput,
     prompt_template: &str,
 ) -> Result<ProviderSuccess, ProviderFailure> {
+    let scan_started = Instant::now();
     let scan = invoke_custom_llm_stage(
         http_client,
         custom_llm_cfg,
@@ -841,24 +888,31 @@ async fn invoke_custom_llm_two_stage(
         None,
     )
     .await?;
+    let scan_latency_ms = elapsed_ms_u64(scan_started);
     let scan_value = parse_entry_scan_output("custom_llm", &scan.raw_text).map_err(|failure| {
         let mut trace = scan.trace.clone();
         trace.push_entry_stage_event(build_entry_scan_trace_event(
             "custom_llm",
             &scan.raw_text,
             None,
+            scan_latency_ms,
         ));
         ProviderFailure {
             error: failure.error.context("market scan stage failed"),
             trace,
         }
     })?;
-    let scan_event = build_entry_scan_trace_event("custom_llm", &scan.raw_text, Some(&scan_value));
+    let scan_event = build_entry_scan_trace_event(
+        "custom_llm",
+        &scan.raw_text,
+        Some(&scan_value),
+        scan_latency_ms,
+    );
     let scan_prompt_inputs = scan
         .trace
         .output_entry_stage_prompt_inputs()
         .unwrap_or_default();
-    let finalize_event = build_entry_finalize_trace_event(input, &scan_value);
+    let finalize_started = Instant::now();
     let finalize = invoke_custom_llm_stage(
         http_client,
         custom_llm_cfg,
@@ -873,9 +927,21 @@ async fn invoke_custom_llm_two_stage(
         error: failure.error,
         trace: failure
             .trace
-            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()])
+            .prepend_entry_stage_events(&[
+                scan_event.clone(),
+                build_entry_finalize_trace_event(
+                    input,
+                    &scan_value,
+                    Some(elapsed_ms_u64(finalize_started)),
+                ),
+            ])
             .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })?;
+    let finalize_event = build_entry_finalize_trace_event(
+        input,
+        &scan_value,
+        Some(elapsed_ms_u64(finalize_started)),
+    );
 
     Ok(ProviderSuccess {
         raw_text: finalize.raw_text,
@@ -927,7 +993,7 @@ async fn invoke_custom_llm_stage(
             prompt_template,
         )),
         enable_thinking: None,
-        reasoning: custom_llm_reasoning(model),
+        reasoning: custom_llm_reasoning(model, entry_stage),
         stream: None,
     };
 
@@ -993,11 +1059,12 @@ fn chat_completions_url(base_api_url: &str) -> String {
     }
 }
 
-fn custom_llm_reasoning(model: &LlmModelConfig) -> Option<OpenAiCompatibleReasoningConfig> {
-    let effort = model.reasoning.as_deref()?.trim();
-    if effort.is_empty() {
-        return None;
-    }
+fn custom_llm_reasoning(
+    model: &LlmModelConfig,
+    entry_stage: prompt::EntryPromptStage,
+) -> Option<OpenAiCompatibleReasoningConfig> {
+    let effort =
+        model.reasoning_for_stage(matches!(entry_stage, prompt::EntryPromptStage::Scan))?;
     Some(OpenAiCompatibleReasoningConfig {
         effort: effort.to_string(),
     })
@@ -1500,6 +1567,7 @@ async fn invoke_gemini_two_stage(
     input: &ModelInvocationInput,
     prompt_template: &str,
 ) -> Result<ProviderSuccess, ProviderFailure> {
+    let scan_started = Instant::now();
     let scan = if model.should_use_openrouter() {
         invoke_gemini_via_openrouter(
             http_client,
@@ -1523,20 +1591,27 @@ async fn invoke_gemini_two_stage(
         )
         .await?
     };
+    let scan_latency_ms = elapsed_ms_u64(scan_started);
     let scan_value = parse_entry_scan_output("gemini", &scan.raw_text).map_err(|failure| {
         let mut trace = scan.trace.clone();
-        trace.push_entry_stage_event(build_entry_scan_trace_event("gemini", &scan.raw_text, None));
+        trace.push_entry_stage_event(build_entry_scan_trace_event(
+            "gemini",
+            &scan.raw_text,
+            None,
+            scan_latency_ms,
+        ));
         ProviderFailure {
             error: failure.error.context("market scan stage failed"),
             trace,
         }
     })?;
-    let scan_event = build_entry_scan_trace_event("gemini", &scan.raw_text, Some(&scan_value));
+    let scan_event =
+        build_entry_scan_trace_event("gemini", &scan.raw_text, Some(&scan_value), scan_latency_ms);
     let scan_prompt_inputs = scan
         .trace
         .output_entry_stage_prompt_inputs()
         .unwrap_or_default();
-    let finalize_event = build_entry_finalize_trace_event(input, &scan_value);
+    let finalize_started = Instant::now();
     let finalize = if model.should_use_openrouter() {
         invoke_gemini_via_openrouter(
             http_client,
@@ -1564,9 +1639,21 @@ async fn invoke_gemini_two_stage(
         error: failure.error,
         trace: failure
             .trace
-            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()])
+            .prepend_entry_stage_events(&[
+                scan_event.clone(),
+                build_entry_finalize_trace_event(
+                    input,
+                    &scan_value,
+                    Some(elapsed_ms_u64(finalize_started)),
+                ),
+            ])
             .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })?;
+    let finalize_event = build_entry_finalize_trace_event(
+        input,
+        &scan_value,
+        Some(elapsed_ms_u64(finalize_started)),
+    );
 
     Ok(ProviderSuccess {
         raw_text: finalize.raw_text,
@@ -1822,6 +1909,7 @@ async fn invoke_grok_two_stage(
     input: &ModelInvocationInput,
     prompt_template: &str,
 ) -> Result<ProviderSuccess, ProviderFailure> {
+    let scan_started = Instant::now();
     let scan = invoke_grok_stage(
         http_client,
         grok_cfg,
@@ -1832,20 +1920,27 @@ async fn invoke_grok_two_stage(
         None,
     )
     .await?;
+    let scan_latency_ms = elapsed_ms_u64(scan_started);
     let scan_value = parse_entry_scan_output("grok", &scan.raw_text).map_err(|failure| {
         let mut trace = scan.trace.clone();
-        trace.push_entry_stage_event(build_entry_scan_trace_event("grok", &scan.raw_text, None));
+        trace.push_entry_stage_event(build_entry_scan_trace_event(
+            "grok",
+            &scan.raw_text,
+            None,
+            scan_latency_ms,
+        ));
         ProviderFailure {
             error: failure.error.context("market scan stage failed"),
             trace,
         }
     })?;
-    let scan_event = build_entry_scan_trace_event("grok", &scan.raw_text, Some(&scan_value));
+    let scan_event =
+        build_entry_scan_trace_event("grok", &scan.raw_text, Some(&scan_value), scan_latency_ms);
     let scan_prompt_inputs = scan
         .trace
         .output_entry_stage_prompt_inputs()
         .unwrap_or_default();
-    let finalize_event = build_entry_finalize_trace_event(input, &scan_value);
+    let finalize_started = Instant::now();
     let finalize = invoke_grok_stage(
         http_client,
         grok_cfg,
@@ -1860,9 +1955,21 @@ async fn invoke_grok_two_stage(
         error: failure.error,
         trace: failure
             .trace
-            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()])
+            .prepend_entry_stage_events(&[
+                scan_event.clone(),
+                build_entry_finalize_trace_event(
+                    input,
+                    &scan_value,
+                    Some(elapsed_ms_u64(finalize_started)),
+                ),
+            ])
             .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })?;
+    let finalize_event = build_entry_finalize_trace_event(
+        input,
+        &scan_value,
+        Some(elapsed_ms_u64(finalize_started)),
+    );
 
     Ok(ProviderSuccess {
         raw_text: finalize.raw_text,
@@ -2679,6 +2786,7 @@ async fn invoke_claude_two_stage(
     input: &ModelInvocationInput,
     prompt_template: &str,
 ) -> Result<ProviderSuccess, ProviderFailure> {
+    let scan_started = Instant::now();
     let scan = invoke_claude_batch(
         http_client,
         claude_cfg,
@@ -2689,20 +2797,27 @@ async fn invoke_claude_two_stage(
         None,
     )
     .await?;
+    let scan_latency_ms = elapsed_ms_u64(scan_started);
     let scan_value = parse_entry_scan_output("claude", &scan.raw_text).map_err(|failure| {
         let mut trace = scan.trace.clone();
-        trace.push_entry_stage_event(build_entry_scan_trace_event("claude", &scan.raw_text, None));
+        trace.push_entry_stage_event(build_entry_scan_trace_event(
+            "claude",
+            &scan.raw_text,
+            None,
+            scan_latency_ms,
+        ));
         ProviderFailure {
             error: failure.error.context("market scan stage failed"),
             trace,
         }
     })?;
-    let scan_event = build_entry_scan_trace_event("claude", &scan.raw_text, Some(&scan_value));
+    let scan_event =
+        build_entry_scan_trace_event("claude", &scan.raw_text, Some(&scan_value), scan_latency_ms);
     let scan_prompt_inputs = scan
         .trace
         .output_entry_stage_prompt_inputs()
         .unwrap_or_default();
-    let finalize_event = build_entry_finalize_trace_event(input, &scan_value);
+    let finalize_started = Instant::now();
     let finalize = invoke_claude_batch(
         http_client,
         claude_cfg,
@@ -2717,9 +2832,21 @@ async fn invoke_claude_two_stage(
         error: failure.error,
         trace: failure
             .trace
-            .prepend_entry_stage_events(&[scan_event.clone(), finalize_event.clone()])
+            .prepend_entry_stage_events(&[
+                scan_event.clone(),
+                build_entry_finalize_trace_event(
+                    input,
+                    &scan_value,
+                    Some(elapsed_ms_u64(finalize_started)),
+                ),
+            ])
             .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })?;
+    let finalize_event = build_entry_finalize_trace_event(
+        input,
+        &scan_value,
+        Some(elapsed_ms_u64(finalize_started)),
+    );
 
     Ok(ProviderSuccess {
         raw_text: finalize.raw_text,
@@ -3848,6 +3975,66 @@ mod tests {
     }
 
     #[test]
+    fn custom_llm_reasoning_uses_stage_specific_settings() {
+        let model = super::LlmModelConfig {
+            name: "custom_llm".to_string(),
+            provider: "custom_llm".to_string(),
+            model: "gpt-5.4-xhigh".to_string(),
+            use_openrouter: None,
+            enabled: true,
+            temperature: 0.1,
+            max_tokens: 1000,
+            enable_thinking: None,
+            stage1_reasoning: Some("high".to_string()),
+            stage2_reasoning: Some("low".to_string()),
+            reasoning: Some("medium".to_string()),
+        };
+
+        assert_eq!(
+            super::custom_llm_reasoning(&model, super::prompt::EntryPromptStage::Scan)
+                .as_ref()
+                .map(|cfg| cfg.effort.as_str()),
+            Some("high")
+        );
+        assert_eq!(
+            super::custom_llm_reasoning(&model, super::prompt::EntryPromptStage::Finalize)
+                .as_ref()
+                .map(|cfg| cfg.effort.as_str()),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn custom_llm_reasoning_falls_back_to_legacy_reasoning() {
+        let model = super::LlmModelConfig {
+            name: "custom_llm".to_string(),
+            provider: "custom_llm".to_string(),
+            model: "gpt-5.4-xhigh".to_string(),
+            use_openrouter: None,
+            enabled: true,
+            temperature: 0.1,
+            max_tokens: 1000,
+            enable_thinking: None,
+            stage1_reasoning: None,
+            stage2_reasoning: None,
+            reasoning: Some("xhigh".to_string()),
+        };
+
+        assert_eq!(
+            super::custom_llm_reasoning(&model, super::prompt::EntryPromptStage::Scan)
+                .as_ref()
+                .map(|cfg| cfg.effort.as_str()),
+            Some("xhigh")
+        );
+        assert_eq!(
+            super::custom_llm_reasoning(&model, super::prompt::EntryPromptStage::Finalize)
+                .as_ref()
+                .map(|cfg| cfg.effort.as_str()),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
     fn custom_llm_entry_schema_disables_additional_properties() {
         let schema = super::custom_llm_response_schema(
             false,
@@ -3957,7 +4144,7 @@ mod tests {
             "market_narrative": "4h and 15m bullish, 1d neutral — tactical long bias"
         });
 
-        let event = super::build_entry_finalize_trace_event(&input, &scan);
+        let event = super::build_entry_finalize_trace_event(&input, &scan, Some(123));
         assert_eq!(
             event.get("scan_15m_trend").and_then(Value::as_str),
             Some("Bullish")
@@ -3973,6 +4160,11 @@ mod tests {
         assert_eq!(
             event.get("scan_dominant_bias").and_then(Value::as_str),
             Some("bullish")
+        );
+        assert_eq!(event.get("latency_ms").and_then(Value::as_u64), Some(123));
+        assert_eq!(
+            event.get("stage_mode").and_then(Value::as_str),
+            Some("entry")
         );
         assert_eq!(
             event.get("scan_market_narrative").and_then(Value::as_str),

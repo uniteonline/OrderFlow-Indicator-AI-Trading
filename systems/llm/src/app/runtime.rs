@@ -2374,6 +2374,19 @@ async fn invoke_bundle_models(
                     .unwrap_or_else(|| "-".to_string()),
                 err
             );
+            if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
+                print_entry_stage_timing(
+                    &bundle.raw.ts_bucket,
+                    &trigger,
+                    &out.model_name,
+                    &out.provider,
+                    &out.model,
+                    management_mode,
+                    pending_order_mode,
+                    out.latency_ms,
+                    stage_trace,
+                );
+            }
             if print_response {
                 if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
                     print_entry_stage_trace(
@@ -2425,6 +2438,19 @@ async fn invoke_bundle_models(
             trigger = %trigger,
             "llm model call completed"
         );
+        if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
+            print_entry_stage_timing(
+                &bundle.raw.ts_bucket,
+                &trigger,
+                &out.model_name,
+                &out.provider,
+                &out.model,
+                management_mode,
+                pending_order_mode,
+                out.latency_ms,
+                stage_trace,
+            );
+        }
         let should_print_response = print_response || management_mode;
         if should_print_response {
             if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
@@ -4479,6 +4505,50 @@ fn entry_stage_event<'a>(trace: Option<&'a [Value]>, stage: &str) -> Option<&'a 
             .map(|value| value.eq_ignore_ascii_case(stage))
             .unwrap_or(false)
     })
+}
+
+fn entry_stage_latency_ms(trace: Option<&[Value]>, stage: &str) -> Option<u64> {
+    entry_stage_event(trace, stage)
+        .and_then(|event| event.get("latency_ms"))
+        .and_then(Value::as_u64)
+}
+
+fn print_entry_stage_timing(
+    ts_bucket: &DateTime<Utc>,
+    trigger: &str,
+    model_name: &str,
+    provider: &str,
+    model_id: &str,
+    management_mode: bool,
+    pending_order_mode: bool,
+    total_latency_ms: u128,
+    stage_trace: &[Value],
+) {
+    let scan_latency_ms = entry_stage_latency_ms(Some(stage_trace), "scan")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let finalize_latency_ms = entry_stage_latency_ms(Some(stage_trace), "finalize")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let stage2_mode = if pending_order_mode {
+        "pending_order"
+    } else if management_mode {
+        "management"
+    } else {
+        "entry"
+    };
+    println!(
+        "LLM_STAGE_TIMING ts_bucket={} trigger={} model={} provider={} model_id={} stage2_mode={} scan_latency_ms={} finalize_latency_ms={} total_latency_ms={}",
+        ts_bucket,
+        trigger,
+        model_name,
+        provider,
+        model_id,
+        stage2_mode,
+        scan_latency_ms,
+        finalize_latency_ms,
+        total_latency_ms,
+    );
 }
 
 fn entry_stage_trace_str(

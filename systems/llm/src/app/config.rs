@@ -507,7 +507,13 @@ pub struct LlmModelConfig {
     /// Qwen only: set to true to enable thinking (extended reasoning) mode.
     #[serde(default)]
     pub enable_thinking: Option<bool>,
-    /// Optional model-specific reasoning effort hint for OpenAI-compatible custom_llm backends.
+    /// Optional stage-1 scan reasoning effort hint for OpenAI-compatible custom_llm backends.
+    #[serde(default)]
+    pub stage1_reasoning: Option<String>,
+    /// Optional stage-2 finalize reasoning effort hint for OpenAI-compatible custom_llm backends.
+    #[serde(default)]
+    pub stage2_reasoning: Option<String>,
+    /// Legacy fallback reasoning effort hint. Used when stage1/stage2 reasoning is not set.
     #[serde(default)]
     pub reasoning: Option<String>,
 }
@@ -711,7 +717,7 @@ fn default_indicator_codes() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_indicator_codes, LlmConfig};
+    use super::{default_indicator_codes, LlmConfig, LlmModelConfig};
 
     #[test]
     fn default_indicator_codes_include_fvg() {
@@ -730,6 +736,34 @@ mod tests {
         assert!((execution.min_distance_v - 1.0).abs() < f64::EPSILON);
         assert!((execution.min_rr - 2.0).abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn model_reasoning_for_stage_prefers_stage_specific_then_legacy() {
+        let model = LlmModelConfig {
+            name: "custom_llm".to_string(),
+            provider: "custom_llm".to_string(),
+            model: "gpt-5.4-xhigh".to_string(),
+            use_openrouter: None,
+            enabled: true,
+            temperature: 0.1,
+            max_tokens: 1000,
+            enable_thinking: None,
+            stage1_reasoning: Some("high".to_string()),
+            stage2_reasoning: Some("medium".to_string()),
+            reasoning: Some("low".to_string()),
+        };
+        assert_eq!(model.reasoning_for_stage(true), Some("high"));
+        assert_eq!(model.reasoning_for_stage(false), Some("medium"));
+
+        let legacy_only = LlmModelConfig {
+            stage1_reasoning: None,
+            stage2_reasoning: None,
+            reasoning: Some("xhigh".to_string()),
+            ..model
+        };
+        assert_eq!(legacy_only.reasoning_for_stage(true), Some("xhigh"));
+        assert_eq!(legacy_only.reasoning_for_stage(false), Some("xhigh"));
+    }
 }
 
 fn default_models() -> Vec<LlmModelConfig> {
@@ -742,6 +776,8 @@ fn default_models() -> Vec<LlmModelConfig> {
         temperature: default_model_temperature(),
         max_tokens: default_model_max_tokens(),
         enable_thinking: None,
+        stage1_reasoning: None,
+        stage2_reasoning: None,
         reasoning: None,
     }]
 }
@@ -850,6 +886,18 @@ impl LlmModelConfig {
         } else {
             self.use_openrouter.unwrap_or(false)
         }
+    }
+
+    pub fn reasoning_for_stage(&self, is_stage1: bool) -> Option<&str> {
+        let stage_specific = if is_stage1 {
+            self.stage1_reasoning.as_deref()
+        } else {
+            self.stage2_reasoning.as_deref()
+        };
+        stage_specific
+            .or(self.reasoning.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
     }
 }
 

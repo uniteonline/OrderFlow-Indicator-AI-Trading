@@ -10,11 +10,10 @@ const EVENT_INDICATOR_RULES: &[(&str, usize)] = &[
     ("absorption", 20),
     ("buying_exhaustion", 20),
     ("selling_exhaustion", 20),
-    ("initiation", usize::MAX),
     ("bullish_absorption", 20),
     ("bearish_absorption", 20),
-    ("bullish_initiation", usize::MAX),
-    ("bearish_initiation", 20),
+    ("bullish_initiation", 10),
+    ("bearish_initiation", 10),
 ];
 const EVENT_DROP_FIELDS: &[&str] = &[
     "event_id",
@@ -289,7 +288,6 @@ fn filter_fvg(payload: &Value) -> Value {
                 &mut filtered_window,
                 window_value,
                 &[
-                    "fvgs",
                     "active_bull_fvgs",
                     "active_bear_fvgs",
                     "nearest_bull_fvg",
@@ -300,7 +298,6 @@ fn filter_fvg(payload: &Value) -> Value {
             );
             sanitize_fvg_object_field(&mut filtered_window, "nearest_bull_fvg");
             sanitize_fvg_object_field(&mut filtered_window, "nearest_bear_fvg");
-            sanitize_fvg_array_field(&mut filtered_window, "fvgs");
             sanitize_fvg_array_field(&mut filtered_window, "active_bull_fvgs");
             sanitize_fvg_array_field(&mut filtered_window, "active_bear_fvgs");
             filtered_windows.insert((*window).to_string(), Value::Object(filtered_window));
@@ -827,13 +824,6 @@ fn filter_divergence(payload: &Value) -> Value {
         );
         result.insert("recent_7d".to_string(), Value::Object(filtered_recent));
     }
-
-    let candidates = payload
-        .get("candidates")
-        .and_then(Value::as_array)
-        .map(|candidates| top_divergence_candidates(candidates, 5))
-        .unwrap_or_default();
-    result.insert("candidates".to_string(), Value::Array(candidates));
 
     Value::Object(result)
 }
@@ -1395,47 +1385,6 @@ fn depth_imbalance(levels: &[Value], mid_price: f64, pct: f64) -> Value {
     ratio(bid_total, ask_total)
 }
 
-fn top_divergence_candidates(candidates: &[Value], limit: usize) -> Vec<Value> {
-    let mut sorted = candidates
-        .iter()
-        .filter_map(|entry| entry.as_object().cloned())
-        .collect::<Vec<_>>();
-    sorted.sort_by(|left, right| {
-        let left_score = left
-            .get("score")
-            .and_then(Value::as_f64)
-            .unwrap_or_default();
-        let right_score = right
-            .get("score")
-            .and_then(Value::as_f64)
-            .unwrap_or_default();
-        right_score
-            .partial_cmp(&left_score)
-            .unwrap_or(Ordering::Equal)
-    });
-    sorted
-        .into_iter()
-        .take(limit)
-        .map(|entry| {
-            let mut filtered = Map::new();
-            copy_fields(
-                &mut filtered,
-                &entry,
-                &[
-                    "type",
-                    "score",
-                    "sig_pass",
-                    "price_start",
-                    "price_end",
-                    "likely_driver",
-                    "fut_divergence_sign",
-                ],
-            );
-            Value::Object(filtered)
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::ScanFilter;
@@ -1864,10 +1813,10 @@ mod tests {
                 "window_code": "1m",
                 "payload": {
                     "recent_7d": {
-                        "event_count": 3,
+                        "event_count": 12,
                         "history_source": "db",
                         "lookback_coverage_ratio": 1.0,
-                        "events": sample_initiation_events("2026-03-14T05:30:00Z", 15, 3)
+                        "events": sample_initiation_events("2026-03-14T05:30:00Z", 15, 12)
                     }
                 }
             },
@@ -1875,10 +1824,10 @@ mod tests {
                 "window_code": "1m",
                 "payload": {
                     "recent_7d": {
-                        "event_count": 3,
+                        "event_count": 12,
                         "history_source": "db",
                         "lookback_coverage_ratio": 1.0,
-                        "events": sample_initiation_events("2026-03-14T04:30:00Z", 15, 3)
+                        "events": sample_initiation_events("2026-03-14T04:30:00Z", 15, 12)
                     }
                 }
             },
@@ -2011,18 +1960,21 @@ mod tests {
             .pointer("/indicators/orderbook_depth/payload/by_window/1h")
             .is_none());
         assert!(value
-            .pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/fvg_id")
+            .pointer("/indicators/fvg/payload/by_window/15m/fvgs")
             .is_none());
         assert!(value
-            .pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/tf")
+            .pointer("/indicators/fvg/payload/by_window/15m/active_bull_fvgs/0/fvg_id")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/15m/active_bull_fvgs/0/tf")
             .is_none());
         assert_eq!(
-            value.pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/fvg_top"),
-            value.pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/upper")
+            value.pointer("/indicators/fvg/payload/by_window/15m/active_bull_fvgs/0/fvg_top"),
+            value.pointer("/indicators/fvg/payload/by_window/15m/active_bull_fvgs/0/upper")
         );
         assert_eq!(
-            value.pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/fvg_bottom"),
-            value.pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/lower")
+            value.pointer("/indicators/fvg/payload/by_window/15m/active_bull_fvgs/0/fvg_bottom"),
+            value.pointer("/indicators/fvg/payload/by_window/15m/active_bull_fvgs/0/lower")
         );
         assert_eq!(
             value.pointer("/indicators/fvg/payload/by_window/15m/nearest_bull_fvg/fvg_top"),
@@ -2038,23 +1990,48 @@ mod tests {
         assert!(value
             .pointer("/indicators/absorption/payload/recent_7d/events/0/score_base")
             .is_none());
+        assert!(value.pointer("/indicators/initiation").is_none());
+        assert_eq!(
+            value
+                .pointer("/indicators/bullish_initiation/payload/recent_7d/events")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(10)
+        );
+        assert_eq!(
+            value
+                .pointer("/indicators/bearish_initiation/payload/recent_7d/events")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(10)
+        );
         assert!(value
-            .pointer("/indicators/initiation/payload/recent_7d/events/0/follow_through_delta_sum")
+            .pointer(
+                "/indicators/bullish_initiation/payload/recent_7d/events/0/follow_through_delta_sum"
+            )
             .is_none());
         assert!(value
-            .pointer("/indicators/initiation/payload/recent_7d/events/0/follow_through_hold_ok")
+            .pointer(
+                "/indicators/bullish_initiation/payload/recent_7d/events/0/follow_through_hold_ok"
+            )
             .is_none());
         assert!(value
-            .pointer("/indicators/initiation/payload/recent_7d/events/0/follow_through_minutes")
+            .pointer(
+                "/indicators/bullish_initiation/payload/recent_7d/events/0/follow_through_minutes"
+            )
             .is_none());
         assert!(value
-            .pointer("/indicators/initiation/payload/recent_7d/events/0/follow_through_max_adverse_excursion_ticks")
+            .pointer(
+                "/indicators/bullish_initiation/payload/recent_7d/events/0/follow_through_max_adverse_excursion_ticks"
+            )
             .is_none());
         assert!(value
-            .pointer("/indicators/initiation/payload/recent_7d/events/0/spot_cvd_change")
+            .pointer("/indicators/bullish_initiation/payload/recent_7d/events/0/spot_cvd_change")
             .is_none());
         assert!(value
-            .pointer("/indicators/initiation/payload/recent_7d/events/0/spot_rdelta_1m_mean")
+            .pointer(
+                "/indicators/bullish_initiation/payload/recent_7d/events/0/spot_rdelta_1m_mean"
+            )
             .is_none());
         assert_eq!(
             value
@@ -2083,12 +2060,9 @@ mod tests {
         assert!(value
             .pointer("/indicators/divergence/payload/latest_7d/sig_test_mode")
             .is_none());
-        assert_eq!(
-            value
-                .pointer("/indicators/divergence/payload/candidates/0/price_end")
-                .and_then(Value::as_f64),
-            Some(2110.0)
-        );
+        assert!(value
+            .pointer("/indicators/divergence/payload/candidates")
+            .is_none());
     }
 
     #[test]
