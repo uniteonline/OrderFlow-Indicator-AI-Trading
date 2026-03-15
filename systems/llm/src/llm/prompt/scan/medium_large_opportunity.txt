@@ -23,6 +23,7 @@ For each timeframe, verify:
 4. Did you assess cvd_pack, whale_trades, vpin, tpo_market_profile, absorption,
    buying_exhaustion, selling_exhaustion for the flow context? What is their directional bias?
 5. Do you think the Claude Opus 4.6 model, with its strongest reasoning, would also make the same judgment?
+6. Have you anchored every flow signal to its structural price location BEFORE interpreting its direction? Flow signals (absorption, exhaustion, initiation, CVD) are not inherently bullish or bearish — their meaning depends entirely on where price is relative to structure (value area, FVG boundary, OB wall). If you cited a flow signal to support your bias, verify that you first established the structural context.
 
 If you cannot answer yes to (1) and (3), revise your analysis before outputting.
 

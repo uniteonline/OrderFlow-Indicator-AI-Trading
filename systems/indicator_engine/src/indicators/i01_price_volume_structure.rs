@@ -64,7 +64,6 @@ struct BinZone {
 struct PvsV2Analysis {
     bins: Vec<BinnedProfileLevel>,
     poc_idx: usize,
-    poc_volume: f64,
     value_area_bins: HashSet<usize>,
     hvn_zones: Vec<BinZone>,
     lvn_zones: Vec<BinZone>,
@@ -104,6 +103,9 @@ impl Indicator for I01PriceVolumeStructure {
             build_level_rows(self.code(), "1m", &ctx.futures.profile, total_volume);
 
         // ── Multi-window by_window ─────────────────────────────────────────────
+        // Snapshot payloads stay full-fidelity. Downstream filters decide how much
+        // to trim for prompt-facing contexts; the indicator engine itself should
+        // emit the full aggregated profile.
         let avail = trade_history.len();
         let mut by_window = serde_json::Map::new();
 
@@ -153,7 +155,7 @@ impl Indicator for I01PriceVolumeStructure {
             let w_zscore = zscore(window_total, prior_vols);
             let w_dryup = w_zscore.map(|z| z <= -DRYUP_Z_THRESHOLD).unwrap_or(false);
 
-            let mut w_payload = build_pvs_v2_payload(wcode, &agg, window_total, w_zscore, w_dryup);
+            let mut w_payload = build_pvs_payload(&agg, window_total, w_zscore, w_dryup);
             if let Some(obj) = w_payload.as_object_mut() {
                 obj.insert("window_bars_used".into(), json!(window_bars_used));
             }
@@ -377,97 +379,6 @@ fn pvs_v2_window_config(window_code: &str) -> Option<PvsV2WindowConfig> {
     }
 }
 
-fn build_pvs_v2_payload(
-    window_code: &str,
-    profile: &BTreeMap<i64, LevelAgg>,
-    total_volume: f64,
-    volume_z: Option<f64>,
-    volume_dryup: bool,
-) -> serde_json::Value {
-    let Some(analysis) = analyze_pvs_v2(window_code, profile) else {
-        return json!({
-            "bar_volume": total_volume,
-            "poc_price": null,
-            "poc_volume": null,
-            "val": null,
-            "vah": null,
-            "value_area_levels": [],
-            "hvn_levels": [],
-            "lvn_levels": [],
-            "volume_zscore": volume_z,
-            "volume_dryup": volume_dryup,
-            "levels": []
-        });
-    };
-
-    let val = analysis
-        .value_area_bins
-        .iter()
-        .min()
-        .map(|idx| analysis.bins[*idx].lower_tick as f64 / 100.0);
-    let vah = analysis
-        .value_area_bins
-        .iter()
-        .max()
-        .map(|idx| analysis.bins[*idx].upper_tick as f64 / 100.0);
-
-    let mut rank_order = analysis
-        .bins
-        .iter()
-        .map(|bin| (bin.index as i64, bin.volume()))
-        .collect::<Vec<_>>();
-    rank_order.sort_by(|a, b| compare_ranked_volume(*a, *b));
-    let rank_map: BTreeMap<usize, i32> = rank_order
-        .iter()
-        .enumerate()
-        .map(|(i, (idx, _))| (*idx as usize, (i + 1) as i32))
-        .collect();
-
-    let levels = analysis
-        .bins
-        .iter()
-        .map(|bin| {
-            json!({
-                "price_level": bin.midpoint_price(),
-                "level_rank": rank_map.get(&bin.index).copied(),
-                "buy_volume": bin.buy_volume,
-                "sell_volume": bin.sell_volume,
-                "volume": bin.volume(),
-                "delta": bin.delta(),
-                "is_hvn": zone_contains_index(&analysis.hvn_zones, bin.index),
-                "is_lvn": zone_contains_index(&analysis.lvn_zones, bin.index),
-                "is_in_value_area": analysis.value_area_bins.contains(&bin.index)
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let value_area_levels = analysis
-        .bins
-        .iter()
-        .filter(|bin| analysis.value_area_bins.contains(&bin.index))
-        .map(|bin| {
-            json!({
-                "price_level": bin.midpoint_price(),
-                "volume": bin.volume()
-            })
-        })
-        .collect::<Vec<_>>();
-
-    json!({
-        "bar_volume": total_volume,
-        "poc_price": analysis.bins[analysis.poc_idx].midpoint_price(),
-        "poc_volume": analysis.poc_volume,
-        "val": val,
-        "vah": vah,
-        "value_area_levels": value_area_levels,
-        "hvn_levels": zone_midpoints(&analysis.bins, &analysis.hvn_zones),
-        "lvn_levels": zone_midpoints(&analysis.bins, &analysis.lvn_zones),
-        "volume_zscore": volume_z,
-        "volume_dryup": volume_dryup,
-        "levels": levels
-    })
-}
-
 fn analyze_pvs_v2(window_code: &str, profile: &BTreeMap<i64, LevelAgg>) -> Option<PvsV2Analysis> {
     let config = pvs_v2_window_config(window_code)?;
     let bins = build_binned_profile(profile, config.rows);
@@ -494,7 +405,6 @@ fn analyze_pvs_v2(window_code: &str, profile: &BTreeMap<i64, LevelAgg>) -> Optio
     Some(PvsV2Analysis {
         bins,
         poc_idx,
-        poc_volume,
         value_area_bins,
         hvn_zones,
         lvn_zones,
@@ -661,17 +571,6 @@ fn is_strict_local_min(values: &[f64], idx: usize, strength: usize) -> bool {
     }
     let value = values[idx];
     (start..=end).all(|other| other == idx || value < values[other])
-}
-
-fn zone_midpoints(bins: &[BinnedProfileLevel], zones: &[BinZone]) -> Vec<f64> {
-    zones
-        .iter()
-        .map(|zone| {
-            let lower_tick = bins[zone.start_idx].lower_tick;
-            let upper_tick = bins[zone.end_idx].upper_tick;
-            (lower_tick + upper_tick) as f64 / 200.0
-        })
-        .collect()
 }
 
 fn zone_contains_index(zones: &[BinZone], index: usize) -> bool {
@@ -1428,6 +1327,133 @@ mod tests {
         // expected = 1 + 2 + 10, not 1 + 2 + 10 + 10
         assert!((bar_volume - 13.0).abs() < 1e-9);
         assert_eq!(bars_used, 3);
+    }
+
+    #[test]
+    fn pvs_by_window_snapshot_keeps_full_profile_levels() {
+        let ts_bucket = Utc
+            .with_ymd_and_hms(2026, 3, 4, 0, 0, 0)
+            .single()
+            .expect("valid timestamp");
+
+        let mut futures = MinuteWindowData::empty(MarketKind::Futures, ts_bucket);
+        for tick in 100_i64..130_i64 {
+            futures.profile.insert(
+                tick,
+                LevelAgg {
+                    buy_qty: 1.0,
+                    sell_qty: 1.0,
+                },
+            );
+        }
+        futures.total_qty = futures.profile.values().map(LevelAgg::total).sum();
+
+        let spot = MinuteWindowData::empty(MarketKind::Spot, ts_bucket);
+        let ctx = IndicatorContext {
+            ts_bucket,
+            symbol: "ETHUSDT".to_string(),
+            futures,
+            spot,
+            history_futures: Vec::new(),
+            history_spot: Vec::new(),
+            trade_history_futures: Vec::new(),
+            trade_history_spot: Vec::new(),
+            latest_mark: None,
+            latest_funding: None,
+            funding_changes_in_window: Vec::new(),
+            funding_points_in_window: Vec::new(),
+            mark_points_in_window: Vec::new(),
+            funding_changes_recent: Vec::new(),
+            funding_points_recent: Vec::new(),
+            mark_points_recent: Vec::new(),
+            whale_threshold_usdt: 300_000.0,
+            kline_history_bars_1m: 1024,
+            kline_history_bars_15m: 120,
+            kline_history_bars_4h: 120,
+            kline_history_bars_1d: 120,
+            kline_history_fill_1d_from_db: true,
+            fvg_windows: vec![
+                "15m".to_string(),
+                "4h".to_string(),
+                "1d".to_string(),
+                "3d".to_string(),
+            ],
+            fvg_fill_from_db: true,
+            fvg_db_bars_4h: 256,
+            fvg_db_bars_1d: 256,
+            fvg_epsilon_gap_ticks: 2,
+            fvg_atr_lookback: 14,
+            fvg_min_body_ratio: 0.60,
+            fvg_min_impulse_atr_ratio: 1.30,
+            fvg_min_gap_atr_ratio: 0.15,
+            fvg_max_gap_atr_ratio: 1.20,
+            fvg_mitigated_fill_threshold: 0.80,
+            fvg_invalid_close_bars: 1,
+            kline_history_futures_4h_db: Vec::new(),
+            kline_history_futures_1d_db: Vec::new(),
+            kline_history_spot_4h_db: Vec::new(),
+            kline_history_spot_1d_db: Vec::new(),
+            tpo_rows_nb: 64,
+            tpo_value_area_pct: 0.70,
+            tpo_session_windows: vec!["4h".to_string(), "1d".to_string()],
+            tpo_ib_minutes: 60,
+            tpo_dev_output_windows: vec!["15m".to_string(), "1h".to_string()],
+            rvwap_windows: vec!["15m".to_string(), "4h".to_string(), "1d".to_string()],
+            rvwap_output_windows: vec!["15m".to_string(), "1h".to_string()],
+            rvwap_min_samples: 5,
+            high_volume_pulse_z_windows: vec!["1h".to_string(), "4h".to_string(), "1d".to_string()],
+            high_volume_pulse_summary_windows: vec!["15m".to_string(), "1h".to_string()],
+            high_volume_pulse_min_samples: 5,
+            ema_base_periods: vec![13, 21, 34],
+            ema_htf_periods: vec![100, 200],
+            ema_htf_windows: vec!["4h".to_string(), "1d".to_string()],
+            ema_output_windows: vec!["15m".to_string(), "1h".to_string()],
+            ema_fill_from_db: true,
+            ema_db_bars_4h: 256,
+            ema_db_bars_1d: 256,
+            divergence_sig_test_mode: DivergenceSigTestMode::Threshold,
+            divergence_bootstrap_b: 200,
+            divergence_bootstrap_block_len: 5,
+            divergence_p_value_threshold: 0.05,
+            window_codes: vec!["1m".to_string()],
+        };
+
+        let computation = I01PriceVolumeStructure.evaluate(&ctx);
+        let payload = computation
+            .snapshot
+            .expect("snapshot")
+            .payload_json
+            .as_object()
+            .cloned()
+            .expect("payload object");
+        let by_window = payload
+            .get("by_window")
+            .and_then(|v| v.as_object())
+            .expect("by_window object");
+        let w15 = by_window
+            .get("15m")
+            .and_then(|v| v.as_object())
+            .expect("15m object");
+        let levels = w15
+            .get("levels")
+            .and_then(|v| v.as_array())
+            .expect("levels");
+
+        assert_eq!(levels.len(), 30);
+        assert_eq!(
+            levels
+                .first()
+                .and_then(|v| v.get("price_level"))
+                .and_then(|v| v.as_f64()),
+            Some(1.0)
+        );
+        assert_eq!(
+            levels
+                .last()
+                .and_then(|v| v.get("price_level"))
+                .and_then(|v| v.as_f64()),
+            Some(1.29)
+        );
     }
 
     #[test]

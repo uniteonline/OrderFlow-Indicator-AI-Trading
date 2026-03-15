@@ -1122,12 +1122,12 @@ fn qwen_output_contract(
     if pending_order_mode {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `reason` and `params`. `analysis` and `self_check` may be present as extra objects.\n- `reason` must be a non-empty top-level string. Do not place `reason` inside `analysis`.\n- `params` must contain exactly: `entry`, `tp`, `sl`, `leverage` — each a number or null.\n- Set all params to null if there is no valid setup.\n".to_string()
     } else if management_mode {
-        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `decision`, `reason`, and `params`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- Allowed decisions: VALID, INVALID, ADJUST.\n- For VALID: params may be empty or omitted.\n- For INVALID: params must include `close_price` (number or null).\n- For ADJUST: params must include `adjust_fields` (array: [\"tp\"], [\"sl\"], [\"tp\",\"sl\"], [\"add\"], or [\"reduce\"]), and corresponding values: `new_tp`/`new_sl` for tp/sl adjustments, `qty_ratio` (number 0-1) for add/reduce.\n".to_string()
+        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `decision`, `reason`, and `params`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- Allowed decisions: VALID, INVALID, ADJUST.\n- `params` must always be present.\n- For VALID: keep `params` present; action fields may be null.\n- For INVALID: set `params.close_price` to a number or null.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], [\"tp\",\"sl\"], [\"add\"], or [\"reduce\"]), and corresponding values: `new_tp`/`new_sl` for tp/sl adjustments, `qty_ratio` (number 0-1) for add/reduce.\n".to_string()
     } else if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
         if is_medium_large(prompt_template) {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string.\n- Top-level keys must be `decision`, `reason`, and `scan`.\n- Allowed entry scan decisions: LONG, SHORT, NO_TRADE.\n- `scan` must include: primary_strategy, market_story, hypothesis, conviction, entry_style, candidate_zone, entry_ladder, target_zone, target_ladder, stop_ladder, invalidation.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `timeframe_analysis`, `flow_context`, and `market_narrative`.\n- `timeframe_analysis` must contain exactly `15m`, `4h`, and `1d`.\n- Each timeframe must include `trend`, `signal_agreement`, `range`, and `story`.\n- `flow_context` must include `dominant_bias`, `key_signals`, and `story`.\n".to_string()
         } else {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string.\n- Top-level keys must be `decision`, `reason`, and `scan`.\n- Allowed entry scan decisions: LONG, SHORT, NO_TRADE.\n- `scan` must include: primary_strategy, setup_quality, order_flow_bias, entry_style, candidate_zone, entry_ladder, target_zone, target_ladder, stop_ladder, invalidation_basis, stop_model_hint, key_signals, risk_flags.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `timeframe_analysis`, `flow_context`, and `market_narrative`.\n- `timeframe_analysis` must contain exactly `15m`, `4h`, and `1d`.\n- Each timeframe must include `trend`, `signal_agreement`, `range`, and `story`.\n- `flow_context` must include `dominant_bias`, `key_signals`, and `story`.\n".to_string()
         }
     } else {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must be `decision`, `reason`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, and `params.horizon` to null.\n".to_string()
@@ -1316,11 +1316,12 @@ fn qwen_entry_response_schema() -> Value {
 fn custom_llm_entry_scan_response_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "required": ["timeframe_analysis", "flow_context", "market_narrative"],
         "properties": {
             "timeframe_analysis": {
                 "type": "object",
+                "additionalProperties": false,
                 "required": ["15m", "4h", "1d"],
                 "properties": {
                     "15m": scan_timeframe_schema_openai(),
@@ -1330,6 +1331,7 @@ fn custom_llm_entry_scan_response_schema() -> Value {
             },
             "flow_context": {
                 "type": "object",
+                "additionalProperties": false,
                 "required": ["dominant_bias", "key_signals", "story"],
                 "properties": {
                     "dominant_bias": { "type": "string" },
@@ -2182,12 +2184,14 @@ fn scan_timeframe_schema_grok() -> Value {
 fn scan_timeframe_schema_openai() -> Value {
     json!({
         "type": "object",
+        "additionalProperties": false,
         "required": ["trend", "signal_agreement", "range", "story"],
         "properties": {
             "trend": { "type": "string", "enum": ["Bullish", "Bearish", "Sideways"] },
             "signal_agreement": { "type": "string", "enum": ["strong", "mixed", "conflicted"] },
             "range": {
                 "type": "object",
+                "additionalProperties": false,
                 "required": ["support", "resistance"],
                 "properties": {
                     "support": { "type": "number" },
@@ -2447,11 +2451,12 @@ fn ml_qwen_management_schema() -> Value {
 fn ml_custom_llm_entry_scan_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "required": ["timeframe_analysis", "flow_context", "market_narrative"],
         "properties": {
             "timeframe_analysis": {
                 "type": "object",
+                "additionalProperties": false,
                 "required": ["15m", "4h", "1d"],
                 "properties": {
                     "15m": scan_timeframe_schema_openai(),
@@ -2461,6 +2466,7 @@ fn ml_custom_llm_entry_scan_schema() -> Value {
             },
             "flow_context": {
                 "type": "object",
+                "additionalProperties": false,
                 "required": ["dominant_bias", "key_signals", "story"],
                 "properties": {
                     "dominant_bias": { "type": "string" },
@@ -3371,11 +3377,261 @@ mod tests {
     use super::{
         extract_grok_response_text, parse_json_from_text, serialize_entry_finalize_input_minified,
         serialize_llm_input_minified, EntryContextForLlm, GrokResponsesApiResponse,
-        ManagementSnapshotForLlm, ModelInvocationInput, PositionContextForLlm,
-        PositionSummaryForLlm,
+        ManagementSnapshotForLlm, ModelInvocationInput, PendingOrderSummaryForLlm,
+        PositionContextForLlm, PositionSummaryForLlm,
     };
     use chrono::Utc;
     use serde_json::{json, Value};
+
+    fn sample_stage_1_scan() -> Value {
+        json!({
+            "timeframe_analysis": {
+                "15m": {
+                    "trend": "Bullish",
+                    "signal_agreement": "strong",
+                    "range": {"support": 1994.0, "resistance": 2018.0},
+                    "story": "15m structure remains constructive"
+                },
+                "4h": {
+                    "trend": "Bullish",
+                    "signal_agreement": "mixed",
+                    "range": {"support": 1988.0, "resistance": 2035.0},
+                    "story": "4h value migration still intact"
+                },
+                "1d": {
+                    "trend": "Sideways",
+                    "signal_agreement": "mixed",
+                    "range": {"support": 1960.0, "resistance": 2050.0},
+                    "story": "daily auction remains rotational"
+                }
+            },
+            "flow_context": {
+                "dominant_bias": "bullish",
+                "key_signals": ["bid wall intact", "delta recovering"],
+                "story": "flow still leans mildly long"
+            },
+            "market_narrative": "15m and 4h constructive, 1d rotational"
+        })
+    }
+
+    fn prompt_route_test_input(
+        management_mode: bool,
+        pending_order_mode: bool,
+    ) -> ModelInvocationInput {
+        let now = Utc::now();
+        let avwap_15m = (0..10)
+            .map(|idx| {
+                json!({
+                    "ts": format!("2026-03-14T{:02}:00:00Z", idx),
+                    "avwap_fut": 2000.0 + idx as f64,
+                    "avwap_spot": 1999.5 + idx as f64,
+                    "xmk_avwap_gap_f_minus_s": 0.5,
+                })
+            })
+            .collect::<Vec<_>>();
+        let avwap_4h = (0..4)
+            .map(|idx| {
+                json!({
+                    "ts": format!("2026-03-1{}T00:00:00Z", idx + 1),
+                    "avwap_fut": 2000.0 + idx as f64,
+                    "avwap_spot": 1999.0 + idx as f64,
+                    "xmk_avwap_gap_f_minus_s": 1.0,
+                })
+            })
+            .collect::<Vec<_>>();
+        let avwap_1d = (0..3)
+            .map(|idx| {
+                json!({
+                    "ts": format!("2026-03-1{}T00:00:00Z", idx + 4),
+                    "avwap_fut": 2005.0 + idx as f64,
+                    "avwap_spot": 2004.0 + idx as f64,
+                    "xmk_avwap_gap_f_minus_s": 1.0,
+                })
+            })
+            .collect::<Vec<_>>();
+        let fvgs = (0..8)
+            .map(|idx| {
+                json!({
+                    "start_ts": format!("2026-03-14T{:02}:00:00Z", idx),
+                    "gap_low": 1990.0 + idx as f64,
+                    "gap_high": 1990.5 + idx as f64,
+                })
+            })
+            .collect::<Vec<_>>();
+        let orderbook_levels = (0..140)
+            .map(|idx| {
+                let price = 1930.0 + idx as f64;
+                json!({
+                    "price_level": price,
+                    "bid_liquidity": 5000.0 + idx as f64,
+                    "ask_liquidity": 4000.0 + idx as f64,
+                    "total_liquidity": 9000.0 + (idx as f64 * 10.0),
+                    "net_liquidity": 1000.0,
+                    "level_imbalance": 0.1,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        ModelInvocationInput {
+            symbol: "ETHUSDT".to_string(),
+            ts_bucket: now,
+            window_code: "15m".to_string(),
+            indicator_count: 4,
+            source_routing_key: "llm_indicator_minute".to_string(),
+            source_published_at: None,
+            received_at: now,
+            indicators: json!({
+                "fvg": {
+                    "payload": {
+                        "source_market": "futures",
+                        "by_window": {
+                            "15m": {
+                                "nearest_bull_fvg": {"gap_low": 1998.0, "gap_high": 1999.0},
+                                "nearest_bear_fvg": {"gap_low": 2004.0, "gap_high": 2005.0},
+                                "is_ready": true,
+                                "coverage_ratio": 0.8,
+                                "active_bull_fvgs": [{"gap_low": 1998.0, "gap_high": 1999.0}],
+                                "active_bear_fvgs": [{"gap_low": 2004.0, "gap_high": 2005.0}],
+                                "fvgs": fvgs
+                            },
+                            "4h": {
+                                "nearest_bull_fvg": {"gap_low": 1988.0, "gap_high": 1990.0},
+                                "nearest_bear_fvg": {"gap_low": 2010.0, "gap_high": 2012.0},
+                                "is_ready": true,
+                                "coverage_ratio": 0.6,
+                                "active_bull_fvgs": [],
+                                "active_bear_fvgs": [],
+                                "fvgs": [
+                                    {"start_ts": "2026-03-13T00:00:00Z", "gap_low": 1988.0, "gap_high": 1990.0}
+                                ]
+                            },
+                            "1d": {
+                                "nearest_bull_fvg": {"gap_low": 1972.0, "gap_high": 1976.0},
+                                "nearest_bear_fvg": {"gap_low": 2032.0, "gap_high": 2036.0},
+                                "is_ready": false,
+                                "coverage_ratio": 0.4,
+                                "active_bull_fvgs": [],
+                                "active_bear_fvgs": [],
+                                "fvgs": [
+                                    {"start_ts": "2026-03-10T00:00:00Z", "gap_low": 1972.0, "gap_high": 1976.0}
+                                ]
+                            },
+                            "3d": {
+                                "nearest_bull_fvg": {"gap_low": 1950.0, "gap_high": 1958.0},
+                                "nearest_bear_fvg": {"gap_low": 2050.0, "gap_high": 2058.0},
+                                "is_ready": false,
+                                "coverage_ratio": 0.3,
+                                "active_bull_fvgs": [],
+                                "active_bear_fvgs": [],
+                                "fvgs": [
+                                    {"start_ts": "2026-03-01T00:00:00Z", "gap_low": 1950.0, "gap_high": 1958.0}
+                                ]
+                            }
+                        }
+                    }
+                },
+                "avwap": {
+                    "payload": {
+                        "fut_mark_price": 2000.0,
+                        "fut_last_price": 2000.5,
+                        "series_by_window": {
+                            "15m": avwap_15m,
+                            "4h": avwap_4h,
+                            "1d": avwap_1d
+                        }
+                    }
+                },
+                "orderbook_depth": {
+                    "payload": {
+                        "obi_fut": 0.12,
+                        "obi_k_dw_twa_fut": 0.09,
+                        "spread_twa_fut": 0.01,
+                        "levels": orderbook_levels,
+                        "by_window": {
+                            "15m": {"obi_fut": 0.12},
+                            "1h": {"obi_fut": 0.08}
+                        }
+                    }
+                },
+                "price_volume_structure": {
+                    "payload": {
+                        "val": 1994.0,
+                        "vah": 2014.0,
+                        "poc_price": 2003.0,
+                        "by_window": {
+                            "15m": {"val": 1994.0, "vah": 2014.0},
+                            "4h": {"val": 1988.0, "vah": 2022.0},
+                            "1d": {"val": 1970.0, "vah": 2040.0}
+                        }
+                    }
+                }
+            }),
+            missing_indicator_codes: vec![],
+            management_mode,
+            pending_order_mode,
+            trading_state: None,
+            management_snapshot: if management_mode || pending_order_mode {
+                Some(ManagementSnapshotForLlm {
+                    context_state: if pending_order_mode {
+                        "OPEN_ORDERS_ONLY".to_string()
+                    } else {
+                        "POSITION_ACTIVE".to_string()
+                    },
+                    has_active_positions: true,
+                    has_open_orders: pending_order_mode,
+                    active_position_count: 1,
+                    open_order_count: if pending_order_mode { 1 } else { 0 },
+                    positions: vec![PositionSummaryForLlm {
+                        position_side: "LONG".to_string(),
+                        direction: "LONG".to_string(),
+                        quantity: 1.0,
+                        leverage: 10,
+                        entry_price: 1998.0,
+                        mark_price: 2006.0,
+                        unrealized_pnl: 8.0,
+                        pnl_by_latest_price: 8.0,
+                        current_tp_price: Some(2028.0),
+                        current_sl_price: Some(1988.0),
+                    }],
+                    pending_order: pending_order_mode.then(|| PendingOrderSummaryForLlm {
+                        position_side: "LONG".to_string(),
+                        direction: "LONG".to_string(),
+                        quantity: 1.0,
+                        leverage: Some(10),
+                        entry_price: Some(1999.0),
+                        current_tp_price: Some(2028.0),
+                        current_sl_price: Some(1988.0),
+                    }),
+                    last_management_reason: Some("test".to_string()),
+                    position_context: Some(PositionContextForLlm {
+                        original_qty: 1.0,
+                        current_qty: 1.0,
+                        current_pct_of_original: 100.0,
+                        effective_leverage: Some(10),
+                        effective_entry_price: Some(1998.0),
+                        effective_take_profit: Some(2028.0),
+                        effective_stop_loss: Some(1988.0),
+                        reduction_history: vec![],
+                        times_reduced_at_current_level: 0,
+                        last_management_action: Some("HOLD".to_string()),
+                        last_management_reason: Some("test".to_string()),
+                        entry_context: Some(EntryContextForLlm {
+                            entry_strategy: Some("patient_retest".to_string()),
+                            stop_model: Some("Value Area Invalidation Stop".to_string()),
+                            entry_mode: Some("limit_below_zone".to_string()),
+                            original_tp: Some(2028.0),
+                            original_sl: Some(1988.0),
+                            sweep_wick_extreme: None,
+                            horizon: Some("4h".to_string()),
+                            entry_reason: "test".to_string(),
+                        }),
+                    }),
+                })
+            } else {
+                None
+            },
+        }
+    }
 
     #[test]
     fn parse_json_from_text_keeps_valid_json() {
@@ -3609,6 +3865,62 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(false)
         );
+    }
+
+    #[test]
+    fn custom_llm_entry_scan_schema_disables_additional_properties() {
+        for prompt_template in ["big_opportunity", "medium_large_opportunity"] {
+            let schema = super::custom_llm_response_schema(
+                false,
+                false,
+                super::prompt::EntryPromptStage::Scan,
+                prompt_template,
+            );
+            assert_eq!(
+                schema.get("additionalProperties").and_then(|v| v.as_bool()),
+                Some(false),
+                "root should be strict for {prompt_template}"
+            );
+            assert_eq!(
+                schema
+                    .pointer("/properties/timeframe_analysis/additionalProperties")
+                    .and_then(|v| v.as_bool()),
+                Some(false),
+                "timeframe_analysis should be strict for {prompt_template}"
+            );
+            assert_eq!(
+                schema
+                    .pointer("/properties/flow_context/additionalProperties")
+                    .and_then(|v| v.as_bool()),
+                Some(false),
+                "flow_context should be strict for {prompt_template}"
+            );
+            assert_eq!(
+                schema
+                    .pointer(
+                        "/properties/timeframe_analysis/properties/15m/properties/range/additionalProperties"
+                    )
+                    .and_then(|v| v.as_bool()),
+                Some(false),
+                "range should be strict for {prompt_template}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen_scan_output_contract_matches_scan_schema_shape() {
+        for prompt_template in ["big_opportunity", "medium_large_opportunity"] {
+            let contract = super::qwen_output_contract(
+                false,
+                false,
+                super::prompt::EntryPromptStage::Scan,
+                prompt_template,
+            );
+            assert!(
+                contract.contains("`timeframe_analysis`, `flow_context`, and `market_narrative`")
+            );
+            assert!(!contract.contains("`decision`, `reason`, and `scan`"));
+        }
     }
 
     #[test]
@@ -4250,6 +4562,156 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("2026-03-11T06:00:00Z")
         );
+    }
+
+    #[test]
+    fn entry_prompt_uses_entry_core() {
+        let input = prompt_route_test_input(false, false);
+        let scan = sample_stage_1_scan();
+
+        let prompt = super::build_prompt_pair(
+            &input,
+            "medium_large_opportunity",
+            super::prompt::EntryPromptStage::Finalize,
+            Some(&scan),
+        )
+        .expect("build entry prompt");
+        let capture = prompt
+            .prompt_input_capture
+            .expect("capture entry prompt input");
+
+        assert!(prompt.user.contains("STAGE_1_MARKET_SCAN_JSON:"));
+        assert!(capture
+            .prompt_input
+            .pointer("/management_snapshot")
+            .is_none());
+        assert!(capture.prompt_input.pointer("/trading_state").is_none());
+        assert!(capture
+            .prompt_input
+            .pointer("/indicators/fvg/payload/by_window/3d")
+            .is_some());
+        assert_eq!(
+            capture
+                .prompt_input
+                .pointer("/indicators/avwap/payload/series_by_window/15m")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(5)
+        );
+        assert_eq!(
+            capture
+                .prompt_input
+                .pointer("/indicators/orderbook_depth/payload/top_liquidity_levels")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(80)
+        );
+        assert!(capture.prompt_input.pointer("/finalize_focus").is_some());
+    }
+
+    #[test]
+    fn management_prompt_uses_management_core() {
+        let input = prompt_route_test_input(true, false);
+        let scan = sample_stage_1_scan();
+
+        let prompt = super::build_prompt_pair(
+            &input,
+            "medium_large_opportunity",
+            super::prompt::EntryPromptStage::Finalize,
+            Some(&scan),
+        )
+        .expect("build management prompt");
+        let capture = prompt
+            .prompt_input_capture
+            .expect("capture management prompt input");
+
+        assert!(prompt.user.contains("STAGE_1_MARKET_SCAN_JSON:"));
+        assert!(capture
+            .prompt_input
+            .pointer("/management_snapshot")
+            .is_some());
+        assert!(capture.prompt_input.pointer("/trading_state").is_none());
+        assert!(capture
+            .prompt_input
+            .pointer("/management_snapshot/positions/0/pnl_by_latest_price")
+            .is_some());
+        assert!(capture
+            .prompt_input
+            .pointer("/indicators/fvg/payload/by_window/1d")
+            .is_none());
+        assert!(capture
+            .prompt_input
+            .pointer("/indicators/fvg/payload/by_window/3d")
+            .is_none());
+        assert_eq!(
+            capture
+                .prompt_input
+                .pointer("/indicators/avwap/payload/series_by_window/15m")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(3)
+        );
+        assert_eq!(
+            capture
+                .prompt_input
+                .pointer("/indicators/orderbook_depth/payload/top_liquidity_levels")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(60)
+        );
+        assert!(capture.prompt_input.pointer("/finalize_focus").is_none());
+    }
+
+    #[test]
+    fn pending_prompt_uses_pending_core() {
+        let input = prompt_route_test_input(false, true);
+        let scan = sample_stage_1_scan();
+
+        let prompt = super::build_prompt_pair(
+            &input,
+            "medium_large_opportunity",
+            super::prompt::EntryPromptStage::Finalize,
+            Some(&scan),
+        )
+        .expect("build pending prompt");
+        let capture = prompt
+            .prompt_input_capture
+            .expect("capture pending prompt input");
+
+        assert!(prompt.user.contains("STAGE_1_MARKET_SCAN_JSON:"));
+        assert!(capture
+            .prompt_input
+            .pointer("/management_snapshot")
+            .is_some());
+        assert!(capture
+            .prompt_input
+            .pointer("/management_snapshot/positions/0/pnl_by_latest_price")
+            .is_some());
+        assert!(capture
+            .prompt_input
+            .pointer("/management_snapshot/pending_order")
+            .is_some());
+        assert!(capture
+            .prompt_input
+            .pointer("/indicators/fvg/payload/by_window/3d")
+            .is_some());
+        assert_eq!(
+            capture
+                .prompt_input
+                .pointer("/indicators/avwap/payload/series_by_window/15m")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(8)
+        );
+        assert_eq!(
+            capture
+                .prompt_input
+                .pointer("/indicators/orderbook_depth/payload/top_liquidity_levels")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(100)
+        );
+        assert!(capture.prompt_input.pointer("/finalize_focus").is_none());
     }
 
     #[test]

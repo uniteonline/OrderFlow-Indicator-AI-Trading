@@ -810,6 +810,8 @@ pub fn zscore(current: f64, history: Vec<f64>) -> Option<f64> {
 }
 
 pub fn robust_z_at(values: &[f64], idx: usize, lookback: usize) -> Option<f64> {
+    const ROBUST_Z_MAD_REL_FLOOR: f64 = 1e-9;
+
     if idx + 1 < lookback || lookback < 5 {
         return None;
     }
@@ -818,7 +820,14 @@ pub fn robust_z_at(values: &[f64], idx: usize, lookback: usize) -> Option<f64> {
     let med = median(win)?;
     let abs_dev = win.iter().map(|v| (v - med).abs()).collect::<Vec<_>>();
     let mad = median(&abs_dev)?;
-    let denom = 1.4826 * mad + 1e-12;
+    let scale = win
+        .iter()
+        .fold(med.abs(), |acc, value| acc.max(value.abs()))
+        .max(1.0);
+    if mad <= ROBUST_Z_MAD_REL_FLOOR * scale {
+        return Some(0.0);
+    }
+    let denom = 1.4826 * mad;
     Some((values[idx] - med) / denom)
 }
 
@@ -946,4 +955,33 @@ pub fn top_profile_levels(
         }
     });
     rows.into_iter().take(n).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::robust_z_at;
+
+    #[test]
+    fn robust_z_at_returns_zero_when_mad_is_effectively_flat() {
+        let values = vec![
+            1.0,
+            1.0 + 1e-13,
+            1.0 - 1e-13,
+            1.0 + 2e-13,
+            1.0 - 2e-13,
+            1.0 + 3e-13,
+        ];
+
+        let z = robust_z_at(&values, values.len() - 1, 5).expect("z score");
+        assert_eq!(z, 0.0);
+    }
+
+    #[test]
+    fn robust_z_at_preserves_normal_signal_when_mad_is_well_formed() {
+        let values = vec![1.0, 1.2, 0.8, 1.1, 0.9, 1.5];
+
+        let z = robust_z_at(&values, values.len() - 1, 5).expect("z score");
+        assert!(z.is_finite());
+        assert!(z > 0.0);
+    }
 }

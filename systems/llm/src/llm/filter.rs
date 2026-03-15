@@ -1,4 +1,8 @@
 pub mod core;
+pub(crate) mod core_entry;
+pub(crate) mod core_management;
+pub(crate) mod core_pending;
+pub(crate) mod core_shared;
 pub mod scan;
 
 use crate::llm::provider::ModelInvocationInput;

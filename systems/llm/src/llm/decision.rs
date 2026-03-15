@@ -149,7 +149,7 @@ pub fn trade_intent_from_value(value: &Value) -> Result<TradeIntent> {
     let take_profit = find_f64(value, &["params.tp", "tp"]);
     let stop_loss = find_f64(value, &["params.sl", "sl"]);
     let leverage = find_f64(value, &["params.leverage", "leverage"]);
-    let risk_reward_ratio = find_f64(value, &["params.rr", "risk_reward_ratio"]);
+    let model_risk_reward_ratio = find_f64(value, &["params.rr", "risk_reward_ratio"]);
     let horizon = find_str(value, &["params.horizon", "holding_period"]).map(str::to_string);
     let swing_logic = find_str(value, &["params.swing_logic"]).map(str::to_string);
 
@@ -169,7 +169,6 @@ pub fn trade_intent_from_value(value: &Value) -> Result<TradeIntent> {
             let entry_price = entry_price.ok_or_else(|| anyhow!("entry is missing"))?;
             let take_profit = take_profit.ok_or_else(|| anyhow!("tp is missing"))?;
             let stop_loss = stop_loss.ok_or_else(|| anyhow!("sl is missing"))?;
-            let risk_reward_ratio = risk_reward_ratio.ok_or_else(|| anyhow!("rr is missing"))?;
             let horizon = horizon
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| anyhow!("horizon is missing"))?;
@@ -186,9 +185,6 @@ pub fn trade_intent_from_value(value: &Value) -> Result<TradeIntent> {
             if leverage.is_some_and(|value| value <= 0.0) {
                 return Err(anyhow!("leverage must be > 0"));
             }
-            if risk_reward_ratio <= 0.0 {
-                return Err(anyhow!("rr must be > 0"));
-            }
             match decision {
                 TradeDecision::Long => {
                     if !(take_profit > entry_price && stop_loss < entry_price) {
@@ -202,6 +198,9 @@ pub fn trade_intent_from_value(value: &Value) -> Result<TradeIntent> {
                 }
                 TradeDecision::NoTrade => {}
             }
+            let risk_reward_ratio = compute_rr_from_levels(entry_price, take_profit, stop_loss)
+                .or_else(|| model_risk_reward_ratio.filter(|value| *value > 0.0))
+                .ok_or_else(|| anyhow!("rr could not be computed from entry/tp/sl"))?;
 
             Ok(TradeIntent {
                 decision,
@@ -385,6 +384,7 @@ pub fn pending_order_management_intent_from_value_with_context(
         if levels_match(intent.new_entry, ctx.current_entry)
             && levels_match(intent.new_tp, ctx.current_tp)
             && levels_match(intent.new_sl, ctx.current_sl)
+            && levels_match(intent.new_leverage, ctx.current_leverage)
         {
             intent.decision = PendingOrderManagementDecision::Hold;
         }
@@ -404,6 +404,16 @@ fn levels_match(model: Option<f64>, current: Option<f64>) -> bool {
                 ((m - c) / c).abs() < 0.0005
             }
         }
+    }
+}
+
+fn compute_rr_from_levels(entry: f64, tp: f64, sl: f64) -> Option<f64> {
+    let risk = (entry - sl).abs();
+    let reward = (tp - entry).abs();
+    if risk <= f64::EPSILON || reward <= f64::EPSILON {
+        None
+    } else {
+        Some(reward / risk)
     }
 }
 
@@ -491,8 +501,9 @@ fn get_path<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        pending_order_management_intent_from_value, trade_intent_from_value,
-        PendingOrderManagementDecision, TradeDecision,
+        pending_order_management_intent_from_value,
+        pending_order_management_intent_from_value_with_context, trade_intent_from_value,
+        PendingOrderContext, PendingOrderManagementDecision, TradeDecision,
     };
     use serde_json::json;
 
@@ -571,5 +582,47 @@ mod tests {
 
         let intent = trade_intent_from_value(&value).expect("free-form horizon should parse");
         assert_eq!(intent.horizon.as_deref(), Some("next week"));
+    }
+
+    #[test]
+    fn trade_intent_derives_rr_when_model_omits_it() {
+        let value = json!({
+            "decision": "LONG",
+            "reason": "schema-compliant entry without rr should still parse",
+            "params": {
+                "entry": 2000.0,
+                "tp": 2040.0,
+                "sl": 1980.0,
+                "leverage": 3,
+                "horizon": "4h"
+            }
+        });
+
+        let intent = trade_intent_from_value(&value).expect("trade intent should derive rr");
+        assert_eq!(intent.risk_reward_ratio, Some(2.0));
+    }
+
+    #[test]
+    fn pending_leverage_change_keeps_modify_maker() {
+        let value = json!({
+            "reason": "same prices but different leverage",
+            "params": {
+                "entry": 1965.5,
+                "tp": 1974.0,
+                "sl": 1961.2,
+                "leverage": 5.0
+            }
+        });
+        let ctx = PendingOrderContext {
+            has_open_orders: true,
+            current_entry: Some(1965.5),
+            current_tp: Some(1974.0),
+            current_sl: Some(1961.2),
+            current_leverage: Some(3.0),
+        };
+
+        let intent = pending_order_management_intent_from_value_with_context(&value, &ctx)
+            .expect("pending intent parses");
+        assert_eq!(intent.decision, PendingOrderManagementDecision::ModifyMaker);
     }
 }

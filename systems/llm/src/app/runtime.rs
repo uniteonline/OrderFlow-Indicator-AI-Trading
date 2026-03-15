@@ -42,6 +42,7 @@ use tracing::{debug, error, info, warn};
 
 const TEMP_INDICATOR_DIR: &str = "systems/llm/temp_indicator";
 const TEMP_MODEL_INPUT_DIR: &str = "systems/llm/temp_model_input";
+const TEMP_MODEL_OUTPUT_DIR: &str = "systems/llm/temp_model_output";
 const LLM_JOURNAL_DIR: &str = "systems/llm/journal";
 const LLM_JOURNAL_FILE: &str = "systems/llm/journal/llm_trade_journal.jsonl";
 const MANAGEMENT_REDUCTION_LEVEL_THRESHOLD: f64 = 0.5;
@@ -459,6 +460,7 @@ fn build_invocation_input(
     }
 }
 
+#[cfg(test)]
 fn build_persist_only_input(bundle: &LatestBundle) -> ModelInvocationInput {
     ModelInvocationInput {
         symbol: bundle.raw.symbol.clone(),
@@ -475,6 +477,133 @@ fn build_persist_only_input(bundle: &LatestBundle) -> ModelInvocationInput {
         trading_state: None,
         management_snapshot: None,
     }
+}
+
+#[derive(Debug, Clone)]
+struct InvocationRoutingContext {
+    trading_state: Option<crate::execution::binance::TradingStateSnapshot>,
+    management_mode: bool,
+    pending_order_mode: bool,
+    active_position_count: usize,
+    open_order_count: usize,
+    context_state: &'static str,
+    invoke_management_reason: Option<String>,
+    position_context: Option<PositionContextForLlm>,
+}
+
+impl InvocationRoutingContext {
+    fn persist_fallback() -> Self {
+        Self {
+            trading_state: None,
+            management_mode: false,
+            pending_order_mode: false,
+            active_position_count: 0,
+            open_order_count: 0,
+            context_state: "NO_ACTIVE_CONTEXT",
+            invoke_management_reason: None,
+            position_context: None,
+        }
+    }
+}
+
+fn context_state_from_trading_state(
+    trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
+) -> &'static str {
+    trading_state
+        .map(
+            |state| match (state.has_active_positions, state.has_open_orders) {
+                (true, true) => "POSITION_AND_ORDERS",
+                (true, false) => "POSITION_ACTIVE",
+                (false, true) => "OPEN_ORDERS_ONLY",
+                (false, false) => "NO_ACTIVE_CONTEXT",
+            },
+        )
+        .unwrap_or("NO_ACTIVE_CONTEXT")
+}
+
+async fn resolve_invocation_routing_context(
+    config: &RootConfig,
+    http_client: &Client,
+    bundle: &LatestBundle,
+    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
+) -> Result<InvocationRoutingContext> {
+    let trading_state = if config.llm.execution.enabled {
+        Some(
+            fetch_symbol_trading_state(
+                http_client,
+                &config.api.binance,
+                &config.llm.execution,
+                &bundle.raw.symbol,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let management_mode = trading_state
+        .as_ref()
+        .map(|state| state.has_active_context)
+        .unwrap_or(false);
+    let active_position_count = trading_state
+        .as_ref()
+        .map(|state| state.active_positions.len())
+        .unwrap_or(0);
+    let open_order_count = trading_state
+        .as_ref()
+        .map(|state| state.open_orders.len())
+        .unwrap_or(0);
+    let pending_order_mode = active_position_count == 0 && open_order_count > 0;
+    let context_state = context_state_from_trading_state(trading_state.as_ref());
+    let global_management_reason = {
+        let guard = runtime_lifecycle_state.lock().await;
+        if active_position_count == 0 && open_order_count == 0 {
+            None
+        } else {
+            guard.last_management_reason(&bundle.raw.symbol)
+        }
+    };
+
+    hydrate_position_context_from_live_state(
+        http_client,
+        &config.api.binance,
+        &config.llm.execution,
+        trading_state.as_ref(),
+        runtime_lifecycle_state,
+    )
+    .await;
+    if let Err(err) = restore_position_context_from_journal_for_live_state(
+        trading_state.as_ref(),
+        runtime_lifecycle_state,
+    )
+    .await
+    {
+        warn!(
+            symbol = %bundle.raw.symbol,
+            error = %err,
+            "restore position context from journal failed"
+        );
+    }
+    let position_context =
+        sync_and_build_position_context_snapshot(trading_state.as_ref(), runtime_lifecycle_state)
+            .await;
+    let invoke_management_reason = resolve_invoke_management_reason(
+        active_position_count,
+        open_order_count,
+        global_management_reason,
+        position_context.as_ref(),
+    );
+
+    Ok(InvocationRoutingContext {
+        trading_state,
+        management_mode,
+        pending_order_mode,
+        active_position_count,
+        open_order_count,
+        context_state,
+        invoke_management_reason,
+        position_context,
+    })
 }
 
 /// Mirror of `extract_existing_exit_trigger` in binance.rs (private there).
@@ -1886,14 +2015,51 @@ async fn invoke_bundle_models(
 ) {
     let mut execution_done = false;
     let mut execution_blocked_due_to_stale = false;
+    let routing_context = match resolve_invocation_routing_context(
+        &config,
+        &http_client,
+        &bundle,
+        &runtime_lifecycle_state,
+    )
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(err) if !config.llm.request_enabled => {
+            warn!(
+                symbol = %bundle.raw.symbol,
+                ts_bucket = %bundle.raw.ts_bucket,
+                trigger = %trigger,
+                error = %err,
+                "llm.request_enabled=false fallback to entry-shaped temp_model_input because trading state fetch failed"
+            );
+            InvocationRoutingContext::persist_fallback()
+        }
+        Err(err) => {
+            let error_chain = format!("{err:#}");
+            error!(
+                symbol = %bundle.raw.symbol,
+                error = %error_chain,
+                "llm invoke aborted: failed to fetch trading state"
+            );
+            return;
+        }
+    };
+
     if !config.llm.request_enabled {
-        let input = build_persist_only_input(&bundle);
+        let input = build_invocation_input(
+            &bundle,
+            routing_context.management_mode,
+            routing_context.pending_order_mode,
+            routing_context.trading_state.clone(),
+            routing_context.invoke_management_reason.clone(),
+            routing_context.position_context.clone(),
+        );
         let source_file = minute_bundle_path(&bundle.raw);
         let model_input_files = match persist_model_input_to_disk(
             &bundle.raw,
             trigger.as_ref(),
-            false,
-            false,
+            routing_context.management_mode,
+            routing_context.pending_order_mode,
             &input,
             config.llm.temp_cache_retention_minutes,
         )
@@ -1940,103 +2106,27 @@ async fn invoke_bundle_models(
             core_input_exists,
             bundle.raw.indicator_count,
             bundle.missing_indicator_codes.len(),
-            false,
-            false,
+            routing_context.management_mode,
+            routing_context.pending_order_mode,
         );
         info!(
             ts_bucket = %bundle.raw.ts_bucket,
             trigger = %trigger,
             indicator_count = bundle.raw.indicator_count,
             missing_count = bundle.missing_indicator_codes.len(),
+            management_mode = routing_context.management_mode,
+            pending_order_mode = routing_context.pending_order_mode,
             "llm request skipped because llm.request_enabled=false; persisted temp_indicator and temp_model_input only"
         );
         return;
     }
-    let trading_state = if config.llm.execution.enabled {
-        match fetch_symbol_trading_state(
-            &http_client,
-            &config.api.binance,
-            &config.llm.execution,
-            &bundle.raw.symbol,
-        )
-        .await
-        {
-            Ok(state) => Some(state),
-            Err(err) => {
-                let error_chain = format!("{err:#}");
-                error!(
-                    symbol = %bundle.raw.symbol,
-                    error = %error_chain,
-                    "llm invoke aborted: failed to fetch trading state"
-                );
-                return;
-            }
-        }
-    } else {
-        None
-    };
-    let management_mode = trading_state
-        .as_ref()
-        .map(|state| state.has_active_context)
-        .unwrap_or(false);
-    let active_position_count = trading_state
-        .as_ref()
-        .map(|state| state.active_positions.len())
-        .unwrap_or(0);
-    let open_order_count = trading_state
-        .as_ref()
-        .map(|state| state.open_orders.len())
-        .unwrap_or(0);
-    let open_orders_only_mode = active_position_count == 0 && open_order_count > 0;
-    let pending_order_mode = open_orders_only_mode;
-    let context_state = trading_state
-        .as_ref()
-        .map(
-            |state| match (state.has_active_positions, state.has_open_orders) {
-                (true, true) => "POSITION_AND_ORDERS",
-                (true, false) => "POSITION_ACTIVE",
-                (false, true) => "OPEN_ORDERS_ONLY",
-                (false, false) => "NO_ACTIVE_CONTEXT",
-            },
-        )
-        .unwrap_or("NO_ACTIVE_CONTEXT");
-    let global_management_reason = {
-        let guard = runtime_lifecycle_state.lock().await;
-        if active_position_count == 0 && open_order_count == 0 {
-            None
-        } else {
-            guard.last_management_reason(&bundle.raw.symbol)
-        }
-    };
-    hydrate_position_context_from_live_state(
-        &http_client,
-        &config.api.binance,
-        &config.llm.execution,
-        trading_state.as_ref(),
-        &runtime_lifecycle_state,
-    )
-    .await;
-    if let Err(err) = restore_position_context_from_journal_for_live_state(
-        trading_state.as_ref(),
-        &runtime_lifecycle_state,
-    )
-    .await
-    {
-        warn!(
-            symbol = %bundle.raw.symbol,
-            error = %err,
-            "restore position context from journal failed"
-        );
-    }
-    let position_context =
-        sync_and_build_position_context_snapshot(trading_state.as_ref(), &runtime_lifecycle_state)
-            .await;
-    let invoke_management_reason = resolve_invoke_management_reason(
-        active_position_count,
-        open_order_count,
-        global_management_reason.clone(),
-        position_context.as_ref(),
-    );
+    let trading_state = routing_context.trading_state.clone();
+    let management_mode = routing_context.management_mode;
+    let active_position_count = routing_context.active_position_count;
+    let open_order_count = routing_context.open_order_count;
+    let pending_order_mode = routing_context.pending_order_mode;
+    let context_state = routing_context.context_state;
+    let invoke_management_reason = routing_context.invoke_management_reason.clone();
     println!(
         "LLM_INVOKE_CONTEXT ts_bucket={} trigger={} symbol={} management_mode={} pending_order_mode={} context_state={} active_position_count={} open_order_count={} default_model={} prompt_template={} last_management_reason={}",
         bundle.raw.ts_bucket,
@@ -2085,7 +2175,7 @@ async fn invoke_bundle_models(
         pending_order_mode,
         trading_state.clone(),
         invoke_management_reason,
-        position_context,
+        routing_context.position_context.clone(),
     );
 
     debug!(
@@ -2252,7 +2342,7 @@ async fn invoke_bundle_models(
                         provider = %out.provider,
                         model_id = %out.model,
                         error = %err,
-                        "persist entry stage prompt inputs to temp_model_input failed"
+                        "persist entry stage prompt inputs to temp_model_output failed"
                     );
                 }
             }
@@ -4041,6 +4131,12 @@ async fn ensure_temp_model_input_dir() -> Result<()> {
     Ok(())
 }
 
+async fn ensure_temp_model_output_dir() -> Result<()> {
+    fs::create_dir_all(TEMP_MODEL_OUTPUT_DIR)
+        .with_context(|| format!("create {}", TEMP_MODEL_OUTPUT_DIR))?;
+    Ok(())
+}
+
 async fn ensure_llm_journal_dir() -> Result<()> {
     fs::create_dir_all(LLM_JOURNAL_DIR).with_context(|| format!("create {}", LLM_JOURNAL_DIR))?;
     Ok(())
@@ -4115,6 +4211,14 @@ fn prune_expired_temp_model_input_files(
     prune_expired_timestamped_json_files(dir, current_ts_bucket, retention_minutes)
 }
 
+fn prune_expired_temp_model_output_files(
+    dir: &Path,
+    current_ts_bucket: DateTime<Utc>,
+    retention_minutes: i64,
+) -> Result<usize> {
+    prune_expired_timestamped_json_files(dir, current_ts_bucket, retention_minutes)
+}
+
 fn prune_expired_timestamped_json_files(
     dir: &Path,
     current_ts_bucket: DateTime<Utc>,
@@ -4164,8 +4268,8 @@ fn temp_indicator_ts_bucket_from_path(path: &Path) -> Option<DateTime<Utc>> {
 async fn persist_model_input_to_disk(
     bundle: &MinuteBundleEnvelope,
     _trigger: &str,
-    _management_mode: bool,
-    _pending_order_mode: bool,
+    management_mode: bool,
+    pending_order_mode: bool,
     input: &ModelInvocationInput,
     retention_minutes: u64,
 ) -> Result<PersistedModelInputFiles> {
@@ -4174,7 +4278,8 @@ async fn persist_model_input_to_disk(
     let scan_value = ScanFilter::build_value(input).context("build scan model input")?;
     let core_value = CoreFilter::build_value(input).context("build core model input")?;
     let scan_path = llm_filtered_model_input_path(bundle, "scan");
-    let core_path = llm_filtered_model_input_path(bundle, "core");
+    let core_stage = CoreFilter::stage_label_for_flags(management_mode, pending_order_mode);
+    let core_path = llm_filtered_model_input_path(bundle, core_stage);
 
     write_pretty_json_file(&scan_path, &scan_value)
         .with_context(|| format!("write {}", scan_path.display()))?;
@@ -4212,11 +4317,11 @@ async fn persist_entry_stage_prompt_inputs_to_disk(
     captures: &[EntryStagePromptInputCapture],
     retention_minutes: u64,
 ) -> Result<Vec<(String, PathBuf)>> {
-    ensure_temp_model_input_dir().await?;
+    ensure_temp_model_output_dir().await?;
 
     let mut files = Vec::with_capacity(captures.len());
     for capture in captures {
-        let path = llm_stage_prompt_input_path(
+        let path = llm_stage_prompt_output_path(
             bundle,
             trigger,
             management_mode,
@@ -4243,18 +4348,18 @@ async fn persist_entry_stage_prompt_inputs_to_disk(
         files.push((capture.stage.clone(), path));
     }
 
-    let removed = prune_expired_temp_model_input_files(
-        Path::new(TEMP_MODEL_INPUT_DIR),
+    let removed = prune_expired_temp_model_output_files(
+        Path::new(TEMP_MODEL_OUTPUT_DIR),
         bundle.ts_bucket,
         retention_minutes_i64(retention_minutes),
     )
-    .context("prune expired temp_model_input cache")?;
+    .context("prune expired temp_model_output cache")?;
     if removed > 0 {
         debug!(
             ts_bucket = %bundle.ts_bucket,
             removed,
             retention_minutes = retention_minutes,
-            "pruned expired temp_model_input cache"
+            "pruned expired temp_model_output cache"
         );
     }
 
@@ -4301,7 +4406,7 @@ fn llm_filtered_model_input_path(bundle: &MinuteBundleEnvelope, stage: &str) -> 
     ))
 }
 
-fn llm_stage_prompt_input_path(
+fn llm_stage_prompt_output_path(
     bundle: &MinuteBundleEnvelope,
     _trigger: &str,
     management_mode: bool,
@@ -4326,7 +4431,7 @@ fn llm_stage_prompt_input_path(
     } else {
         "entry"
     };
-    Path::new(TEMP_MODEL_INPUT_DIR).join(format!(
+    Path::new(TEMP_MODEL_OUTPUT_DIR).join(format!(
         "{}_{}_{}_{}_{}_{}_prompt_input_{}.json",
         bucket_ts, symbol, mode, provider, model_name, stage, invoke_ts
     ))
@@ -4711,6 +4816,38 @@ mod tests {
         }
     }
 
+    fn sample_trading_state() -> TradingStateSnapshot {
+        TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: true,
+            active_positions: vec![ActivePositionSnapshot {
+                position_side: "LONG".to_string(),
+                position_amt: 1.0,
+                entry_price: 2010.0,
+                mark_price: 2025.0,
+                unrealized_pnl: 15.0,
+                leverage: 10,
+            }],
+            open_orders: vec![OpenOrderSnapshot {
+                order_id: 1,
+                side: "BUY".to_string(),
+                position_side: "LONG".to_string(),
+                order_type: "LIMIT".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 1.0,
+                executed_qty: 0.0,
+                price: 2005.0,
+                stop_price: 0.0,
+                close_position: false,
+                reduce_only: false,
+            }],
+            total_wallet_balance: 1000.0,
+            available_balance: 900.0,
+        }
+    }
+
     fn sample_indicators_with_known_v() -> Value {
         json!({
             "kline_history": {
@@ -4763,7 +4900,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_model_input_to_disk_writes_scan_and_core_files() {
+    fn persist_model_input_to_disk_writes_scan_and_mode_specific_core_files() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4830,7 +4967,7 @@ mod tests {
                 .core
                 .file_name()
                 .and_then(|name| name.to_str())
-                .map(|name| name.contains("_core_"))
+                .map(|name| name.contains("_entry_core_"))
                 .unwrap_or(false));
 
             let scan_value: Value = serde_json::from_str(
@@ -4869,6 +5006,181 @@ mod tests {
 
             fs::remove_file(&persisted.scan).expect("cleanup scan model input");
             fs::remove_file(&persisted.core).expect("cleanup core model input");
+
+            let management_input = ModelInvocationInput {
+                management_mode: true,
+                pending_order_mode: false,
+                trading_state: Some(sample_trading_state()),
+                management_snapshot: Some(
+                    build_management_snapshot_for_llm(Some(&sample_trading_state()), None, None)
+                        .expect("management snapshot"),
+                ),
+                ..sample_model_input(json!({
+                    "avwap": {
+                        "payload": {
+                            "fut_mark_price": 2001.5678,
+                            "series_by_window": {
+                                "15m": [
+                                    {"ts": "2026-03-14T06:00:00Z", "avwap_fut": 2000.1234}
+                                ]
+                            }
+                        }
+                    }
+                }))
+            };
+            let management_persisted = persist_model_input_to_disk(
+                &bundle,
+                "unit_test",
+                true,
+                false,
+                &management_input,
+                5,
+            )
+            .await
+            .expect("persist management model input");
+            assert!(management_persisted
+                .scan
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.contains("_scan_"))
+                .unwrap_or(false));
+            assert!(management_persisted
+                .core
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.contains("_management_core_"))
+                .unwrap_or(false));
+            fs::remove_file(&management_persisted.scan)
+                .expect("cleanup management scan model input");
+            fs::remove_file(&management_persisted.core)
+                .expect("cleanup management core model input");
+
+            let pending_input = ModelInvocationInput {
+                management_mode: false,
+                pending_order_mode: true,
+                trading_state: Some(sample_trading_state()),
+                management_snapshot: Some(
+                    build_management_snapshot_for_llm(Some(&sample_trading_state()), None, None)
+                        .expect("pending snapshot"),
+                ),
+                ..sample_model_input(json!({
+                    "avwap": {
+                        "payload": {
+                            "fut_mark_price": 2001.5678,
+                            "series_by_window": {
+                                "15m": [
+                                    {"ts": "2026-03-14T06:00:00Z", "avwap_fut": 2000.1234}
+                                ]
+                            }
+                        }
+                    }
+                }))
+            };
+            let pending_persisted =
+                persist_model_input_to_disk(&bundle, "unit_test", false, true, &pending_input, 5)
+                    .await
+                    .expect("persist pending model input");
+            assert!(pending_persisted
+                .scan
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.contains("_scan_"))
+                .unwrap_or(false));
+            assert!(pending_persisted
+                .core
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.contains("_pending_core_"))
+                .unwrap_or(false));
+            fs::remove_file(&pending_persisted.scan).expect("cleanup pending scan model input");
+            fs::remove_file(&pending_persisted.core).expect("cleanup pending core model input");
+        });
+    }
+
+    #[test]
+    fn persist_entry_stage_prompt_inputs_to_disk_writes_to_temp_model_output() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        runtime.block_on(async {
+            let ts_bucket = DateTime::parse_from_rfc3339("2026-03-14T11:15:00Z")
+                .expect("parse ts bucket")
+                .with_timezone(&Utc);
+            let bundle = MinuteBundleEnvelope {
+                msg_type: "indicator_bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                ts_bucket,
+                window_code: "15m".to_string(),
+                indicator_count: 1,
+                published_at: None,
+                indicators: json!({
+                    "kline_history": {
+                        "payload": {
+                            "intervals": {
+                                "15m": {
+                                    "futures": {
+                                        "bars": [
+                                            {"open_time": "2026-03-14T11:00:00Z", "high": 2010.0, "low": 2000.0, "is_closed": true}
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+            };
+            let captures = vec![
+                EntryStagePromptInputCapture {
+                    stage: "scan".to_string(),
+                    prompt_input: json!({"symbol": "ETHUSDT", "stage": "scan"}),
+                    stage_1_setup_scan_json: None,
+                },
+                EntryStagePromptInputCapture {
+                    stage: "finalize".to_string(),
+                    prompt_input: json!({"symbol": "ETHUSDT", "stage": "finalize"}),
+                    stage_1_setup_scan_json: Some(json!({"scan_bias": "bullish"})),
+                },
+            ];
+
+            let files = persist_entry_stage_prompt_inputs_to_disk(
+                &bundle,
+                "unit_test",
+                false,
+                false,
+                "custom_llm",
+                "custom_llm",
+                "custom_llm",
+                &captures,
+                5,
+            )
+            .await
+            .expect("persist entry stage prompt inputs");
+
+            assert_eq!(files.len(), 2);
+            for (stage, path) in files {
+                assert!(path.exists(), "expected {stage} prompt input file to exist");
+                assert!(path.starts_with(TEMP_MODEL_OUTPUT_DIR));
+                assert!(!path.starts_with(TEMP_MODEL_INPUT_DIR));
+                assert!(path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.contains("_prompt_input_"))
+                    .unwrap_or(false));
+
+                let saved: Value = serde_json::from_str(
+                    &fs::read_to_string(&path).expect("read prompt input artifact"),
+                )
+                .expect("parse prompt input artifact");
+                assert_eq!(
+                    saved.get("stage").and_then(Value::as_str),
+                    Some(stage.as_str())
+                );
+
+                fs::remove_file(&path).expect("cleanup prompt input artifact");
+            }
         });
     }
 
