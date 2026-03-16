@@ -254,10 +254,9 @@ fn build_entry_finalize_trace_event(
             "entry"
         },
         "latency_ms": latency_ms,
-        "scan_15m_trend": prior_scan.pointer("/timeframe_analysis/15m/trend").cloned().unwrap_or(Value::Null),
-        "scan_4h_trend": prior_scan.pointer("/timeframe_analysis/4h/trend").cloned().unwrap_or(Value::Null),
-        "scan_1d_trend": prior_scan.pointer("/timeframe_analysis/1d/trend").cloned().unwrap_or(Value::Null),
-        "scan_dominant_bias": prior_scan.pointer("/flow_context/dominant_bias").cloned().unwrap_or(Value::Null),
+        "scan_15m_trend": prior_scan.pointer("/15m/trend").cloned().unwrap_or(Value::Null),
+        "scan_4h_trend": prior_scan.pointer("/4h/trend").cloned().unwrap_or(Value::Null),
+        "scan_1d_trend": prior_scan.pointer("/1d/trend").cloned().unwrap_or(Value::Null),
         "scan_market_narrative": prior_scan.pointer("/market_narrative").cloned().unwrap_or(Value::Null),
         "stage_2_filter": "core",
         "raw_indicator_count": input.indicators.as_object().map(|obj| obj.len()).unwrap_or(0),
@@ -374,80 +373,54 @@ fn parse_entry_scan_output(provider: &str, raw_text: &str) -> Result<Value, Prov
 }
 
 fn validate_scan_output(value: &Value) -> Result<()> {
-    let tf_analysis = value
-        .get("timeframe_analysis")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("scan timeframe_analysis is missing or not an object"))?;
     for tf in ["15m", "4h", "1d"] {
-        let tf_obj = tf_analysis
+        let tf_obj = value
             .get(tf)
             .and_then(Value::as_object)
-            .ok_or_else(|| anyhow!("scan timeframe_analysis.{} is missing or not an object", tf))?;
+            .ok_or_else(|| anyhow!("scan {} is missing or not an object", tf))?;
         let trend = tf_obj
             .get("trend")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("scan timeframe_analysis.{}.trend is missing", tf))?;
+            .ok_or_else(|| anyhow!("scan {}.trend is missing", tf))?;
         if !matches!(trend, "Bullish" | "Bearish" | "Sideways") {
             return Err(anyhow!(
-                "scan timeframe_analysis.{}.trend must be Bullish/Bearish/Sideways",
+                "scan {}.trend must be Bullish/Bearish/Sideways",
                 tf
             ));
         }
         tf_obj
             .get("range")
             .and_then(Value::as_object)
-            .ok_or_else(|| {
-                anyhow!(
-                    "scan timeframe_analysis.{}.range is missing or not an object",
-                    tf
-                )
-            })?;
+            .ok_or_else(|| anyhow!("scan {}.range is missing or not an object", tf))?;
         let agreement = tf_obj
             .get("signal_agreement")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("scan timeframe_analysis.{}.signal_agreement is missing", tf))?;
+            .ok_or_else(|| anyhow!("scan {}.signal_agreement is missing", tf))?;
         if !matches!(agreement, "strong" | "mixed" | "conflicted") {
             return Err(anyhow!(
-                "scan timeframe_analysis.{}.signal_agreement must be strong/mixed/conflicted",
+                "scan {}.signal_agreement must be strong/mixed/conflicted",
                 tf
             ));
         }
         tf_obj
             .get("supporting_signals")
             .and_then(Value::as_array)
-            .ok_or_else(|| {
-                anyhow!(
-                    "scan timeframe_analysis.{}.supporting_signals is missing",
-                    tf
-                )
-            })?;
+            .ok_or_else(|| anyhow!("scan {}.supporting_signals is missing", tf))?;
         tf_obj
             .get("conflicting_signals")
             .and_then(Value::as_array)
-            .ok_or_else(|| {
-                anyhow!(
-                    "scan timeframe_analysis.{}.conflicting_signals is missing",
-                    tf
-                )
-            })?;
+            .ok_or_else(|| anyhow!("scan {}.conflicting_signals is missing", tf))?;
         tf_obj
             .get("opportunity")
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow!("scan timeframe_analysis.{}.opportunity is missing", tf))?;
+            .ok_or_else(|| anyhow!("scan {}.opportunity is missing", tf))?;
         tf_obj
             .get("risk")
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow!("scan timeframe_analysis.{}.risk is missing", tf))?;
+            .ok_or_else(|| anyhow!("scan {}.risk is missing", tf))?;
     }
-    value
-        .get("flow_context")
-        .and_then(Value::as_object)
-        .and_then(|obj| obj.get("dominant_bias"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("scan flow_context.dominant_bias must be non-empty"))?;
     value
         .get("market_narrative")
         .and_then(Value::as_str)
@@ -458,24 +431,10 @@ fn validate_scan_output(value: &Value) -> Result<()> {
 
 fn sanitize_scan_for_stage2(value: &Value) -> Value {
     let mut sanitized = value.clone();
-    if let Some(timeframe_analysis) = sanitized
-        .get_mut("timeframe_analysis")
-        .and_then(Value::as_object_mut)
-    {
-        for tf in ["15m", "4h", "1d"] {
-            if let Some(tf_obj) = timeframe_analysis
-                .get_mut(tf)
-                .and_then(Value::as_object_mut)
-            {
-                tf_obj.remove("story");
-            }
+    for tf in ["15m", "4h", "1d"] {
+        if let Some(tf_obj) = sanitized.get_mut(tf).and_then(Value::as_object_mut) {
+            tf_obj.remove("story");
         }
-    }
-    if let Some(flow_context) = sanitized
-        .get_mut("flow_context")
-        .and_then(Value::as_object_mut)
-    {
-        flow_context.remove("story");
     }
     sanitized
 }
@@ -1243,9 +1202,9 @@ fn qwen_output_contract(
 ) -> String {
     if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
         if is_medium_large(prompt_template) {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `timeframe_analysis`, `flow_context`, and `market_narrative`.\n- `timeframe_analysis` must contain exactly `15m`, `4h`, and `1d`.\n- Each timeframe must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n- `flow_context` must include `dominant_bias` and `key_signals`.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, `1d`, and `market_narrative`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n".to_string()
         } else {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `timeframe_analysis`, `flow_context`, and `market_narrative`.\n- `timeframe_analysis` must contain exactly `15m`, `4h`, and `1d`.\n- Each timeframe must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n- `flow_context` must include `dominant_bias` and `key_signals`.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, `1d`, and `market_narrative`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n".to_string()
         }
     } else if pending_order_mode {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `reason` and `params`. `analysis` and `self_check` may be present as extra objects.\n- `reason` must be a non-empty top-level string. Do not place `reason` inside `analysis`.\n- `params` must contain exactly: `entry`, `tp`, `sl`, `leverage` — each a number or null.\n- Set all params to null if there is no valid setup.\n".to_string()
@@ -1380,25 +1339,11 @@ fn qwen_entry_scan_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["timeframe_analysis", "flow_context", "market_narrative"],
+        "required": ["15m", "4h", "1d", "market_narrative"],
         "properties": {
-            "timeframe_analysis": {
-                "type": "object",
-                "required": ["15m", "4h", "1d"],
-                "properties": {
-                    "15m": scan_timeframe_schema_openai(),
-                    "4h":  scan_timeframe_schema_openai(),
-                    "1d":  scan_timeframe_schema_openai(),
-                }
-            },
-            "flow_context": {
-                "type": "object",
-                "required": ["dominant_bias", "key_signals"],
-                "properties": {
-                    "dominant_bias": { "type": "string" },
-                    "key_signals": { "type": "array", "items": { "type": "string" } }
-                }
-            },
+            "15m": scan_timeframe_schema_openai(),
+            "4h": scan_timeframe_schema_openai(),
+            "1d": scan_timeframe_schema_openai(),
             "market_narrative": { "type": "string" }
         }
     })
@@ -1438,27 +1383,11 @@ fn custom_llm_entry_scan_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["timeframe_analysis", "flow_context", "market_narrative"],
+        "required": ["15m", "4h", "1d", "market_narrative"],
         "properties": {
-            "timeframe_analysis": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["15m", "4h", "1d"],
-                "properties": {
-                    "15m": scan_timeframe_schema_openai(),
-                    "4h":  scan_timeframe_schema_openai(),
-                    "1d":  scan_timeframe_schema_openai(),
-                }
-            },
-            "flow_context": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["dominant_bias", "key_signals"],
-                "properties": {
-                    "dominant_bias": { "type": "string" },
-                    "key_signals": { "type": "array", "items": { "type": "string" } }
-                }
-            },
+            "15m": scan_timeframe_schema_openai(),
+            "4h": scan_timeframe_schema_openai(),
+            "1d": scan_timeframe_schema_openai(),
             "market_narrative": { "type": "string" }
         }
     })
@@ -2205,27 +2134,11 @@ fn grok_entry_scan_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["timeframe_analysis", "flow_context", "market_narrative"],
+        "required": ["15m", "4h", "1d", "market_narrative"],
         "properties": {
-            "timeframe_analysis": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["15m", "4h", "1d"],
-                "properties": {
-                    "15m": scan_timeframe_schema_grok(),
-                    "4h":  scan_timeframe_schema_grok(),
-                    "1d":  scan_timeframe_schema_grok(),
-                }
-            },
-            "flow_context": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["dominant_bias", "key_signals"],
-                "properties": {
-                    "dominant_bias": { "type": "string" },
-                    "key_signals": { "type": "array", "items": { "type": "string" } }
-                }
-            },
+            "15m": scan_timeframe_schema_grok(),
+            "4h": scan_timeframe_schema_grok(),
+            "1d": scan_timeframe_schema_grok(),
             "market_narrative": { "type": "string" }
         }
     })
@@ -2437,27 +2350,11 @@ fn ml_grok_entry_scan_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["timeframe_analysis", "flow_context", "market_narrative"],
+        "required": ["15m", "4h", "1d", "market_narrative"],
         "properties": {
-            "timeframe_analysis": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["15m", "4h", "1d"],
-                "properties": {
-                    "15m": scan_timeframe_schema_grok(),
-                    "4h":  scan_timeframe_schema_grok(),
-                    "1d":  scan_timeframe_schema_grok(),
-                }
-            },
-            "flow_context": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["dominant_bias", "key_signals"],
-                "properties": {
-                    "dominant_bias": { "type": "string" },
-                    "key_signals": { "type": "array", "items": { "type": "string" } }
-                }
-            },
+            "15m": scan_timeframe_schema_grok(),
+            "4h": scan_timeframe_schema_grok(),
+            "1d": scan_timeframe_schema_grok(),
             "market_narrative": { "type": "string" }
         }
     })
@@ -2524,26 +2421,12 @@ fn ml_gemini_entry_scan_schema() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
-            "timeframe_analysis": {
-                "type": "OBJECT",
-                "properties": {
-                    "15m": scan_timeframe_schema_gemini(),
-                    "4h":  scan_timeframe_schema_gemini(),
-                    "1d":  scan_timeframe_schema_gemini(),
-                },
-                "required": ["15m", "4h", "1d"]
-            },
-            "flow_context": {
-                "type": "OBJECT",
-                "properties": {
-                    "dominant_bias": { "type": "STRING" },
-                    "key_signals": { "type": "ARRAY", "items": { "type": "STRING" } }
-                },
-                "required": ["dominant_bias", "key_signals"]
-            },
+            "15m": scan_timeframe_schema_gemini(),
+            "4h": scan_timeframe_schema_gemini(),
+            "1d": scan_timeframe_schema_gemini(),
             "market_narrative": { "type": "STRING" }
         },
-        "required": ["timeframe_analysis", "flow_context", "market_narrative"]
+        "required": ["15m", "4h", "1d", "market_narrative"]
     })
 }
 
@@ -2603,25 +2486,11 @@ fn ml_qwen_entry_scan_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["timeframe_analysis", "flow_context", "market_narrative"],
+        "required": ["15m", "4h", "1d", "market_narrative"],
         "properties": {
-            "timeframe_analysis": {
-                "type": "object",
-                "required": ["15m", "4h", "1d"],
-                "properties": {
-                    "15m": scan_timeframe_schema_openai(),
-                    "4h":  scan_timeframe_schema_openai(),
-                    "1d":  scan_timeframe_schema_openai(),
-                }
-            },
-            "flow_context": {
-                "type": "object",
-                "required": ["dominant_bias", "key_signals"],
-                "properties": {
-                    "dominant_bias": { "type": "string" },
-                    "key_signals": { "type": "array", "items": { "type": "string" } }
-                }
-            },
+            "15m": scan_timeframe_schema_openai(),
+            "4h": scan_timeframe_schema_openai(),
+            "1d": scan_timeframe_schema_openai(),
             "market_narrative": { "type": "string" }
         }
     })
@@ -2659,27 +2528,11 @@ fn ml_custom_llm_entry_scan_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["timeframe_analysis", "flow_context", "market_narrative"],
+        "required": ["15m", "4h", "1d", "market_narrative"],
         "properties": {
-            "timeframe_analysis": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["15m", "4h", "1d"],
-                "properties": {
-                    "15m": scan_timeframe_schema_openai(),
-                    "4h":  scan_timeframe_schema_openai(),
-                    "1d":  scan_timeframe_schema_openai(),
-                }
-            },
-            "flow_context": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["dominant_bias", "key_signals"],
-                "properties": {
-                    "dominant_bias": { "type": "string" },
-                    "key_signals": { "type": "array", "items": { "type": "string" } }
-                }
-            },
+            "15m": scan_timeframe_schema_openai(),
+            "4h": scan_timeframe_schema_openai(),
+            "1d": scan_timeframe_schema_openai(),
             "market_narrative": { "type": "string" }
         }
     })
@@ -2766,26 +2619,12 @@ fn gemini_entry_scan_response_schema() -> Value {
     json!({
         "type": "OBJECT",
         "properties": {
-            "timeframe_analysis": {
-                "type": "OBJECT",
-                "properties": {
-                    "15m": scan_timeframe_schema_gemini(),
-                    "4h":  scan_timeframe_schema_gemini(),
-                    "1d":  scan_timeframe_schema_gemini(),
-                },
-                "required": ["15m", "4h", "1d"]
-            },
-            "flow_context": {
-                "type": "OBJECT",
-                "properties": {
-                    "dominant_bias": { "type": "STRING" },
-                    "key_signals": { "type": "ARRAY", "items": { "type": "STRING" } }
-                },
-                "required": ["dominant_bias", "key_signals"]
-            },
+            "15m": scan_timeframe_schema_gemini(),
+            "4h": scan_timeframe_schema_gemini(),
+            "1d": scan_timeframe_schema_gemini(),
             "market_narrative": { "type": "STRING" }
         },
-        "required": ["timeframe_analysis", "flow_context", "market_narrative"]
+        "required": ["15m", "4h", "1d", "market_narrative"]
     })
 }
 
@@ -3631,42 +3470,36 @@ mod tests {
 
     fn sample_stage_1_scan() -> Value {
         json!({
-            "timeframe_analysis": {
-                "15m": sample_scan_tf(
-                    "Bullish",
-                    "strong",
-                    1994.0,
-                    2018.0,
-                    &["15m ema bull", "cvd bullish"],
-                    &["absorption bearish"],
-                    "Break above 2018 extends local impulse",
-                    "Loss of 1994 weakens trigger context"
-                ),
-                "4h": sample_scan_tf(
-                    "Bullish",
-                    "mixed",
-                    1988.0,
-                    2035.0,
-                    &["4h ema bull", "higher support intact"],
-                    &["whale bias bearish"],
-                    "Acceptance above 2035 opens continuation",
-                    "Failure back through 1988 breaks setup"
-                ),
-                "1d": sample_scan_tf(
-                    "Sideways",
-                    "mixed",
-                    1960.0,
-                    2050.0,
-                    &["daily value area intact"],
-                    &["trend/flow not fully aligned"],
-                    "Breakout above 2050 improves macro structure",
-                    "Loss of 1960 reopens downside auction"
-                )
-            },
-            "flow_context": {
-                "dominant_bias": "bullish",
-                "key_signals": ["bid wall intact", "delta recovering"]
-            },
+            "15m": sample_scan_tf(
+                "Bullish",
+                "strong",
+                1994.0,
+                2018.0,
+                &["15m ema bull", "cvd bullish"],
+                &["absorption bearish"],
+                "Break above 2018 extends local impulse",
+                "Loss of 1994 weakens trigger context"
+            ),
+            "4h": sample_scan_tf(
+                "Bullish",
+                "mixed",
+                1988.0,
+                2035.0,
+                &["4h ema bull", "higher support intact"],
+                &["whale bias bearish"],
+                "Acceptance above 2035 opens continuation",
+                "Failure back through 1988 breaks setup"
+            ),
+            "1d": sample_scan_tf(
+                "Sideways",
+                "mixed",
+                1960.0,
+                2050.0,
+                &["daily value area intact"],
+                &["trend/flow not fully aligned"],
+                "Breakout above 2050 improves macro structure",
+                "Loss of 1960 reopens downside auction"
+            ),
             "market_narrative": "15m and 4h constructive, 1d rotational"
         })
     }
@@ -4200,30 +4033,21 @@ mod tests {
             );
             assert_eq!(
                 schema
-                    .pointer("/properties/timeframe_analysis/additionalProperties")
+                    .pointer("/properties/15m/additionalProperties")
                     .and_then(|v| v.as_bool()),
                 Some(false),
-                "timeframe_analysis should be strict for {prompt_template}"
+                "15m should be strict for {prompt_template}"
             );
             assert_eq!(
                 schema
-                    .pointer("/properties/flow_context/additionalProperties")
-                    .and_then(|v| v.as_bool()),
-                Some(false),
-                "flow_context should be strict for {prompt_template}"
-            );
-            assert_eq!(
-                schema
-                    .pointer(
-                        "/properties/timeframe_analysis/properties/15m/properties/range/additionalProperties"
-                    )
+                    .pointer("/properties/15m/properties/range/additionalProperties")
                     .and_then(|v| v.as_bool()),
                 Some(false),
                 "range should be strict for {prompt_template}"
             );
             assert_eq!(
                 schema
-                    .pointer("/properties/timeframe_analysis/properties/15m/properties/supporting_signals/type")
+                    .pointer("/properties/15m/properties/supporting_signals/type")
                     .and_then(|v| v.as_str()),
                 Some("array"),
                 "supporting_signals should exist for {prompt_template}"
@@ -4240,9 +4064,7 @@ mod tests {
                 super::prompt::EntryPromptStage::Scan,
                 prompt_template,
             );
-            assert!(
-                contract.contains("`timeframe_analysis`, `flow_context`, and `market_narrative`")
-            );
+            assert!(contract.contains("`15m`, `4h`, `1d`, and `market_narrative`"));
             assert!(contract.contains("`supporting_signals`"));
             assert!(!contract.contains("`range_basis`"));
             assert!(!contract.contains("`range_role_used`"));
@@ -4272,15 +4094,9 @@ mod tests {
             management_snapshot: None,
         };
         let scan = json!({
-            "timeframe_analysis": {
-                "15m": sample_scan_tf("Bullish", "mixed", 2030.0, 2060.0, &["positive cvd", "range support held"], &["funding stretched"], "Push through 2060 extends 15m trend", "Loss of 2030 weakens trigger structure"),
-                "4h": sample_scan_tf("Bullish", "strong", 2020.0, 2080.0, &["4h trend up", "support defended"], &[], "Acceptance above 2080 opens continuation", "Failure below 2020 damages setup"),
-                "1d": sample_scan_tf("Sideways", "mixed", 2000.0, 2100.0, &["daily auction balanced"], &["macro trend unresolved"], "Breakout above 2100 improves daily backdrop", "Loss of 2000 reopens downside risk")
-            },
-            "flow_context": {
-                "dominant_bias": "bullish",
-                "key_signals": ["positive cvd", "whale buy"]
-            },
+            "15m": sample_scan_tf("Bullish", "mixed", 2030.0, 2060.0, &["positive cvd", "range support held"], &["funding stretched"], "Push through 2060 extends 15m trend", "Loss of 2030 weakens trigger structure"),
+            "4h": sample_scan_tf("Bullish", "strong", 2020.0, 2080.0, &["4h trend up", "support defended"], &[], "Acceptance above 2080 opens continuation", "Failure below 2020 damages setup"),
+            "1d": sample_scan_tf("Sideways", "mixed", 2000.0, 2100.0, &["daily auction balanced"], &["macro trend unresolved"], "Breakout above 2100 improves daily backdrop", "Loss of 2000 reopens downside risk"),
             "market_narrative": "4h and 15m bullish, 1d neutral — tactical long bias"
         });
 
@@ -4296,10 +4112,6 @@ mod tests {
         assert_eq!(
             event.get("scan_1d_trend").and_then(Value::as_str),
             Some("Sideways")
-        );
-        assert_eq!(
-            event.get("scan_dominant_bias").and_then(Value::as_str),
-            Some("bullish")
         );
         assert_eq!(event.get("latency_ms").and_then(Value::as_u64), Some(123));
         assert_eq!(
@@ -4343,15 +4155,9 @@ mod tests {
             management_snapshot: None,
         };
         let scan = json!({
-            "timeframe_analysis": {
-                "15m": sample_scan_tf("Bullish", "strong", 1995.0, 2025.0, &["bid wall holding", "positive obi"], &[], "Break through 2025 releases short-term upside", "Loss of 1995 invalidates trigger"),
-                "4h": sample_scan_tf("Bullish", "strong", 1990.0, 2030.0, &["4h value accepted", "trend support intact"], &[], "Acceptance above 2030 confirms continuation", "Close back below 1990 weakens 4h structure"),
-                "1d": sample_scan_tf("Sideways", "mixed", 1980.0, 2040.0, &["daily rotation intact"], &["top-down breakout not confirmed"], "Breakout above 2040 improves macro context", "Loss of 1980 reopens downside auction")
-            },
-            "flow_context": {
-                "dominant_bias": "bullish",
-                "key_signals": ["bid wall holding", "positive obi"]
-            },
+            "15m": sample_scan_tf("Bullish", "strong", 1995.0, 2025.0, &["bid wall holding", "positive obi"], &[], "Break through 2025 releases short-term upside", "Loss of 1995 invalidates trigger"),
+            "4h": sample_scan_tf("Bullish", "strong", 1990.0, 2030.0, &["4h value accepted", "trend support intact"], &[], "Acceptance above 2030 confirms continuation", "Close back below 1990 weakens 4h structure"),
+            "1d": sample_scan_tf("Sideways", "mixed", 1980.0, 2040.0, &["daily rotation intact"], &["top-down breakout not confirmed"], "Breakout above 2040 improves macro context", "Loss of 1980 reopens downside auction"),
             "market_narrative": "15m and 4h bullish off dom liquidity wall, 1d neutral — tactical long bias"
         });
 
@@ -4566,15 +4372,9 @@ mod tests {
             management_snapshot: None,
         };
         let scan = json!({
-            "timeframe_analysis": {
-                "15m": sample_scan_tf("Bullish", "mixed", 1990.0, 2015.0, &["value area re-fill", "flow long"], &["short-term overhead supply"], "Break above 2015 improves trigger quality", "Loss of 1990 weakens immediate setup"),
-                "4h": sample_scan_tf("Bullish", "strong", 1985.0, 2020.0, &["4h structure up", "support held"], &[], "Acceptance above 2020 confirms continuation", "Failure below 1985 damages setup"),
-                "1d": sample_scan_tf("Bullish", "mixed", 1980.0, 2025.0, &["daily backdrop constructive"], &["macro breakout not complete"], "Daily acceptance above 2025 improves macro trend", "Loss of 1980 increases downside risk")
-            },
-            "flow_context": {
-                "dominant_bias": "bullish",
-                "key_signals": ["value area re-fill", "flow long"]
-            },
+            "15m": sample_scan_tf("Bullish", "mixed", 1990.0, 2015.0, &["value area re-fill", "flow long"], &["short-term overhead supply"], "Break above 2015 improves trigger quality", "Loss of 1990 weakens immediate setup"),
+            "4h": sample_scan_tf("Bullish", "strong", 1985.0, 2020.0, &["4h structure up", "support held"], &[], "Acceptance above 2020 confirms continuation", "Failure below 1985 damages setup"),
+            "1d": sample_scan_tf("Bullish", "mixed", 1980.0, 2025.0, &["daily backdrop constructive"], &["macro breakout not complete"], "Daily acceptance above 2025 improves macro trend", "Loss of 1980 increases downside risk"),
             "market_narrative": "15m and 4h bullish with value area re-fill setup — tactical long near val 1990"
         });
 
@@ -4594,7 +4394,7 @@ mod tests {
             capture
                 .stage_1_setup_scan_json
                 .as_ref()
-                .and_then(|value| value.pointer("/timeframe_analysis/4h/range/support"))
+                .and_then(|value| value.pointer("/4h/range/support"))
                 .and_then(Value::as_f64),
             Some(1985.0)
         );
@@ -4602,27 +4402,14 @@ mod tests {
             capture
                 .stage_1_setup_scan_json
                 .as_ref()
-                .and_then(|value| value.pointer("/timeframe_analysis/15m/range/support"))
+                .and_then(|value| value.pointer("/15m/range/support"))
                 .and_then(Value::as_f64),
             Some(1990.0)
         );
-        assert_eq!(
-            capture
-                .stage_1_setup_scan_json
-                .as_ref()
-                .and_then(|value| value.pointer("/flow_context/dominant_bias"))
-                .and_then(Value::as_str),
-            Some("bullish")
-        );
         assert!(capture
             .stage_1_setup_scan_json
             .as_ref()
-            .and_then(|value| value.pointer("/flow_context/story"))
-            .is_none());
-        assert!(capture
-            .stage_1_setup_scan_json
-            .as_ref()
-            .and_then(|value| value.pointer("/timeframe_analysis/15m/story"))
+            .and_then(|value| value.pointer("/15m/story"))
             .is_none());
         assert_eq!(
             capture
@@ -4926,12 +4713,7 @@ mod tests {
         assert!(capture
             .stage_1_setup_scan_json
             .as_ref()
-            .and_then(|value| value.pointer("/flow_context/story"))
-            .is_none());
-        assert!(capture
-            .stage_1_setup_scan_json
-            .as_ref()
-            .and_then(|value| value.pointer("/timeframe_analysis/15m/story"))
+            .and_then(|value| value.pointer("/15m/story"))
             .is_none());
     }
 
@@ -4964,6 +4746,18 @@ mod tests {
         assert!(capture
             .prompt_input
             .pointer("/indicators/fvg/payload/by_window/1d")
+            .is_some());
+        assert!(capture
+            .prompt_input
+            .pointer("/indicators/fvg/payload/by_window/1d/active_bull_fvgs")
+            .is_none());
+        assert!(capture
+            .prompt_input
+            .pointer("/indicators/fvg/payload/by_window/1d/active_bear_fvgs")
+            .is_none());
+        assert!(capture
+            .prompt_input
+            .pointer("/indicators/fvg/payload/by_window/1d/fvgs")
             .is_none());
         assert!(capture
             .prompt_input
@@ -5020,7 +4814,7 @@ mod tests {
         assert!(capture
             .prompt_input
             .pointer("/indicators/fvg/payload/by_window/3d")
-            .is_some());
+            .is_none());
         assert_eq!(
             capture
                 .prompt_input
@@ -5035,7 +4829,7 @@ mod tests {
                 .pointer("/indicators/orderbook_depth/payload/top_liquidity_levels")
                 .and_then(Value::as_array)
                 .map(Vec::len),
-            Some(100)
+            Some(81)
         );
         assert!(capture.prompt_input.pointer("/finalize_focus").is_none());
     }

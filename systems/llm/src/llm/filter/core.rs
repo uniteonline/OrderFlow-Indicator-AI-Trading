@@ -53,10 +53,9 @@ impl CoreFilter {
             root.insert(
                 "finalize_focus".to_string(),
                 json!({
-                    "scan_15m_trend": prior_scan.pointer("/timeframe_analysis/15m/trend").and_then(Value::as_str).unwrap_or("unknown"),
-                    "scan_4h_trend": prior_scan.pointer("/timeframe_analysis/4h/trend").and_then(Value::as_str).unwrap_or("unknown"),
-                    "scan_1d_trend": prior_scan.pointer("/timeframe_analysis/1d/trend").and_then(Value::as_str).unwrap_or("unknown"),
-                    "scan_dominant_bias": prior_scan.pointer("/flow_context/dominant_bias").and_then(Value::as_str).unwrap_or("unknown"),
+                    "scan_15m_trend": prior_scan.pointer("/15m/trend").and_then(Value::as_str).unwrap_or("unknown"),
+                    "scan_4h_trend": prior_scan.pointer("/4h/trend").and_then(Value::as_str).unwrap_or("unknown"),
+                    "scan_1d_trend": prior_scan.pointer("/1d/trend").and_then(Value::as_str).unwrap_or("unknown"),
                 }),
             );
         }

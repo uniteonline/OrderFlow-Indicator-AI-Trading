@@ -14,8 +14,13 @@ For each timeframe — 15m, 4h, 1d — give:
   - the main risk
 
 Also give:
-  - flow_context: the current dominant flow bias and the key signals behind it
   - market_narrative: one concise top-down explanation of how 1d, 4h, and 15m relate
+
+Return them as top-level keys:
+  - 15m
+  - 4h
+  - 1d
+  - market_narrative
 
 
 RANGE SEMANTICS

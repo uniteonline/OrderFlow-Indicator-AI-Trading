@@ -720,16 +720,16 @@ fn footprint_nearest_clusters(items: &[Value], current_price: f64, n: usize) -> 
 
 | scan 输入字段 | Stage1 输出字段 |
 |------|------|
-| `timeframe_evidence[tf].ranges.local_structure_range.support`（必要时参考 `ranges.session_value_area_range.support`） | `timeframe_analysis[tf].range.support` |
-| `timeframe_evidence[tf].ranges.local_structure_range.resistance`（必要时参考 `ranges.session_value_area_range.resistance`） | `timeframe_analysis[tf].range.resistance` |
-| `by_timeframe[tf].trend.* + by_timeframe[tf].flow.* + timeframe_evidence[tf].balance_scores` | `timeframe_analysis[tf].trend`（由 LLM 自行判断） |
-| `timeframe_evidence[tf].balance_scores.conflict_score + temporal_stability + raw feature contradictions` | `timeframe_analysis[tf].signal_agreement`（由 LLM 自行判断） |
-| `by_timeframe[tf].trend.* + flow.* + signal_snapshot` | `timeframe_analysis[tf].supporting_signals` / `conflicting_signals`（由 LLM 归纳） |
-| `risk_opportunity + clearance_atr + breakout_above/breakdown_below` | `timeframe_analysis[tf].opportunity` / `risk`（由 LLM 归纳） |
-| `multi_timeframe_evidence + breakout_above/breakdown_below + risk_opportunity` | `flow_context` / `market_narrative` |
+| `timeframe_evidence[tf].ranges.local_structure_range.support`（必要时参考 `ranges.session_value_area_range.support`） | 顶层 `{tf}.range.support` |
+| `timeframe_evidence[tf].ranges.local_structure_range.resistance`（必要时参考 `ranges.session_value_area_range.resistance`） | 顶层 `{tf}.range.resistance` |
+| `by_timeframe[tf].trend.* + by_timeframe[tf].flow.* + timeframe_evidence[tf].balance_scores` | 顶层 `{tf}.trend`（由 LLM 自行判断） |
+| `timeframe_evidence[tf].balance_scores.conflict_score + temporal_stability + raw feature contradictions` | 顶层 `{tf}.signal_agreement`（由 LLM 自行判断） |
+| `by_timeframe[tf].trend.* + flow.* + signal_snapshot` | 顶层 `{tf}.supporting_signals` / `conflicting_signals`（由 LLM 归纳） |
+| `risk_opportunity + clearance_atr + breakout_above/breakdown_below` | 顶层 `{tf}.opportunity` / `risk`（由 LLM 归纳） |
+| `multi_timeframe_evidence + breakout_above/breakdown_below + risk_opportunity` | `market_narrative` |
 
 说明：
-`timeframe_evidence[tf].ranges.*`、`current_price_location`、`range_role` 仅用于帮助 LLM 选择最终 `timeframe_analysis[tf].range`，不再输出额外的 `range_basis` / `range_role_used` 给下游。下游只消费最终区间、信号依据、风险和机会。
+`timeframe_evidence[tf].ranges.*`、`current_price_location`、`range_role` 仅用于帮助 LLM 选择最终顶层 `{tf}.range`，不再输出额外的 `range_basis` / `range_role_used` 给下游。下游只消费最终区间、信号依据、风险和机会。
 
 ---
 
