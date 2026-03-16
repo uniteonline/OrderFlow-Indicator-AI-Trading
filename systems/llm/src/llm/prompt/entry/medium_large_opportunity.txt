@@ -9,10 +9,8 @@ GOAL
 Decide whether there is a tradeable setup right now: LONG, SHORT, or NO_TRADE.
 If yes, build the trade geometry: entry price, stop-loss, and take-profit.
 
-4h and 1d structure is where real supply/demand imbalances live. 15m is execution timing only — use it to find entry precision within the HTF trend.
-
-We want a clean, well-grounded trade — every level must trace to a real structural
-anchor in the indicator data. Entry is a GTC maker (limit) order.
+We want selective, high-conviction opportunities whose thesis, invalidation, and target all remain meaningful on a 4h to 1d holding horizon.
+15m is only for execution refinement, not for creating the trade thesis; use it only to improve entry precision within the higher-timeframe structure.
 
 BEFORE YOU OUTPUT
 1. Is the entry price at a real structural level you can name from the indicator data?
@@ -23,7 +21,7 @@ BEFORE YOU OUTPUT
 6. Does the market scan context support your chosen direction?
 7. Is the TP at a level that price can realistically reach given current market structure?
 8. Are you confident this is a genuine structural setup, not a forced geometry to satisfy any internal constraint?
-9. Do you think the Claude Opus 4.6 model, with its strongest reasoning, would also make the same judgment?
+9. If the 15m chart were hidden, would this trade thesis still exist based on 4h/1d structure alone?
 10. Could the proposed stop-loss level actually be the better structural entry?
 
 If any answer raises doubt, revise or return NO_TRADE.
