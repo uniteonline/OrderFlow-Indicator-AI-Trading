@@ -1,4 +1,4 @@
-use chrono::{SecondsFormat, Timelike, Utc};
+use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -510,10 +510,8 @@ pub(super) fn filter_ema_trend_regime(payload: &Value) -> Value {
             "ema_34",
             "ema_band_high",
             "ema_band_low",
-            "trend_regime",
             "ema_100_htf",
             "ema_200_htf",
-            "trend_regime_by_tf",
         ],
     );
     Value::Object(result)
@@ -957,8 +955,6 @@ pub(super) fn filter_divergence(payload: &Value) -> Value {
         &mut result,
         payload,
         &[
-            "signal",
-            "signals",
             "event_count",
             "divergence_type",
             "likely_driver",
@@ -2141,4 +2137,415 @@ fn aggregate_price_clusters(prices: &[Value], step_ratio: f64, limit: usize) -> 
     });
     clusters.truncate(limit);
     clusters
+}
+
+// ── v4 shared helpers (used by management_core and pending_core) ──────────────
+
+pub(super) const MGMT_EVENT_INDICATOR_RULES: &[(&str, usize)] = &[
+    ("absorption", 10),
+    ("buying_exhaustion", 10),
+    ("selling_exhaustion", 10),
+    ("initiation", 10),
+];
+
+pub(super) const MGMT_EVENT_SUMMARY_FIELDS: &[(&str, &str)] = &[
+    ("absorption", "most_recent_absorption"),
+    ("initiation", "most_recent_initiation"),
+    ("buying_exhaustion", "most_recent_buying_exhaustion"),
+    ("selling_exhaustion", "most_recent_selling_exhaustion"),
+    ("divergence", "most_recent_divergence"),
+];
+
+pub(super) const FVG_V4_KEEP_FIELDS: &[&str] = &[
+    "fvg_bottom",
+    "fvg_top",
+    "side",
+    "state",
+    "fill_pct",
+    "touch_count",
+    "displacement_score",
+    "age_bars",
+    "width",
+];
+
+pub(super) const TPO_DEV_SERIES_LIMITS: &[(&str, usize)] = &[("15m", 8), ("1h", 5)];
+
+pub(super) const FOOTPRINT_MIN_STACK_LENGTHS: &[(&str, usize)] =
+    &[("15m", 3), ("4h", 4), ("1d", 7)];
+
+pub(super) fn prune_nulls(value: Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    let pruned = prune_nulls(value);
+                    if pruned.is_null() {
+                        None
+                    } else {
+                        Some((key, pruned))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(prune_nulls)
+                .filter(|value| !value.is_null())
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+pub(super) fn parse_rfc3339_utc(ts: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+pub(super) fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+pub(super) fn truncate_tpo_dev_series_v4(value: Option<&mut Value>) {
+    let Some(dev_series) = value.and_then(Value::as_object_mut) else {
+        return;
+    };
+    for (window, limit) in TPO_DEV_SERIES_LIMITS {
+        if let Some(series) = dev_series.get_mut(*window).and_then(Value::as_array_mut) {
+            series.truncate(*limit);
+        }
+    }
+}
+
+pub(super) fn filter_stack_field_v4(
+    window_value: &mut Map<String, Value>,
+    field: &str,
+    min_length: usize,
+) {
+    let Some(items) = window_value.get_mut(field).and_then(Value::as_array_mut) else {
+        return;
+    };
+    items.retain(|entry| {
+        entry
+            .get("length")
+            .and_then(Value::as_u64)
+            .map(|length| length as usize >= min_length)
+            .unwrap_or(false)
+    });
+}
+
+pub(super) fn recompute_max_stack_len_v4(
+    window_value: &mut Map<String, Value>,
+    field: &str,
+    max_field: &str,
+) {
+    let max_len = window_value
+        .get(field)
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .filter_map(|entry| entry.get("length").and_then(Value::as_u64))
+                .max()
+        });
+    match max_len {
+        Some(value) => {
+            window_value.insert(max_field.to_string(), Value::from(value));
+        }
+        None => {
+            window_value.remove(max_field);
+        }
+    }
+}
+
+pub(super) fn sanitize_fvg_value_v4(value: Value) -> Value {
+    let Some(entry) = value.as_object() else {
+        return Value::Null;
+    };
+    let mut filtered = Map::new();
+
+    if let Some(bottom) = entry
+        .get("fvg_bottom")
+        .cloned()
+        .or_else(|| entry.get("lower").cloned())
+    {
+        filtered.insert("fvg_bottom".to_string(), bottom);
+    }
+    if let Some(top) = entry
+        .get("fvg_top")
+        .cloned()
+        .or_else(|| entry.get("upper").cloned())
+    {
+        filtered.insert("fvg_top".to_string(), top);
+    }
+
+    for field in FVG_V4_KEEP_FIELDS {
+        if matches!(*field, "fvg_bottom" | "fvg_top") {
+            continue;
+        }
+        if let Some(field_value) = entry.get(*field) {
+            filtered.insert((*field).to_string(), field_value.clone());
+        }
+    }
+
+    let filtered = prune_nulls(Value::Object(filtered));
+    match filtered {
+        Value::Object(object) if object.is_empty() => Value::Null,
+        other => other,
+    }
+}
+
+pub(super) fn sanitize_fvg_object_field_v4(target: &mut Map<String, Value>, field: &str) {
+    let Some(value) = target.remove(field) else {
+        return;
+    };
+    let sanitized = sanitize_fvg_value_v4(value);
+    if !sanitized.is_null() {
+        target.insert(field.to_string(), sanitized);
+    }
+}
+
+pub(super) fn sanitize_fvg_array_field_v4(target: &mut Map<String, Value>, field: &str) {
+    let Some(items) = target
+        .remove(field)
+        .and_then(|value| value.as_array().cloned())
+    else {
+        return;
+    };
+    let sanitized: Vec<Value> = items
+        .into_iter()
+        .map(sanitize_fvg_value_v4)
+        .filter(|value| !value.is_null())
+        .collect();
+    target.insert(field.to_string(), Value::Array(sanitized));
+}
+
+pub(super) fn extract_filtered_futures_bars_v4(
+    indicators: &Map<String, Value>,
+    tf: &str,
+) -> Option<Vec<Map<String, Value>>> {
+    indicators
+        .get("kline_history")
+        .and_then(|indicator| indicator.get("payload"))
+        .and_then(|payload| payload.get("intervals"))
+        .and_then(Value::as_object)
+        .and_then(|intervals| intervals.get(tf))
+        .and_then(Value::as_object)
+        .and_then(|interval| interval.get("markets"))
+        .and_then(Value::as_object)
+        .and_then(|markets| markets.get("futures"))
+        .and_then(Value::as_array)
+        .map(|bars| {
+            bars.iter()
+                .filter_map(Value::as_object)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+}
+
+pub(super) fn compute_atr14_v4(bars: &[Map<String, Value>]) -> Option<f64> {
+    if bars.is_empty() {
+        return None;
+    }
+    let mut true_ranges = Vec::new();
+    let mut prev_close: Option<f64> = None;
+    for bar in bars {
+        let Some(high) = bar.get("high").and_then(Value::as_f64) else {
+            continue;
+        };
+        let Some(low) = bar.get("low").and_then(Value::as_f64) else {
+            continue;
+        };
+        let Some(close) = bar.get("close").and_then(Value::as_f64) else {
+            continue;
+        };
+        let tr = if let Some(prev_close) = prev_close {
+            (high - low)
+                .max((high - prev_close).abs())
+                .max((low - prev_close).abs())
+        } else {
+            high - low
+        };
+        true_ranges.push(tr);
+        prev_close = Some(close);
+    }
+    if true_ranges.is_empty() {
+        return None;
+    }
+    let window = true_ranges.len().min(14);
+    Some(
+        true_ranges[true_ranges.len() - window..]
+            .iter()
+            .sum::<f64>()
+            / window as f64,
+    )
+}
+
+fn event_reference_ts_v4(event: &Map<String, Value>) -> Option<DateTime<Utc>> {
+    event_reference_ts_str_v4(event).and_then(parse_rfc3339_utc)
+}
+
+fn event_reference_ts_str_v4<'a>(event: &'a Map<String, Value>) -> Option<&'a str> {
+    [
+        "confirm_ts",
+        "event_end_ts",
+        "pivot_confirm_ts_2",
+        "pivot_ts_2",
+        "event_start_ts",
+        "pivot_confirm_ts_1",
+        "pivot_ts_1",
+    ]
+    .into_iter()
+    .find_map(|field| event.get(field).and_then(Value::as_str))
+}
+
+fn most_recent_event_from_array_v4(events: &[Value]) -> Option<&Map<String, Value>> {
+    events
+        .iter()
+        .filter_map(Value::as_object)
+        .max_by_key(|event| event_reference_ts_v4(*event))
+}
+
+fn direction_label_from_sign_v4(value: f64) -> &'static str {
+    if value > 0.0 {
+        "bullish"
+    } else if value < 0.0 {
+        "bearish"
+    } else {
+        "neutral"
+    }
+}
+
+fn event_direction_from_type_v4(event_type: &str) -> &'static str {
+    let normalized = event_type.to_ascii_lowercase();
+    if normalized.contains("bullish") || normalized == "selling_exhaustion" {
+        "bullish"
+    } else if normalized.contains("bearish") || normalized == "buying_exhaustion" {
+        "bearish"
+    } else {
+        "neutral"
+    }
+}
+
+fn event_direction_label_v4(event: &Map<String, Value>) -> &'static str {
+    if let Some(direction) = event.get("direction") {
+        if let Some(value) = direction.as_i64() {
+            return direction_label_from_sign_v4(value as f64);
+        }
+        if let Some(value) = direction.as_f64() {
+            return direction_label_from_sign_v4(value);
+        }
+        if let Some(value) = direction.as_str() {
+            let normalized = value.to_ascii_lowercase();
+            if normalized.contains("bull") {
+                return "bullish";
+            }
+            if normalized.contains("bear") {
+                return "bearish";
+            }
+        }
+    }
+
+    event
+        .get("type")
+        .and_then(Value::as_str)
+        .map(event_direction_from_type_v4)
+        .unwrap_or("neutral")
+}
+
+fn event_price_v4(event: &Map<String, Value>) -> Option<f64> {
+    [
+        "pivot_price",
+        "price_end",
+        "price_start",
+        "price_high",
+        "price_low",
+    ]
+    .into_iter()
+    .find_map(|field| event.get(field).and_then(Value::as_f64))
+}
+
+fn build_most_recent_event_summary_v4(
+    indicator: Option<&Value>,
+    current_ts: Option<DateTime<Utc>>,
+    current_price: Option<f64>,
+    atr14: Option<f64>,
+) -> Option<Value> {
+    let payload = indicator?.get("payload")?.as_object()?;
+    let event = payload
+        .get("recent_7d")
+        .and_then(Value::as_object)
+        .and_then(|recent| recent.get("events"))
+        .and_then(Value::as_array)
+        .and_then(|events| most_recent_event_from_array_v4(events))
+        .or_else(|| payload.get("latest_7d").and_then(Value::as_object))?;
+
+    let mut summary = Map::new();
+    if let Some(confirm_ts) = event_reference_ts_str_v4(event) {
+        summary.insert(
+            "confirm_ts".to_string(),
+            Value::String(confirm_ts.to_string()),
+        );
+    }
+    if let (Some(event_ts), Some(current_ts)) = (event_reference_ts_v4(event), current_ts) {
+        let minutes_ago = (current_ts - event_ts).num_minutes().max(0);
+        summary.insert("minutes_ago".to_string(), Value::from(minutes_ago));
+    }
+    summary.insert(
+        "direction".to_string(),
+        Value::String(event_direction_label_v4(event).to_string()),
+    );
+    if let Some(event_type) = event.get("type").cloned() {
+        summary.insert("type".to_string(), event_type);
+    }
+    if let Some(price) = event_price_v4(event) {
+        summary.insert("price".to_string(), Value::from(price));
+        if let (Some(current_price), Some(atr14)) = (current_price, atr14) {
+            if atr14 > 0.0 {
+                summary.insert(
+                    "price_distance_atr".to_string(),
+                    Value::from(round2((price - current_price).abs() / atr14)),
+                );
+            }
+        }
+    }
+    if let Some(score) = event.get("score").cloned() {
+        summary.insert("score".to_string(), score);
+    }
+    if let Some(sig_pass) = event.get("sig_pass").cloned() {
+        summary.insert("sig_pass".to_string(), sig_pass);
+    }
+
+    match prune_nulls(Value::Object(summary)) {
+        Value::Object(object) if !object.is_empty() => Some(Value::Object(object)),
+        _ => None,
+    }
+}
+
+pub(super) fn build_events_summary_v4(
+    indicators: &Map<String, Value>,
+    current_ts: Option<DateTime<Utc>>,
+    current_price: Option<f64>,
+) -> Option<Map<String, Value>> {
+    let atr14 = extract_filtered_futures_bars_v4(indicators, "15m")
+        .as_deref()
+        .and_then(compute_atr14_v4);
+    let mut payload = Map::new();
+
+    for (indicator_code, output_key) in MGMT_EVENT_SUMMARY_FIELDS {
+        let summary = build_most_recent_event_summary_v4(
+            indicators.get(*indicator_code),
+            current_ts,
+            current_price,
+            atr14,
+        );
+        if let Some(summary) = summary {
+            payload.insert((*output_key).to_string(), summary);
+        }
+    }
+
+    (!payload.is_empty()).then_some(payload)
 }

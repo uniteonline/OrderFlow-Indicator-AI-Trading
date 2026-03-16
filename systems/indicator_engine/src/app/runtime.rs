@@ -478,6 +478,8 @@ fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Opti
     use flate2::read::GzDecoder;
     use std::fs::File;
 
+    const MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT: usize = 60;
+
     if path.is_empty() {
         return None;
     }
@@ -523,10 +525,36 @@ fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Opti
         warn!("State snapshot futures history is not a strict contiguous minute series, ignoring");
         return None;
     }
+    if let Some((start, end, len)) = find_long_null_price_run(
+        &snap.history_futures,
+        MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
+    ) {
+        warn!(
+            run_start = %start,
+            run_end = %end,
+            run_len = len,
+            max_allowed = MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
+            "State snapshot futures history contains long null-price run, ignoring"
+        );
+        return None;
+    }
     if !snap.history_spot.is_empty()
         && !minute_history_is_strictly_contiguous(&snap.history_spot, snap.last_finalized_ts)
     {
         warn!("State snapshot spot history is not a strict contiguous minute series, ignoring");
+        return None;
+    }
+    if let Some((start, end, len)) = find_long_null_price_run(
+        &snap.history_spot,
+        MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
+    ) {
+        warn!(
+            run_start = %start,
+            run_end = %end,
+            run_len = len,
+            max_allowed = MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
+            "State snapshot spot history contains long null-price run, ignoring"
+        );
         return None;
     }
     Some(snap)
@@ -554,6 +582,51 @@ fn minute_history_is_strictly_contiguous(
         next.ts_bucket > prev.ts_bucket
             && (next.ts_bucket - prev.ts_bucket) == ChronoDuration::minutes(1)
     })
+}
+
+fn find_long_null_price_run(
+    history: &[MinuteHistory],
+    min_run_len: usize,
+) -> Option<(DateTime<Utc>, DateTime<Utc>, usize)> {
+    if history.is_empty() || min_run_len == 0 {
+        return None;
+    }
+
+    let mut run_start: Option<DateTime<Utc>> = None;
+    let mut run_end: Option<DateTime<Utc>> = None;
+    let mut run_len = 0usize;
+
+    for row in history {
+        if minute_history_has_any_price(row) {
+            if run_len >= min_run_len {
+                return Some((run_start?, run_end?, run_len));
+            }
+            run_start = None;
+            run_end = None;
+            run_len = 0;
+            continue;
+        }
+
+        if run_start.is_none() {
+            run_start = Some(row.ts_bucket);
+        }
+        run_end = Some(row.ts_bucket);
+        run_len += 1;
+    }
+
+    if run_len >= min_run_len {
+        Some((run_start?, run_end?, run_len))
+    } else {
+        None
+    }
+}
+
+fn minute_history_has_any_price(row: &MinuteHistory) -> bool {
+    row.open_price.is_some()
+        || row.high_price.is_some()
+        || row.low_price.is_some()
+        || row.close_price.is_some()
+        || row.last_price.is_some()
 }
 
 async fn save_state_snapshot(snap: &StateSnapshot, path: &str) -> anyhow::Result<()> {
@@ -2243,11 +2316,15 @@ async fn export_snapshots(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_backfill_sql, minute_history_is_strictly_contiguous};
+    use super::{
+        build_backfill_sql, find_long_null_price_run, minute_history_is_strictly_contiguous,
+    };
     use crate::ingest::decoder::MarketKind;
     use crate::runtime::state_store::MinuteHistory;
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use std::collections::BTreeMap;
+
+    const MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT: usize = 60;
 
     fn history_row(ts_bucket: chrono::DateTime<Utc>) -> MinuteHistory {
         MinuteHistory {
@@ -2293,6 +2370,19 @@ mod tests {
             whale_qty_eth_buy: 0.0,
             whale_qty_eth_sell: 0.0,
             profile: BTreeMap::new(),
+        }
+    }
+
+    fn priced_history_row(ts_bucket: chrono::DateTime<Utc>, price: f64) -> MinuteHistory {
+        MinuteHistory {
+            open_price: Some(price),
+            high_price: Some(price),
+            low_price: Some(price),
+            close_price: Some(price),
+            last_price: Some(price),
+            total_qty: 1.0,
+            total_notional: price,
+            ..history_row(ts_bucket)
         }
     }
 
@@ -2356,5 +2446,42 @@ mod tests {
             history_row(start),
         ];
         assert!(!minute_history_is_strictly_contiguous(&out_of_order, start));
+    }
+
+    #[test]
+    fn snapshot_null_price_guard_accepts_short_run() {
+        let start = Utc.with_ymd_and_hms(2026, 3, 10, 5, 0, 0).single().unwrap();
+        let mut history = vec![priced_history_row(start, 2000.0)];
+        for offset in 1..MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT {
+            history.push(history_row(start + ChronoDuration::minutes(offset as i64)));
+        }
+        history.push(priced_history_row(
+            start + ChronoDuration::minutes(MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT as i64),
+            2001.0,
+        ));
+
+        assert_eq!(
+            find_long_null_price_run(&history, MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT),
+            None
+        );
+    }
+
+    #[test]
+    fn snapshot_null_price_guard_rejects_long_run() {
+        let start = Utc.with_ymd_and_hms(2026, 3, 10, 5, 0, 0).single().unwrap();
+        let mut history = vec![priced_history_row(start, 2000.0)];
+        for offset in 1..=MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT {
+            history.push(history_row(start + ChronoDuration::minutes(offset as i64)));
+        }
+
+        let run =
+            find_long_null_price_run(&history, MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT)
+                .expect("expected long null-price run");
+        assert_eq!(run.0, start + ChronoDuration::minutes(1));
+        assert_eq!(
+            run.1,
+            start + ChronoDuration::minutes(MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT as i64)
+        );
+        assert_eq!(run.2, MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT);
     }
 }

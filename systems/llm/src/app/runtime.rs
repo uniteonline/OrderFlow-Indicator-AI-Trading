@@ -29,7 +29,8 @@ use lapin::{
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use sqlx::{PgPool, Row};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -46,6 +47,8 @@ const TEMP_MODEL_OUTPUT_DIR: &str = "systems/llm/temp_model_output";
 const LLM_JOURNAL_DIR: &str = "systems/llm/journal";
 const LLM_JOURNAL_FILE: &str = "systems/llm/journal/llm_trade_journal.jsonl";
 const MANAGEMENT_REDUCTION_LEVEL_THRESHOLD: f64 = 0.5;
+const KLINE_DB_BACKFILL_INTERVALS: [(&str, i64); 2] = [("4h", 240), ("1d", 1440)];
+
 #[derive(Debug, Default)]
 struct InvokeThrottleState {
     last_invoke_at: Option<Instant>,
@@ -458,6 +461,236 @@ fn build_invocation_input(
         trading_state,
         management_snapshot,
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MissingKlineBarRequest {
+    market: String,
+    interval_code: String,
+    open_time: DateTime<Utc>,
+}
+
+async fn hydrate_missing_kline_history_from_db(
+    pool: &PgPool,
+    input: &mut ModelInvocationInput,
+) -> Result<usize> {
+    let requests = collect_missing_kline_bar_requests(&input.indicators);
+    if requests.is_empty() {
+        return Ok(0);
+    }
+
+    let mut replacements = Vec::new();
+    for request in &requests {
+        if let Some(bar) = fetch_kline_bar_from_db(
+            pool,
+            &input.symbol,
+            &request.market,
+            &request.interval_code,
+            request.open_time,
+        )
+        .await?
+        {
+            replacements.push((request.clone(), bar));
+        }
+    }
+
+    Ok(apply_backfilled_kline_bars(
+        &mut input.indicators,
+        &replacements,
+    ))
+}
+
+fn collect_missing_kline_bar_requests(indicators: &Value) -> Vec<MissingKlineBarRequest> {
+    let mut requests = BTreeSet::new();
+
+    let Some(intervals) = indicators
+        .get("kline_history")
+        .and_then(|indicator| indicator.get("payload"))
+        .and_then(|payload| payload.get("intervals"))
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+
+    for (interval_code, _) in KLINE_DB_BACKFILL_INTERVALS {
+        let Some(markets) = intervals
+            .get(interval_code)
+            .and_then(|interval| interval.get("markets"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+
+        for market in ["futures", "spot"] {
+            let Some(bars) = markets
+                .get(market)
+                .and_then(|market_value| market_value.get("bars"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+
+            for bar in bars {
+                let Some(open_time) = empty_kline_bar_open_time(bar) else {
+                    continue;
+                };
+                requests.insert(MissingKlineBarRequest {
+                    market: market.to_string(),
+                    interval_code: interval_code.to_string(),
+                    open_time,
+                });
+            }
+        }
+    }
+
+    requests.into_iter().collect()
+}
+
+fn empty_kline_bar_open_time(bar: &Value) -> Option<DateTime<Utc>> {
+    let object = bar.as_object()?;
+    let all_prices_empty = ["open", "high", "low", "close"]
+        .iter()
+        .all(|field| object.get(*field).map(Value::is_null).unwrap_or(true));
+    if !all_prices_empty {
+        return None;
+    }
+    object
+        .get("open_time")
+        .and_then(Value::as_str)
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+async fn fetch_kline_bar_from_db(
+    pool: &PgPool,
+    symbol: &str,
+    market: &str,
+    interval_code: &str,
+    open_time: DateTime<Utc>,
+) -> Result<Option<Value>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            open_time,
+            close_time,
+            open_price,
+            high_price,
+            low_price,
+            close_price,
+            COALESCE(volume_base, 0.0) AS volume_base,
+            COALESCE(quote_volume, 0.0) AS volume_quote,
+            is_closed
+        FROM md.kline_bar
+        WHERE market = $1::cfg.market_type
+          AND symbol = $2
+          AND interval_code = $3
+          AND open_time = $4
+        LIMIT 1
+        "#,
+    )
+    .bind(market)
+    .bind(symbol.to_uppercase())
+    .bind(interval_code)
+    .bind(open_time)
+    .fetch_optional(pool)
+    .await
+    .context("query missing kline bar from db")?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let open_time: DateTime<Utc> = row.get("open_time");
+    let close_time: DateTime<Utc> = row.get("close_time");
+    let expected_minutes = interval_minutes(interval_code);
+    Ok(Some(json!({
+        "open_time": open_time.to_rfc3339(),
+        "close_time": close_time.to_rfc3339(),
+        "open": row.get::<f64, _>("open_price"),
+        "high": row.get::<f64, _>("high_price"),
+        "low": row.get::<f64, _>("low_price"),
+        "close": row.get::<f64, _>("close_price"),
+        "volume_base": row.get::<f64, _>("volume_base"),
+        "volume_quote": row.get::<f64, _>("volume_quote"),
+        "is_closed": row.get::<bool, _>("is_closed"),
+        "minutes_covered": expected_minutes,
+        "expected_minutes": expected_minutes,
+    })))
+}
+
+fn apply_backfilled_kline_bars(
+    indicators: &mut Value,
+    replacements: &[(MissingKlineBarRequest, Value)],
+) -> usize {
+    if replacements.is_empty() {
+        return 0;
+    }
+
+    let Some(intervals) = indicators
+        .get_mut("kline_history")
+        .and_then(Value::as_object_mut)
+        .and_then(|indicator| indicator.get_mut("payload"))
+        .and_then(Value::as_object_mut)
+        .and_then(|payload| payload.get_mut("intervals"))
+        .and_then(Value::as_object_mut)
+    else {
+        return 0;
+    };
+
+    let mut patched = 0usize;
+    for (request, replacement) in replacements {
+        let Some(bars) = intervals
+            .get_mut(&request.interval_code)
+            .and_then(Value::as_object_mut)
+            .and_then(|interval| interval.get_mut("markets"))
+            .and_then(Value::as_object_mut)
+            .and_then(|markets| markets.get_mut(&request.market))
+            .and_then(Value::as_object_mut)
+            .and_then(|market| market.get_mut("bars"))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+
+        for bar in bars.iter_mut() {
+            let Some(open_time) = empty_kline_bar_open_time(bar) else {
+                continue;
+            };
+            if open_time == request.open_time {
+                *bar = replacement.clone();
+                patched += 1;
+                break;
+            }
+        }
+    }
+
+    patched
+}
+
+fn interval_minutes(interval_code: &str) -> i64 {
+    match interval_code {
+        "4h" => 240,
+        "1d" => 1440,
+        _ => 1,
+    }
+}
+
+async fn patch_input_kline_history_from_db(
+    pool: &PgPool,
+    input: &mut ModelInvocationInput,
+    trigger: &str,
+) -> Result<()> {
+    let patched = hydrate_missing_kline_history_from_db(pool, input).await?;
+    if patched > 0 {
+        info!(
+            symbol = %input.symbol,
+            ts_bucket = %input.ts_bucket,
+            trigger = trigger,
+            patched_bars = patched,
+            "patched missing kline_history bars from db before llm invocation"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1955,6 +2188,7 @@ fn queue_latest_bundle_invoke(
 
     *last_invoked_ts_bucket = Some(bundle.raw.ts_bucket);
     let config = Arc::clone(&ctx.config);
+    let db_pool = ctx.db_pool.clone();
     let http_client = ctx.http_client.clone();
     let print_response = ctx.config.llm.print_response;
     let invoke_inflight = Arc::clone(invoke_inflight);
@@ -1986,6 +2220,7 @@ fn queue_latest_bundle_invoke(
         if should_invoke {
             invoke_bundle_models(
                 config,
+                db_pool,
                 http_client,
                 print_response,
                 bundle,
@@ -2007,6 +2242,7 @@ fn queue_latest_bundle_invoke(
 
 async fn invoke_bundle_models(
     config: Arc<RootConfig>,
+    db_pool: PgPool,
     http_client: Client,
     print_response: bool,
     bundle: LatestBundle,
@@ -2054,6 +2290,18 @@ async fn invoke_bundle_models(
             routing_context.invoke_management_reason.clone(),
             routing_context.position_context.clone(),
         );
+        let mut input = input;
+        if let Err(err) =
+            patch_input_kline_history_from_db(&db_pool, &mut input, trigger.as_ref()).await
+        {
+            warn!(
+                symbol = %bundle.raw.symbol,
+                ts_bucket = %bundle.raw.ts_bucket,
+                trigger = %trigger,
+                error = %err,
+                "failed to patch missing kline_history bars from db"
+            );
+        }
         let source_file = minute_bundle_path(&bundle.raw);
         let model_input_files = match persist_model_input_to_disk(
             &bundle.raw,
@@ -2177,6 +2425,18 @@ async fn invoke_bundle_models(
         invoke_management_reason,
         routing_context.position_context.clone(),
     );
+    let mut input = input;
+    if let Err(err) =
+        patch_input_kline_history_from_db(&db_pool, &mut input, trigger.as_ref()).await
+    {
+        warn!(
+            symbol = %bundle.raw.symbol,
+            ts_bucket = %bundle.raw.ts_bucket,
+            trigger = %trigger,
+            error = %err,
+            "failed to patch missing kline_history bars from db"
+        );
+    }
 
     debug!(
         ts_bucket = %bundle.raw.ts_bucket,
@@ -4886,6 +5146,22 @@ mod tests {
         }
     }
 
+    fn empty_kline_bar(open_time: &str, close_time: &str) -> Value {
+        json!({
+            "open_time": open_time,
+            "close_time": close_time,
+            "open": Value::Null,
+            "high": Value::Null,
+            "low": Value::Null,
+            "close": Value::Null,
+            "volume_base": 0.0,
+            "volume_quote": 0.0,
+            "is_closed": true,
+            "minutes_covered": 240,
+            "expected_minutes": 240
+        })
+    }
+
     fn sample_trading_state() -> TradingStateSnapshot {
         TradingStateSnapshot {
             symbol: "ETHUSDT".to_string(),
@@ -4916,6 +5192,86 @@ mod tests {
             total_wallet_balance: 1000.0,
             available_balance: 900.0,
         }
+    }
+
+    #[test]
+    fn collect_missing_kline_bar_requests_finds_empty_scan_bars() {
+        let indicators = json!({
+            "kline_history": {
+                "payload": {
+                    "intervals": {
+                        "4h": {
+                            "markets": {
+                                "futures": {
+                                    "bars": [
+                                        empty_kline_bar("2026-03-08T16:00:00+00:00", "2026-03-08T20:00:00+00:00")
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let requests = collect_missing_kline_bar_requests(&indicators);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].market, "futures");
+        assert_eq!(requests[0].interval_code, "4h");
+        assert_eq!(
+            requests[0].open_time,
+            DateTime::parse_from_rfc3339("2026-03-08T16:00:00+00:00")
+                .expect("parse open time")
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[test]
+    fn apply_backfilled_kline_bars_replaces_empty_bar_in_place() {
+        let mut indicators = json!({
+            "kline_history": {
+                "payload": {
+                    "intervals": {
+                        "4h": {
+                            "markets": {
+                                "futures": {
+                                    "bars": [
+                                        empty_kline_bar("2026-03-08T16:00:00+00:00", "2026-03-08T20:00:00+00:00")
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let request = MissingKlineBarRequest {
+            market: "futures".to_string(),
+            interval_code: "4h".to_string(),
+            open_time: DateTime::parse_from_rfc3339("2026-03-08T16:00:00+00:00")
+                .expect("parse open time")
+                .with_timezone(&Utc),
+        };
+        let replacement = json!({
+            "open_time": "2026-03-08T16:00:00+00:00",
+            "close_time": "2026-03-08T20:00:00+00:00",
+            "open": 1942.01,
+            "high": 1969.19,
+            "low": 1926.73,
+            "close": 1963.20,
+            "volume_base": 583922.748,
+            "volume_quote": 1.0,
+            "is_closed": true,
+            "minutes_covered": 240,
+            "expected_minutes": 240
+        });
+
+        let patched = apply_backfilled_kline_bars(&mut indicators, &[(request, replacement)]);
+        assert_eq!(patched, 1);
+        assert_eq!(
+            indicators.pointer("/kline_history/payload/intervals/4h/markets/futures/bars/0/open"),
+            Some(&json!(1942.01))
+        );
     }
 
     fn sample_indicators_with_known_v() -> Value {

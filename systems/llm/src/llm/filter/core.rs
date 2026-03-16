@@ -117,9 +117,19 @@ fn build_core_root(root: &Value, mode: CoreMode) -> Value {
         .get("indicators")
         .and_then(Value::as_object)
         .map(|source| match mode {
-            CoreMode::Entry => core_entry::filter_indicators(source),
-            CoreMode::Management => core_management::filter_indicators(source),
-            CoreMode::Pending => core_pending::filter_indicators(source),
+            CoreMode::Entry => {
+                core_entry::filter_indicators(source, root.get("ts_bucket").and_then(Value::as_str))
+            }
+            CoreMode::Management => core_management::filter_indicators(
+                source,
+                root.get("ts_bucket").and_then(Value::as_str),
+                root.get("management_snapshot"),
+            ),
+            CoreMode::Pending => core_pending::filter_indicators(
+                source,
+                root.get("ts_bucket").and_then(Value::as_str),
+                root.get("management_snapshot"),
+            ),
         })
         .unwrap_or_default();
     result.insert("indicators".to_string(), Value::Object(filtered_indicators));
@@ -129,6 +139,13 @@ fn build_core_root(root: &Value, mode: CoreMode) -> Value {
             .get("trading_state")
             .filter(|value| !value.is_null())
             .cloned()
+            .map(|value| {
+                if matches!(mode, CoreMode::Pending | CoreMode::Management) {
+                    prune_nulls_root(value)
+                } else {
+                    value
+                }
+            })
         {
             result.insert("trading_state".to_string(), trading_state);
         }
@@ -136,12 +153,45 @@ fn build_core_root(root: &Value, mode: CoreMode) -> Value {
             .get("management_snapshot")
             .filter(|value| !value.is_null())
             .cloned()
+            .map(|value| {
+                if matches!(mode, CoreMode::Pending | CoreMode::Management) {
+                    prune_nulls_root(value)
+                } else {
+                    value
+                }
+            })
         {
             result.insert("management_snapshot".to_string(), snapshot);
         }
     }
 
     Value::Object(result)
+}
+
+fn prune_nulls_root(value: Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    let pruned = prune_nulls_root(value);
+                    if pruned.is_null() {
+                        None
+                    } else {
+                        Some((key, pruned))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(prune_nulls_root)
+                .filter(|value| !value.is_null())
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -187,6 +237,18 @@ mod tests {
                 None
             },
         }
+    }
+
+    fn sample_input_at(
+        indicators: Value,
+        management_mode: bool,
+        pending_order_mode: bool,
+        ts_bucket: DateTime<Utc>,
+    ) -> ModelInvocationInput {
+        let mut input = sample_input(indicators, management_mode, pending_order_mode);
+        input.ts_bucket = ts_bucket;
+        input.received_at = ts_bucket;
+        input
     }
 
     fn sample_management_snapshot() -> ManagementSnapshotForLlm {
@@ -962,6 +1024,23 @@ mod tests {
         );
     }
 
+    fn assert_no_nulls(value: &Value) {
+        match value {
+            Value::Null => panic!("unexpected null in filtered output"),
+            Value::Array(items) => {
+                for item in items {
+                    assert_no_nulls(item);
+                }
+            }
+            Value::Object(object) => {
+                for item in object.values() {
+                    assert_no_nulls(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn extracted_footprint_prices(value: &Value, pointer: &str) -> Vec<f64> {
         value
             .pointer(pointer)
@@ -973,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn build_entry_core_value_applies_v3_rules() {
+    fn build_entry_core_value_applies_v4_rules() {
         let input = sample_input(build_sample_indicators(), false, false);
 
         let value = CoreFilter::build_value(&input).expect("build entry core value");
@@ -1068,22 +1147,30 @@ mod tests {
         assert!(value
             .pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/tf")
             .is_none());
-        assert_eq!(
-            value.pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/fvg_top"),
-            value.pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/upper")
-        );
-        assert_eq!(
-            value.pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/fvg_bottom"),
-            value.pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/lower")
-        );
-        assert_eq!(
-            value.pointer("/indicators/fvg/payload/by_window/15m/nearest_bull_fvg/fvg_top"),
-            value.pointer("/indicators/fvg/payload/by_window/15m/nearest_bull_fvg/upper")
-        );
-        assert_eq!(
-            value.pointer("/indicators/fvg/payload/by_window/15m/nearest_bear_fvg/fvg_bottom"),
-            value.pointer("/indicators/fvg/payload/by_window/15m/nearest_bear_fvg/lower")
-        );
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/upper")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/lower")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/mid")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/body_ratio_mid")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/distance_to_avwap")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/spot_confirm_at_birth")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/fvg_top")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/15m/fvgs/0/fvg_bottom")
+            .is_some());
         assert!(value
             .pointer("/indicators/absorption/payload/recent_7d/events/0/event_id")
             .is_none());
@@ -1227,16 +1314,13 @@ mod tests {
                 .map(Vec::len),
             Some(1)
         );
+        assert!(value.pointer("/indicators/bullish_absorption").is_none());
+        assert!(value.pointer("/indicators/bearish_absorption").is_none());
+        assert!(value.pointer("/indicators/bullish_initiation").is_none());
+        assert!(value.pointer("/indicators/bearish_initiation").is_none());
         assert_eq!(
             value
                 .pointer("/indicators/absorption/payload/recent_7d/events")
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            Some(10)
-        );
-        assert_eq!(
-            value
-                .pointer("/indicators/bullish_initiation/payload/recent_7d/events")
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(10)
@@ -1279,6 +1363,78 @@ mod tests {
                 .map(Vec::len),
             Some(5)
         );
+        assert!(value
+            .pointer("/indicators/divergence/payload/signal")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/divergence/payload/signals")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/ema_trend_regime/payload/trend_regime")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/ema_trend_regime/payload/trend_regime_by_tf")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/ema_trend_regime/payload/output_sampling/15m/trend_regime")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/vpin/payload/toxicity_state")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/high_volume_pulse/payload/by_z_window/1h/is_volume_spike_z2")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/high_volume_pulse/payload/by_z_window/1h/is_volume_spike_z3")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/high_volume_pulse/payload/pulse")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/events_summary/payload/most_recent_absorption/minutes_ago")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/events_summary/payload/most_recent_absorption/price")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/events_summary/payload/most_recent_divergence")
+            .is_some());
+        assert!(
+            value
+                .pointer("/indicators/tpo_market_profile/payload/by_session/1d/dev_series/15m")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default()
+                <= 8
+        );
+        assert!(
+            value
+                .pointer("/indicators/tpo_market_profile/payload/by_session/1d/dev_series/1h")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default()
+                <= 5
+        );
+        assert!(value
+            .pointer("/indicators/footprint/payload/by_window/4h/buy_stacks")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().all(|item| {
+                item.get("length")
+                    .and_then(Value::as_u64)
+                    .map(|length| length >= 4)
+                    .unwrap_or(false)
+            }))
+            .unwrap_or(true));
+        assert!(value
+            .pointer("/indicators/footprint/payload/by_window/1d/buy_stacks")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().all(|item| {
+                item.get("length")
+                    .and_then(Value::as_u64)
+                    .map(|length| length >= 7)
+                    .unwrap_or(false)
+            }))
+            .unwrap_or(true));
         assert_newest_first(
             &value,
             "/indicators/avwap/payload/series_by_window/15m",
@@ -1309,6 +1465,7 @@ mod tests {
             .and_then(Value::as_f64)
             .expect("last va price");
         assert!(first_price >= last_price);
+        assert_no_nulls(&value);
     }
 
     #[test]
@@ -1374,7 +1531,101 @@ mod tests {
     }
 
     #[test]
-    fn build_management_core_value_applies_v2_rules() {
+    fn entry_core_events_summary_uses_latest_event_timing() {
+        let mut indicators = build_sample_indicators();
+        indicators
+            .get_mut("absorption")
+            .and_then(Value::as_object_mut)
+            .and_then(|indicator| indicator.get_mut("payload"))
+            .and_then(Value::as_object_mut)
+            .and_then(|payload| payload.get_mut("recent_7d"))
+            .and_then(Value::as_object_mut)
+            .expect("absorption recent_7d")
+            .insert(
+                "events".to_string(),
+                json!([
+                    {
+                        "confirm_ts": "2026-03-16T12:06:00Z",
+                        "event_end_ts": "2026-03-16T12:05:00Z",
+                        "direction": -1,
+                        "pivot_price": 2293.0,
+                        "score": 0.64,
+                        "sig_pass": true,
+                        "type": "bearish_absorption"
+                    },
+                    {
+                        "confirm_ts": "2026-03-16T11:20:00Z",
+                        "event_end_ts": "2026-03-16T11:19:00Z",
+                        "direction": 1,
+                        "pivot_price": 2261.0,
+                        "score": 0.7,
+                        "sig_pass": true,
+                        "type": "bullish_absorption"
+                    }
+                ]),
+            );
+        indicators
+            .get_mut("buying_exhaustion")
+            .and_then(Value::as_object_mut)
+            .and_then(|indicator| indicator.get_mut("payload"))
+            .and_then(Value::as_object_mut)
+            .and_then(|payload| payload.get_mut("recent_7d"))
+            .and_then(Value::as_object_mut)
+            .expect("buying_exhaustion recent_7d")
+            .insert(
+                "events".to_string(),
+                json!([
+                    {
+                        "confirm_ts": "2026-03-16T11:04:00Z",
+                        "event_end_ts": "2026-03-16T11:04:00Z",
+                        "direction": -1,
+                        "pivot_price": 2279.13,
+                        "score": 0.77,
+                        "sig_pass": true,
+                        "type": "buying_exhaustion"
+                    }
+                ]),
+            );
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-16T12:21:00Z")
+            .expect("parse ts bucket")
+            .with_timezone(&Utc);
+        let input = sample_input_at(indicators, false, false, ts_bucket);
+
+        let value = CoreFilter::build_value(&input).expect("build entry core value");
+
+        assert_eq!(
+            value
+                .pointer("/indicators/events_summary/payload/most_recent_absorption/direction")
+                .and_then(Value::as_str),
+            Some("bearish")
+        );
+        assert_eq!(
+            value
+                .pointer("/indicators/events_summary/payload/most_recent_absorption/price")
+                .and_then(Value::as_f64),
+            Some(2293.0)
+        );
+        assert_eq!(
+            value
+                .pointer("/indicators/events_summary/payload/most_recent_absorption/minutes_ago")
+                .and_then(Value::as_i64),
+            Some(15)
+        );
+        assert!(value
+            .pointer("/indicators/events_summary/payload/most_recent_absorption/price_distance_atr")
+            .is_some());
+        assert_eq!(
+            value
+                .pointer(
+                    "/indicators/events_summary/payload/most_recent_buying_exhaustion/minutes_ago"
+                )
+                .and_then(Value::as_i64),
+            Some(77)
+        );
+    }
+
+    #[test]
+    fn build_management_core_value_applies_v1_rules() {
         let input = sample_input(build_sample_indicators(), true, false);
 
         let value = CoreFilter::build_value(&input).expect("build management core value");
@@ -1414,7 +1665,22 @@ mod tests {
             .is_some());
         assert!(value
             .pointer("/indicators/fvg/payload/by_window/1d")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/1d/fvgs")
             .is_none());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/1d/active_bull_fvgs")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/1d/active_bear_fvgs")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/1d/nearest_bull_fvg")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/1d/nearest_bear_fvg")
+            .is_some());
         assert_eq!(
             value
                 .pointer("/indicators/fvg/payload/by_window/15m/fvgs")
@@ -1422,13 +1688,14 @@ mod tests {
                 .map(Vec::len),
             Some(4)
         );
-        let footprint_prices = extracted_footprint_prices(
-            &value,
-            "/indicators/footprint/payload/by_window/15m/levels",
+        assert!(
+            value
+                .pointer("/indicators/footprint/payload/by_window/15m/levels")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default()
+                <= 20
         );
-        assert!(footprint_prices.contains(&2100.0));
-        assert!(!footprint_prices.contains(&2100.1));
-        assert!(footprint_prices.len() <= 2);
         assert_eq!(
             value
                 .pointer("/indicators/orderbook_depth/payload/top_liquidity_levels")
@@ -1457,10 +1724,62 @@ mod tests {
                 .map(Vec::len),
             Some(12)
         );
+        assert!(value.pointer("/indicators/bullish_absorption").is_none());
+        assert!(value.pointer("/indicators/bearish_absorption").is_none());
+        assert!(value.pointer("/indicators/bullish_initiation").is_none());
+        assert!(value.pointer("/indicators/bearish_initiation").is_none());
+        assert!(value
+            .pointer("/indicators/divergence/payload/signal")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/divergence/payload/signals")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/ema_trend_regime/payload/trend_regime")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/ema_trend_regime/payload/trend_regime_by_tf")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/vpin/payload/toxicity_state")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/high_volume_pulse/payload/by_z_window/1h/is_volume_spike_z2")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/high_volume_pulse/payload/by_z_window/1h/is_volume_spike_z3")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/events_summary/payload/most_recent_absorption/minutes_ago")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/position_evidence/payload/price_to_entry_atr")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/position_evidence/payload/price_to_current_sl_atr")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/position_evidence/payload/price_to_current_tp_atr")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/position_evidence/payload/current_sl_beyond_nearest_structure")
+            .is_some());
+        assert!(value
+            .pointer(
+                "/indicators/position_evidence/payload/current_tp_before_next_major_resistance"
+            )
+            .is_some());
+        assert!(value
+            .pointer("/indicators/position_evidence/payload/position_in_4h_tpo_pct")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/position_evidence/payload/position_in_1d_range_pct")
+            .is_some());
+        assert_no_nulls(&value);
     }
 
     #[test]
-    fn build_pending_core_value_applies_v2_rules() {
+    fn build_pending_core_value_applies_v1_rules() {
         let input = sample_input(build_sample_indicators(), false, true);
 
         let value = CoreFilter::build_value(&input).expect("build pending core value");
@@ -1498,13 +1817,14 @@ mod tests {
             .is_some());
         assert!(value
             .pointer("/indicators/fvg/payload/by_window/3d")
-            .is_some());
-        assert_eq!(
+            .is_none());
+        assert!(
             value
                 .pointer("/indicators/orderbook_depth/payload/top_liquidity_levels")
                 .and_then(Value::as_array)
-                .map(Vec::len),
-            Some(100)
+                .map(Vec::len)
+                .unwrap_or_default()
+                <= 100
         );
         assert_eq!(
             value
@@ -1535,6 +1855,64 @@ mod tests {
                 .unwrap_or_default()
                 <= 12
         );
+        assert!(value.pointer("/indicators/bullish_absorption").is_none());
+        assert!(value.pointer("/indicators/bearish_absorption").is_none());
+        assert!(value.pointer("/indicators/bullish_initiation").is_none());
+        assert!(value.pointer("/indicators/bearish_initiation").is_none());
+        assert!(value
+            .pointer("/indicators/divergence/payload/signal")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/divergence/payload/signals")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/ema_trend_regime/payload/trend_regime")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/vpin/payload/toxicity_state")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/high_volume_pulse/payload/by_z_window/1h/is_volume_spike_z2")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/high_volume_pulse/payload/by_z_window/1h/is_volume_spike_z3")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/events_summary/payload/most_recent_absorption/minutes_ago")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/pending_entry_evidence/payload/entry_to_current_price_atr")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/pending_entry_evidence/payload/spent_move_pct_of_atr")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/pending_entry_evidence/payload/rvwap_15m_z_current")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/pending_entry_evidence/payload/entry_anchor_wall_still_present")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/footprint/payload/by_window/4h/buy_stacks")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().all(|item| {
+                item.get("length")
+                    .and_then(Value::as_u64)
+                    .map(|length| length >= 4)
+                    .unwrap_or(false)
+            }))
+            .unwrap_or(true));
+        assert!(value
+            .pointer("/indicators/footprint/payload/by_window/1d/buy_stacks")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().all(|item| {
+                item.get("length")
+                    .and_then(Value::as_u64)
+                    .map(|length| length >= 7)
+                    .unwrap_or(false)
+            }))
+            .unwrap_or(true));
+        assert_no_nulls(&value);
     }
 
     #[test]
@@ -1606,10 +1984,54 @@ mod tests {
         assert!(value
             .pointer("/indicators/divergence/payload/recent_7d/events/0/sig_test_mode")
             .is_none());
+        assert!(value.pointer("/indicators/bullish_absorption").is_none());
+        assert!(value.pointer("/indicators/bearish_absorption").is_none());
+        assert!(value.pointer("/indicators/bullish_initiation").is_none());
+        assert!(value.pointer("/indicators/bearish_initiation").is_none());
+        assert!(value
+            .pointer("/indicators/ema_trend_regime/payload/trend_regime")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/divergence/payload/signal")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/vpin/payload/toxicity_state")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/high_volume_pulse/payload/by_z_window/1h/is_volume_spike_z2")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/events_summary/payload/most_recent_absorption")
+            .is_some());
+        assert!(
+            value
+                .pointer("/indicators/tpo_market_profile/payload/by_session/1d/dev_series/15m")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default()
+                <= 8,
+            "entry_core tpo dev_series 15m exceeded 8 for {}",
+            path.display()
+        );
+        assert!(
+            value
+                .pointer("/indicators/footprint/payload/by_window/1d/buy_stacks")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().all(|item| {
+                    item.get("length")
+                        .and_then(Value::as_u64)
+                        .map(|length| length >= 7)
+                        .unwrap_or(false)
+                }))
+                .unwrap_or(true),
+            "entry_core 1d buy_stacks still contains short stacks for {}",
+            path.display()
+        );
+        assert_no_nulls(&value);
         let size = serde_json::to_string(&value)
             .expect("serialize entry core")
             .len();
-        assert_snapshot_budget("entry_core", size, 280_000, 320_000, &path);
+        assert_snapshot_budget("entry_core", size, 120_000, 140_000, &path);
     }
 
     #[test]
@@ -1619,6 +2041,25 @@ mod tests {
         };
 
         let value = CoreFilter::build_value(&input).expect("build management core");
+        assert!(value.pointer("/indicators/bullish_absorption").is_none());
+        assert!(value.pointer("/indicators/bearish_absorption").is_none());
+        assert!(value.pointer("/indicators/bullish_initiation").is_none());
+        assert!(value.pointer("/indicators/bearish_initiation").is_none());
+        assert!(value
+            .pointer("/indicators/divergence/payload/signal")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/divergence/payload/signals")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/ema_trend_regime/payload/trend_regime")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/vpin/payload/toxicity_state")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/high_volume_pulse/payload/by_z_window/1h/is_volume_spike_z2")
+            .is_none());
         assert!(value
             .pointer("/indicators/price_volume_structure/payload/value_area_levels")
             .is_none());
@@ -1635,6 +2076,44 @@ mod tests {
             "management_core va_top_levels exceeded 15 for {}",
             path.display()
         );
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/1d")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/1d/fvgs")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/1d/active_bull_fvgs")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/fvg/payload/by_window/1d/active_bear_fvgs")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/events_summary/payload/most_recent_absorption")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/position_evidence/payload/price_to_entry_atr")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/position_evidence/payload/price_to_current_sl_atr")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/position_evidence/payload/price_to_current_tp_atr")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/position_evidence/payload/current_sl_beyond_nearest_structure")
+            .is_some());
+        assert!(value
+            .pointer(
+                "/indicators/position_evidence/payload/current_tp_before_next_major_resistance"
+            )
+            .is_some());
+        assert!(value
+            .pointer("/indicators/position_evidence/payload/position_in_4h_tpo_pct")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/position_evidence/payload/position_in_1d_range_pct")
+            .is_some());
         assert!(
             value
                 .pointer("/indicators/footprint/payload/by_window/15m/levels")
@@ -1645,10 +2124,11 @@ mod tests {
             "management_core footprint representative levels exceeded 200 for {}",
             path.display()
         );
+        assert_no_nulls(&value);
         let size = serde_json::to_string(&value)
             .expect("serialize management core")
             .len();
-        assert_snapshot_budget("management_core", size, 340_000, 340_000, &path);
+        assert_snapshot_budget("management_core", size, 180_000, 220_000, &path);
     }
 
     #[test]
@@ -1658,6 +2138,34 @@ mod tests {
         };
 
         let value = CoreFilter::build_value(&input).expect("build pending core");
+        assert!(value.pointer("/indicators/bullish_absorption").is_none());
+        assert!(value.pointer("/indicators/bearish_absorption").is_none());
+        assert!(value.pointer("/indicators/bullish_initiation").is_none());
+        assert!(value.pointer("/indicators/bearish_initiation").is_none());
+        assert!(value
+            .pointer("/indicators/divergence/payload/signal")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/ema_trend_regime/payload/trend_regime")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/vpin/payload/toxicity_state")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/high_volume_pulse/payload/by_z_window/1h/is_volume_spike_z2")
+            .is_none());
+        assert!(value
+            .pointer("/indicators/events_summary/payload/most_recent_absorption")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/pending_entry_evidence/payload/spent_move_pct_of_atr")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/pending_entry_evidence/payload/rvwap_15m_z_current")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/pending_entry_evidence/payload/entry_anchor_wall_still_present")
+            .is_some());
         assert!(value
             .pointer("/indicators/price_volume_structure/payload/value_area_levels")
             .is_none());
@@ -1684,9 +2192,10 @@ mod tests {
             "pending_core footprint representative levels exceeded 200 for {}",
             path.display()
         );
+        assert_no_nulls(&value);
         let size = serde_json::to_string(&value)
             .expect("serialize pending core")
             .len();
-        assert_snapshot_budget("pending_core", size, 320_000, 320_000, &path);
+        assert_snapshot_budget("pending_core", size, 140_000, 190_000, &path);
     }
 }

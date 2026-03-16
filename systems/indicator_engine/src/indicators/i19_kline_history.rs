@@ -257,7 +257,13 @@ fn build_interval_bars_with_db(
     for bar in
         build_interval_bar_records(history, interval_minutes, usize::MAX, current_minute_close)
     {
-        merged.insert(bar.open_time, bar);
+        let preserve_existing_db_bar = merged
+            .get(&bar.open_time)
+            .map(|existing| !bar_has_any_price(&bar) && bar_has_any_price(existing))
+            .unwrap_or(false);
+        if !preserve_existing_db_bar {
+            merged.insert(bar.open_time, bar);
+        }
     }
 
     let mut bars = merged.into_values().map(bar_to_json).collect::<Vec<_>>();
@@ -293,6 +299,10 @@ fn minute_bar_to_record(bar: &MinuteHistory) -> KlineHistoryBar {
     }
 }
 
+fn bar_has_any_price(bar: &KlineHistoryBar) -> bool {
+    bar.open.is_some() || bar.high.is_some() || bar.low.is_some() || bar.close.is_some()
+}
+
 fn bar_to_json(bar: KlineHistoryBar) -> serde_json::Value {
     json!({
         "open_time": bar.open_time.to_rfc3339(),
@@ -313,4 +323,137 @@ fn floor_to_interval(ts: DateTime<Utc>, interval_minutes: i64) -> DateTime<Utc> 
     let secs = interval_minutes * 60;
     let aligned = ts.timestamp().div_euclid(secs) * secs;
     DateTime::<Utc>::from_timestamp(aligned, 0).unwrap_or(ts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_interval_bars_with_db, floor_to_interval};
+    use crate::indicators::context::KlineHistoryBar;
+    use crate::ingest::decoder::MarketKind;
+    use crate::runtime::state_store::MinuteHistory;
+    use chrono::{Duration, TimeZone, Utc};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn empty_minute(ts_bucket: chrono::DateTime<Utc>) -> MinuteHistory {
+        MinuteHistory {
+            ts_bucket,
+            market: MarketKind::Futures,
+            open_price: None,
+            high_price: None,
+            low_price: None,
+            close_price: None,
+            last_price: None,
+            buy_qty: 0.0,
+            sell_qty: 0.0,
+            total_qty: 0.0,
+            total_notional: 0.0,
+            delta: 0.0,
+            relative_delta: 0.0,
+            force_liq: BTreeMap::new(),
+            ofi: 0.0,
+            spread_twa: None,
+            topk_depth_twa: None,
+            obi_twa: None,
+            obi_l1_twa: None,
+            obi_k_twa: None,
+            obi_k_dw_twa: None,
+            obi_k_dw_close: None,
+            obi_k_dw_change: None,
+            obi_k_dw_adj_twa: None,
+            bbo_updates: 0,
+            microprice_twa: None,
+            microprice_classic_twa: None,
+            microprice_kappa_twa: None,
+            microprice_adj_twa: None,
+            cvd: 0.0,
+            vpin: 0.0,
+            avwap_minute: None,
+            whale_trade_count: 0,
+            whale_buy_count: 0,
+            whale_sell_count: 0,
+            whale_notional_total: 0.0,
+            whale_notional_buy: 0.0,
+            whale_notional_sell: 0.0,
+            whale_qty_eth_total: 0.0,
+            whale_qty_eth_buy: 0.0,
+            whale_qty_eth_sell: 0.0,
+            profile: BTreeMap::new(),
+        }
+    }
+
+    fn priced_minute(ts_bucket: chrono::DateTime<Utc>, price: f64) -> MinuteHistory {
+        MinuteHistory {
+            open_price: Some(price),
+            high_price: Some(price),
+            low_price: Some(price),
+            close_price: Some(price),
+            last_price: Some(price),
+            total_qty: 1.0,
+            total_notional: price,
+            ..empty_minute(ts_bucket)
+        }
+    }
+
+    fn db_bar(
+        open_time: chrono::DateTime<Utc>,
+        price: f64,
+        interval_minutes: i64,
+    ) -> KlineHistoryBar {
+        KlineHistoryBar {
+            open_time,
+            close_time: open_time + Duration::minutes(interval_minutes),
+            open: Some(price),
+            high: Some(price + 10.0),
+            low: Some(price - 10.0),
+            close: Some(price + 1.0),
+            volume_base: 100.0,
+            volume_quote: 1000.0,
+            is_closed: true,
+            minutes_covered: interval_minutes,
+            expected_minutes: interval_minutes,
+        }
+    }
+
+    #[test]
+    fn empty_in_memory_bar_does_not_override_db_bar() {
+        let minute = Utc
+            .with_ymd_and_hms(2026, 3, 10, 16, 5, 0)
+            .single()
+            .unwrap();
+        let open_time = floor_to_interval(minute, 240);
+        let bars = build_interval_bars_with_db(
+            &[empty_minute(minute)],
+            &[db_bar(open_time, 2000.0, 240)],
+            240,
+            10,
+            open_time + Duration::minutes(240),
+        );
+
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0]["open"], json!(2000.0));
+        assert_eq!(bars[0]["close"], json!(2001.0));
+        assert_eq!(bars[0]["minutes_covered"], json!(240));
+    }
+
+    #[test]
+    fn priced_in_memory_bar_still_overrides_db_bar() {
+        let minute = Utc
+            .with_ymd_and_hms(2026, 3, 10, 16, 5, 0)
+            .single()
+            .unwrap();
+        let open_time = floor_to_interval(minute, 240);
+        let bars = build_interval_bars_with_db(
+            &[priced_minute(minute, 2100.0)],
+            &[db_bar(open_time, 2000.0, 240)],
+            240,
+            10,
+            open_time + Duration::minutes(240),
+        );
+
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0]["open"], json!(2100.0));
+        assert_eq!(bars[0]["close"], json!(2100.0));
+        assert_eq!(bars[0]["minutes_covered"], json!(1));
+    }
 }

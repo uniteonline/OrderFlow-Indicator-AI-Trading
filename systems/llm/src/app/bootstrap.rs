@@ -6,6 +6,7 @@ use lapin::{
     Channel, Connection, ConnectionProperties, ExchangeKind,
 };
 use reqwest::Client;
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info};
@@ -16,6 +17,7 @@ const CONFIG_PATH: &str = "config/config.yaml";
 #[derive(Clone)]
 pub struct AppContext {
     pub config: Arc<RootConfig>,
+    pub db_pool: PgPool,
     pub mq_consume_channel: Channel,
     pub consume_queue_name: String,
     pub http_client: Client,
@@ -26,6 +28,7 @@ pub async fn bootstrap() -> Result<AppContext> {
     let config = Arc::new(load_config(CONFIG_PATH).context("load config/config.yaml")?);
     let default_provider = config.active_default_model();
     let effective_models = resolve_effective_models_summary(&config);
+    let db_pool = build_db_pool(&config).await?;
 
     let enabled_models = config
         .llm
@@ -129,11 +132,50 @@ pub async fn bootstrap() -> Result<AppContext> {
 
     Ok(AppContext {
         config,
+        db_pool,
         mq_consume_channel,
         consume_queue_name,
         http_client,
         producer_instance_id,
     })
+}
+
+async fn build_db_pool(config: &RootConfig) -> Result<PgPool> {
+    let connect_timeout = config.database.connect_timeout_secs.unwrap_or(10);
+    let pool_cfg = config.database.pool.as_ref();
+    let max_connections = pool_cfg.and_then(|p| p.max_connections).unwrap_or(4);
+    let min_connections = pool_cfg.and_then(|p| p.min_connections).unwrap_or(1);
+    let acquire_timeout_secs = pool_cfg
+        .and_then(|p| p.acquire_timeout_secs)
+        .unwrap_or(connect_timeout);
+    let idle_timeout_secs = pool_cfg.and_then(|p| p.idle_timeout_secs);
+    let max_lifetime_secs = pool_cfg.and_then(|p| p.max_lifetime_secs);
+    let test_before_acquire = pool_cfg.and_then(|p| p.test_before_acquire).unwrap_or(true);
+
+    let mut pool_options = PgPoolOptions::new()
+        .max_connections(max_connections)
+        .min_connections(min_connections)
+        .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
+        .test_before_acquire(test_before_acquire);
+
+    if let Some(v) = idle_timeout_secs {
+        pool_options = pool_options.idle_timeout(Some(Duration::from_secs(v)));
+    }
+    if let Some(v) = max_lifetime_secs {
+        pool_options = pool_options.max_lifetime(Some(Duration::from_secs(v)));
+    }
+
+    let uri = config.database.postgres_uri();
+    let pool = pool_options
+        .connect(&uri)
+        .await
+        .context("connect postgres")?;
+    sqlx::query("SELECT 1")
+        .execute(&pool)
+        .await
+        .context("postgres health query")?;
+    info!("llm db pool connected");
+    Ok(pool)
 }
 
 async fn declare_topology_for_llm(channel: &Channel, mq: &MqConfig, queue_key: &str) -> Result<()> {

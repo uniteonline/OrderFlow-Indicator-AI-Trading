@@ -1446,6 +1446,7 @@ dependencies = [
  "serde_yaml",
  "sha1",
  "sha2",
+ "sqlx",
  "tokio",
  "tokio-tungstenite",
  "tracing",

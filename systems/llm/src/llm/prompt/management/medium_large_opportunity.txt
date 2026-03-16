@@ -21,6 +21,7 @@ BEFORE YOU OUTPUT
 8. Do the cvd_pack, whale_trades, vpin, and tpo_market_profile signals support or contradict the thesis?
 9. Is there a case for adding to the position given current structure and flow?
 10. If you were starting fresh right now, would you place this trade with these levels?
+11. Will your choice maximize your benefits?
 
 If you see no valid thesis → return INVALID with your suggested close price.
 If the thesis holds but something needs to change → return ADJUST with the fields to change.

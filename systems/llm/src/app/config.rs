@@ -10,6 +10,8 @@ pub struct RootConfig {
     pub network: NetworkConfig,
     pub mq: MqConfig,
     #[serde(default)]
+    pub database: DatabaseConfig,
+    #[serde(default)]
     pub llm: LlmConfig,
 }
 
@@ -227,6 +229,93 @@ pub struct NetworkConfig {
     pub proxy: ProxyConfig,
     #[serde(default)]
     pub rest_proxy: ProxyConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DatabaseConfig {
+    #[serde(default = "default_database_host")]
+    pub host: String,
+    #[serde(default = "default_database_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub database: String,
+    #[serde(default)]
+    pub user: String,
+    #[serde(default)]
+    pub password_env: String,
+    #[serde(default = "default_database_sslmode")]
+    pub sslmode: String,
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub application_name: Option<String>,
+    #[serde(default)]
+    pub options: Option<String>,
+    #[serde(default)]
+    pub pool: Option<DatabasePoolConfig>,
+}
+
+impl DatabaseConfig {
+    pub fn resolved_password(&self) -> String {
+        resolve_secret(&self.password_env)
+    }
+
+    pub fn postgres_uri(&self) -> String {
+        let user = urlencoding::encode(&self.user);
+        let resolved_password = self.resolved_password();
+        let password = urlencoding::encode(&resolved_password);
+        let database = urlencoding::encode(&self.database);
+        let mut uri = format!(
+            "postgres://{}:{}@{}:{}/{}",
+            user, password, self.host, self.port, database
+        );
+
+        let mut params = Vec::new();
+        let sslmode = self.sslmode.trim();
+        if !sslmode.is_empty() {
+            params.push(format!("sslmode={}", urlencoding::encode(sslmode)));
+        }
+        if let Some(timeout) = self.connect_timeout_secs {
+            params.push(format!("connect_timeout={}", timeout));
+        }
+        if let Some(app_name) = self.application_name.as_deref() {
+            let app_name = app_name.trim();
+            if !app_name.is_empty() {
+                params.push(format!(
+                    "application_name={}",
+                    urlencoding::encode(app_name)
+                ));
+            }
+        }
+        if let Some(options) = self.options.as_deref() {
+            let options = options.trim();
+            if !options.is_empty() {
+                params.push(format!("options={}", urlencoding::encode(options)));
+            }
+        }
+        if !params.is_empty() {
+            uri.push('?');
+            uri.push_str(&params.join("&"));
+        }
+
+        uri
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DatabasePoolConfig {
+    #[serde(default)]
+    pub min_connections: Option<u32>,
+    #[serde(default)]
+    pub max_connections: Option<u32>,
+    #[serde(default)]
+    pub acquire_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub max_lifetime_secs: Option<u64>,
+    #[serde(default)]
+    pub test_before_acquire: Option<bool>,
 }
 
 impl NetworkConfig {
@@ -660,6 +749,18 @@ fn default_telegram_base_api_url() -> String {
 
 fn default_x_base_api_url() -> String {
     "https://api.x.com/2".to_string()
+}
+
+fn default_database_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_database_port() -> u16 {
+    5432
+}
+
+fn default_database_sslmode() -> String {
+    "disable".to_string()
 }
 
 fn default_claude_api_version() -> String {
