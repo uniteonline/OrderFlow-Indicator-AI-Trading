@@ -1152,12 +1152,12 @@ fn openai_json_schema_response_format(
     QwenResponseFormat {
         kind: "json_schema".to_string(),
         json_schema: QwenResponseJsonSchema {
-            name: if pending_order_mode {
+            name: if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
+                "market_scan".to_string()
+            } else if pending_order_mode {
                 "pending_order_decision".to_string()
             } else if management_mode {
                 "management_decision".to_string()
-            } else if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
-                "market_scan".to_string()
             } else {
                 "entry_decision".to_string()
             },
@@ -1181,12 +1181,12 @@ fn custom_llm_json_schema_response_format(
     QwenResponseFormat {
         kind: "json_schema".to_string(),
         json_schema: QwenResponseJsonSchema {
-            name: if pending_order_mode {
+            name: if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
+                "market_scan".to_string()
+            } else if pending_order_mode {
                 "pending_order_decision".to_string()
             } else if management_mode {
                 "management_decision".to_string()
-            } else if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
-                "market_scan".to_string()
             } else {
                 "entry_decision".to_string()
             },
@@ -1213,16 +1213,16 @@ fn qwen_output_contract(
     entry_stage: prompt::EntryPromptStage,
     prompt_template: &str,
 ) -> String {
-    if pending_order_mode {
-        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `reason` and `params`. `analysis` and `self_check` may be present as extra objects.\n- `reason` must be a non-empty top-level string. Do not place `reason` inside `analysis`.\n- `params` must contain exactly: `entry`, `tp`, `sl`, `leverage` — each a number or null.\n- Set all params to null if there is no valid setup.\n".to_string()
-    } else if management_mode {
-        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `decision`, `reason`, and `params`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- Allowed decisions: VALID, INVALID, ADJUST.\n- `params` must always be present.\n- For VALID: keep `params` present; action fields may be null.\n- For INVALID: set `params.close_price` to a number or null.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], [\"tp\",\"sl\"], [\"add\"], or [\"reduce\"]), and corresponding values: `new_tp`/`new_sl` for tp/sl adjustments, `qty_ratio` (number 0-1) for add/reduce.\n".to_string()
-    } else if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
+    if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
         if is_medium_large(prompt_template) {
             "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `timeframe_analysis`, `flow_context`, and `market_narrative`.\n- `timeframe_analysis` must contain exactly `15m`, `4h`, and `1d`.\n- Each timeframe must include `trend`, `signal_agreement`, and `range`.\n- `flow_context` must include `dominant_bias` and `key_signals`.\n".to_string()
         } else {
             "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `timeframe_analysis`, `flow_context`, and `market_narrative`.\n- `timeframe_analysis` must contain exactly `15m`, `4h`, and `1d`.\n- Each timeframe must include `trend`, `signal_agreement`, and `range`.\n- `flow_context` must include `dominant_bias` and `key_signals`.\n".to_string()
         }
+    } else if pending_order_mode {
+        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `reason` and `params`. `analysis` and `self_check` may be present as extra objects.\n- `reason` must be a non-empty top-level string. Do not place `reason` inside `analysis`.\n- `params` must contain exactly: `entry`, `tp`, `sl`, `leverage` — each a number or null.\n- Set all params to null if there is no valid setup.\n".to_string()
+    } else if management_mode {
+        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `decision`, `reason`, and `params`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- Allowed decisions: VALID, INVALID, ADJUST.\n- `params` must always be present.\n- For VALID: keep `params` present; action fields may be null.\n- For INVALID: set `params.close_price` to a number or null.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], [\"tp\",\"sl\"], [\"add\"], or [\"reduce\"]), and corresponding values: `new_tp`/`new_sl` for tp/sl adjustments, `qty_ratio` (number 0-1) for add/reduce.\n".to_string()
     } else {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must be `decision`, `reason`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, and `params.horizon` to null.\n".to_string()
     }
@@ -1296,19 +1296,19 @@ fn qwen_response_schema(
     entry_stage: prompt::EntryPromptStage,
     prompt_template: &str,
 ) -> Value {
-    if pending_order_mode {
+    if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
+        if is_medium_large(prompt_template) {
+            ml_qwen_entry_scan_schema()
+        } else {
+            qwen_entry_scan_response_schema()
+        }
+    } else if pending_order_mode {
         qwen_pending_order_response_schema()
     } else if management_mode {
         if is_medium_large(prompt_template) {
             ml_qwen_management_schema()
         } else {
             qwen_management_response_schema()
-        }
-    } else if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
-        if is_medium_large(prompt_template) {
-            ml_qwen_entry_scan_schema()
-        } else {
-            qwen_entry_scan_response_schema()
         }
     } else {
         if is_medium_large(prompt_template) {
@@ -1325,19 +1325,19 @@ fn custom_llm_response_schema(
     entry_stage: prompt::EntryPromptStage,
     prompt_template: &str,
 ) -> Value {
-    if pending_order_mode {
+    if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
+        if is_medium_large(prompt_template) {
+            ml_custom_llm_entry_scan_schema()
+        } else {
+            custom_llm_entry_scan_response_schema()
+        }
+    } else if pending_order_mode {
         custom_llm_pending_order_response_schema()
     } else if management_mode {
         if is_medium_large(prompt_template) {
             ml_custom_llm_management_schema()
         } else {
             custom_llm_management_response_schema()
-        }
-    } else if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
-        if is_medium_large(prompt_template) {
-            ml_custom_llm_entry_scan_schema()
-        } else {
-            custom_llm_entry_scan_response_schema()
         }
     } else {
         if is_medium_large(prompt_template) {
@@ -2138,29 +2138,29 @@ fn grok_text_config(
     GrokResponsesTextConfig {
         format: GrokResponsesFormat {
             kind: "json_schema".to_string(),
-            name: if pending_order_mode {
+            name: if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
+                "market_scan".to_string()
+            } else if pending_order_mode {
                 "pending_order_decision".to_string()
             } else if management_mode {
                 "management_decision".to_string()
-            } else if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
-                "market_scan".to_string()
             } else {
                 "entry_decision".to_string()
             },
             strict: true,
-            schema: if pending_order_mode {
+            schema: if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
+                if is_medium_large(prompt_template) {
+                    ml_grok_entry_scan_schema()
+                } else {
+                    grok_entry_scan_response_schema()
+                }
+            } else if pending_order_mode {
                 grok_pending_order_response_schema()
             } else if management_mode {
                 if is_medium_large(prompt_template) {
                     ml_grok_management_schema()
                 } else {
                     grok_management_response_schema()
-                }
-            } else if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
-                if is_medium_large(prompt_template) {
-                    ml_grok_entry_scan_schema()
-                } else {
-                    grok_entry_scan_response_schema()
                 }
             } else {
                 if is_medium_large(prompt_template) {
@@ -5186,19 +5186,19 @@ fn claude_response_tool(
         name: CLAUDE_DECISION_TOOL_NAME.to_string(),
         description: "Emit final decision JSON payload only; do not include narrative text."
             .to_string(),
-        input_schema: if pending_order_mode {
+        input_schema: if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
+            if is_medium_large(prompt_template) {
+                ml_grok_entry_scan_schema()
+            } else {
+                grok_entry_scan_response_schema()
+            }
+        } else if pending_order_mode {
             grok_pending_order_response_schema()
         } else if management_mode {
             if is_medium_large(prompt_template) {
                 ml_grok_management_schema()
             } else {
                 grok_management_response_schema()
-            }
-        } else if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
-            if is_medium_large(prompt_template) {
-                ml_grok_entry_scan_schema()
-            } else {
-                grok_entry_scan_response_schema()
             }
         } else {
             if is_medium_large(prompt_template) {

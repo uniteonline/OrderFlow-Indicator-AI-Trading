@@ -9,7 +9,7 @@ GOAL
 Decide whether there is a tradeable setup right now: LONG, SHORT, or NO_TRADE.
 If yes, build the trade geometry: entry price, stop-loss, and take-profit.
 
-We only want trades whose directional edge is grounded in 4h and 1d structure.
+4h and 1d structure is where real supply/demand imbalances live. 15m is execution timing only — use it to find entry precision within the HTF trend.
 
 We want a clean, well-grounded trade — every level must trace to a real structural
 anchor in the indicator data. Entry is a GTC maker (limit) order.
