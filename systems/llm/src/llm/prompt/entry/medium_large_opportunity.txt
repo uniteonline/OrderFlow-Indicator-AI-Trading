@@ -6,15 +6,16 @@ WHAT YOU RECEIVE
 - Market scan for 15m, 4h, 1d
 
 YOUR TASK
-Make the best current trading decision for a 4h to 1d holding horizon.
+Make the best current pending-trade decision for a 4h to 1d holding horizon.
 Return LONG, SHORT, or NO_TRADE.
 
-If there is a real trade now, build it precisely:
+If there is a real pending trade worth placing now, build it precisely:
 - entry
 - stop-loss
 - take-profit
 - leverage
 - horizon
+
 
 We are asking whether there is a real pending trade worth placing now, where risk, reward, and execution quality are properly balanced.
 
