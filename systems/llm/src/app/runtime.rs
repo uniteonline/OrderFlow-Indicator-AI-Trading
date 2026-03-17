@@ -2190,6 +2190,7 @@ fn queue_latest_bundle_invoke(
     let config = Arc::clone(&ctx.config);
     let db_pool = ctx.db_pool.clone();
     let http_client = ctx.http_client.clone();
+    let loopback_http_client = ctx.loopback_http_client.clone();
     let print_response = ctx.config.llm.print_response;
     let invoke_inflight = Arc::clone(invoke_inflight);
     let invoke_throttle = Arc::clone(invoke_throttle);
@@ -2222,6 +2223,7 @@ fn queue_latest_bundle_invoke(
                 config,
                 db_pool,
                 http_client,
+                loopback_http_client,
                 print_response,
                 bundle,
                 trigger,
@@ -2244,6 +2246,7 @@ async fn invoke_bundle_models(
     config: Arc<RootConfig>,
     db_pool: PgPool,
     http_client: Client,
+    loopback_http_client: Client,
     print_response: bool,
     bundle: LatestBundle,
     trigger: Arc<str>,
@@ -2506,7 +2509,7 @@ async fn invoke_bundle_models(
     let telegram_operator = TelegramOperator::from_config(&config.api.telegram);
     let x_operator = XOperator::from_config(&config.api.x);
 
-    let outputs = invoke_models(&http_client, &config, &input).await;
+    let outputs = invoke_models(&http_client, &loopback_http_client, &config, &input).await;
 
     // Post-invocation freshness gate. For Claude batch mode, invoke_models blocks
     // while polling (30 s intervals) until results arrive, which can take 60–300 s.
@@ -2723,7 +2726,11 @@ async fn invoke_bundle_models(
                     stage_trace,
                 );
             }
-            let text = out.raw_response_text.clone().unwrap_or_default();
+            let text = out
+                .raw_response_text
+                .as_deref()
+                .map(render_pretty_json_text)
+                .unwrap_or_default();
             println!(
                 "LLM_RESPONSE ts_bucket={} trigger={} management_mode={} model={} provider={} model_id={} batch_id={} batch_status={} finish_reason={}:\n{}",
                 bundle.raw.ts_bucket,
@@ -4443,6 +4450,16 @@ fn append_journal_event(event: Value) -> Result<()> {
     Ok(())
 }
 
+fn render_pretty_json_value(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn render_pretty_json_text(text: &str) -> String {
+    serde_json::from_str::<Value>(text)
+        .map(|value| render_pretty_json_value(&value))
+        .unwrap_or_else(|_| text.to_string())
+}
+
 fn pnl_outcome_label(pnl: f64) -> &'static str {
     if pnl > 0.0 {
         "profit"
@@ -5113,7 +5130,13 @@ fn print_entry_stage_trace(
         };
         println!(
             "{} ts_bucket={} trigger={} model={} provider={} model_id={}:\n{}",
-            label, ts_bucket, trigger, model_name, provider, model_id, event
+            label,
+            ts_bucket,
+            trigger,
+            model_name,
+            provider,
+            model_id,
+            render_pretty_json_value(event)
         );
     }
 }
@@ -6478,5 +6501,26 @@ mod tests {
         assert!(dir.join(".gitignore").exists());
 
         fs::remove_dir_all(&dir).expect("cleanup temp model input dir");
+    }
+
+    #[test]
+    fn render_pretty_json_text_formats_single_line_json() {
+        let rendered =
+            render_pretty_json_text("{\"decision\":\"NO_TRADE\",\"params\":{\"entry\":null}}");
+        assert!(rendered.contains('\n'));
+        assert!(rendered.contains("\"decision\": \"NO_TRADE\""));
+    }
+
+    #[test]
+    fn render_pretty_json_value_formats_stage_trace_objects() {
+        let rendered = render_pretty_json_value(&json!({
+            "stage": "scan",
+            "parsed_scan": {
+                "15m": {"trend": "Sideways"}
+            }
+        }));
+        assert!(rendered.contains('\n'));
+        assert!(rendered.contains("\"stage\": \"scan\""));
+        assert!(rendered.contains("\"trend\": \"Sideways\""));
     }
 }

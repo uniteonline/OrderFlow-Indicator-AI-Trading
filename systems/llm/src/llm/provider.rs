@@ -7,7 +7,7 @@ use crate::llm::{filter, prompt};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use futures_util::future::join_all;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Instant;
@@ -257,7 +257,6 @@ fn build_entry_finalize_trace_event(
         "scan_15m_trend": prior_scan.pointer("/15m/trend").cloned().unwrap_or(Value::Null),
         "scan_4h_trend": prior_scan.pointer("/4h/trend").cloned().unwrap_or(Value::Null),
         "scan_1d_trend": prior_scan.pointer("/1d/trend").cloned().unwrap_or(Value::Null),
-        "scan_market_narrative": prior_scan.pointer("/market_narrative").cloned().unwrap_or(Value::Null),
         "stage_2_filter": "core",
         "raw_indicator_count": input.indicators.as_object().map(|obj| obj.len()).unwrap_or(0),
         "missing_indicator_codes": &input.missing_indicator_codes,
@@ -421,16 +420,14 @@ fn validate_scan_output(value: &Value) -> Result<()> {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow!("scan {}.risk is missing", tf))?;
     }
-    value
-        .get("market_narrative")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("scan market_narrative must be non-empty"))?;
     Ok(())
 }
 
 fn sanitize_scan_for_stage2(value: &Value) -> Value {
     let mut sanitized = value.clone();
+    if let Some(root) = sanitized.as_object_mut() {
+        root.remove("market_narrative");
+    }
     for tf in ["15m", "4h", "1d"] {
         if let Some(tf_obj) = sanitized.get_mut(tf).and_then(Value::as_object_mut) {
             tf_obj.remove("story");
@@ -441,6 +438,7 @@ fn sanitize_scan_for_stage2(value: &Value) -> Value {
 
 pub async fn invoke_models(
     http_client: &Client,
+    loopback_http_client: &Client,
     config: &RootConfig,
     input: &ModelInvocationInput,
 ) -> Vec<ModelCallOutput> {
@@ -529,6 +527,7 @@ pub async fn invoke_models(
     let mut tasks = Vec::with_capacity(enabled.len());
     for model in enabled {
         let http_client = http_client.clone();
+        let loopback_http_client = loopback_http_client.clone();
         let claude_cfg = config.api.claude.clone();
         let qwen_cfg = config.api.qwen.clone();
         let custom_llm_cfg = config.api.custom_llm.clone();
@@ -540,6 +539,7 @@ pub async fn invoke_models(
         tasks.push(async move {
             invoke_one_model(
                 &http_client,
+                &loopback_http_client,
                 &claude_cfg,
                 &qwen_cfg,
                 &custom_llm_cfg,
@@ -558,6 +558,7 @@ pub async fn invoke_models(
 
 async fn invoke_one_model(
     http_client: &Client,
+    loopback_http_client: &Client,
     claude_cfg: &ClaudeApiConfig,
     qwen_cfg: &QwenApiConfig,
     custom_llm_cfg: &CustomLlmApiConfig,
@@ -580,7 +581,15 @@ async fn invoke_one_model(
         "claude" => invoke_claude(http_client, claude_cfg, &model, input, prompt_template).await,
         "qwen" => invoke_qwen(http_client, qwen_cfg, &model, input, prompt_template).await,
         "custom_llm" => {
-            invoke_custom_llm(http_client, custom_llm_cfg, &model, input, prompt_template).await
+            invoke_custom_llm(
+                http_client,
+                loopback_http_client,
+                custom_llm_cfg,
+                &model,
+                input,
+                prompt_template,
+            )
+            .await
         }
         "gemini" => {
             invoke_gemini(
@@ -876,16 +885,26 @@ async fn invoke_qwen_stage(
 
 async fn invoke_custom_llm(
     http_client: &Client,
+    loopback_http_client: &Client,
     custom_llm_cfg: &CustomLlmApiConfig,
     model: &LlmModelConfig,
     input: &ModelInvocationInput,
     prompt_template: &str,
 ) -> Result<ProviderSuccess, ProviderFailure> {
-    invoke_custom_llm_two_stage(http_client, custom_llm_cfg, model, input, prompt_template).await
+    invoke_custom_llm_two_stage(
+        http_client,
+        loopback_http_client,
+        custom_llm_cfg,
+        model,
+        input,
+        prompt_template,
+    )
+    .await
 }
 
 async fn invoke_custom_llm_two_stage(
     http_client: &Client,
+    loopback_http_client: &Client,
     custom_llm_cfg: &CustomLlmApiConfig,
     model: &LlmModelConfig,
     input: &ModelInvocationInput,
@@ -894,6 +913,7 @@ async fn invoke_custom_llm_two_stage(
     let scan_started = Instant::now();
     let scan = invoke_custom_llm_stage(
         http_client,
+        loopback_http_client,
         custom_llm_cfg,
         model,
         input,
@@ -929,6 +949,7 @@ async fn invoke_custom_llm_two_stage(
     let finalize_started = Instant::now();
     let finalize = invoke_custom_llm_stage(
         http_client,
+        loopback_http_client,
         custom_llm_cfg,
         model,
         input,
@@ -968,6 +989,7 @@ async fn invoke_custom_llm_two_stage(
 
 async fn invoke_custom_llm_stage(
     http_client: &Client,
+    loopback_http_client: &Client,
     custom_llm_cfg: &CustomLlmApiConfig,
     model: &LlmModelConfig,
     input: &ModelInvocationInput,
@@ -1012,10 +1034,19 @@ async fn invoke_custom_llm_stage(
     };
 
     let url = chat_completions_url(&custom_llm_cfg.base_api_url);
-    let response = http_client
+    let client = if is_loopback_chat_completions_url(&url) {
+        loopback_http_client
+    } else {
+        http_client
+    };
+    let mut request = client
         .post(&url)
         .bearer_auth(custom_llm_cfg.resolved_api_key())
-        .json(&req)
+        .json(&req);
+    if is_loopback_chat_completions_url(&url) {
+        request = request.header("Connection", "close");
+    }
+    let response = request
         .send()
         .await
         .context("call custom_llm chat completions api")
@@ -1062,6 +1093,13 @@ async fn invoke_custom_llm_stage(
         raw_text: text,
         trace,
     })
+}
+
+fn is_loopback_chat_completions_url(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
 }
 
 fn chat_completions_url(base_api_url: &str) -> String {
@@ -1202,9 +1240,9 @@ fn qwen_output_contract(
 ) -> String {
     if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
         if is_medium_large(prompt_template) {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, `1d`, and `market_narrative`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, and `1d`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n".to_string()
         } else {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, `1d`, and `market_narrative`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, and `1d`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n".to_string()
         }
     } else if pending_order_mode {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `reason` and `params`. `analysis` and `self_check` may be present as extra objects.\n- `reason` must be a non-empty top-level string. Do not place `reason` inside `analysis`.\n- `params` must contain exactly: `entry`, `tp`, `sl`, `leverage` — each a number or null.\n- Set all params to null if there is no valid setup.\n".to_string()
@@ -1339,12 +1377,11 @@ fn qwen_entry_scan_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["15m", "4h", "1d", "market_narrative"],
+        "required": ["15m", "4h", "1d"],
         "properties": {
             "15m": scan_timeframe_schema_openai(),
             "4h": scan_timeframe_schema_openai(),
-            "1d": scan_timeframe_schema_openai(),
-            "market_narrative": { "type": "string" }
+            "1d": scan_timeframe_schema_openai()
         }
     })
 }
@@ -1383,12 +1420,11 @@ fn custom_llm_entry_scan_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["15m", "4h", "1d", "market_narrative"],
+        "required": ["15m", "4h", "1d"],
         "properties": {
             "15m": scan_timeframe_schema_openai(),
             "4h": scan_timeframe_schema_openai(),
-            "1d": scan_timeframe_schema_openai(),
-            "market_narrative": { "type": "string" }
+            "1d": scan_timeframe_schema_openai()
         }
     })
 }
@@ -2134,12 +2170,11 @@ fn grok_entry_scan_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["15m", "4h", "1d", "market_narrative"],
+        "required": ["15m", "4h", "1d"],
         "properties": {
             "15m": scan_timeframe_schema_grok(),
             "4h": scan_timeframe_schema_grok(),
-            "1d": scan_timeframe_schema_grok(),
-            "market_narrative": { "type": "string" }
+            "1d": scan_timeframe_schema_grok()
         }
     })
 }
@@ -2350,12 +2385,11 @@ fn ml_grok_entry_scan_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["15m", "4h", "1d", "market_narrative"],
+        "required": ["15m", "4h", "1d"],
         "properties": {
             "15m": scan_timeframe_schema_grok(),
             "4h": scan_timeframe_schema_grok(),
-            "1d": scan_timeframe_schema_grok(),
-            "market_narrative": { "type": "string" }
+            "1d": scan_timeframe_schema_grok()
         }
     })
 }
@@ -2423,10 +2457,9 @@ fn ml_gemini_entry_scan_schema() -> Value {
         "properties": {
             "15m": scan_timeframe_schema_gemini(),
             "4h": scan_timeframe_schema_gemini(),
-            "1d": scan_timeframe_schema_gemini(),
-            "market_narrative": { "type": "STRING" }
+            "1d": scan_timeframe_schema_gemini()
         },
-        "required": ["15m", "4h", "1d", "market_narrative"]
+        "required": ["15m", "4h", "1d"]
     })
 }
 
@@ -2486,12 +2519,11 @@ fn ml_qwen_entry_scan_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["15m", "4h", "1d", "market_narrative"],
+        "required": ["15m", "4h", "1d"],
         "properties": {
             "15m": scan_timeframe_schema_openai(),
             "4h": scan_timeframe_schema_openai(),
-            "1d": scan_timeframe_schema_openai(),
-            "market_narrative": { "type": "string" }
+            "1d": scan_timeframe_schema_openai()
         }
     })
 }
@@ -2528,12 +2560,11 @@ fn ml_custom_llm_entry_scan_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["15m", "4h", "1d", "market_narrative"],
+        "required": ["15m", "4h", "1d"],
         "properties": {
             "15m": scan_timeframe_schema_openai(),
             "4h": scan_timeframe_schema_openai(),
-            "1d": scan_timeframe_schema_openai(),
-            "market_narrative": { "type": "string" }
+            "1d": scan_timeframe_schema_openai()
         }
     })
 }
@@ -2621,10 +2652,9 @@ fn gemini_entry_scan_response_schema() -> Value {
         "properties": {
             "15m": scan_timeframe_schema_gemini(),
             "4h": scan_timeframe_schema_gemini(),
-            "1d": scan_timeframe_schema_gemini(),
-            "market_narrative": { "type": "STRING" }
+            "1d": scan_timeframe_schema_gemini()
         },
-        "required": ["15m", "4h", "1d", "market_narrative"]
+        "required": ["15m", "4h", "1d"]
     })
 }
 
@@ -3500,7 +3530,6 @@ mod tests {
                 "Breakout above 2050 improves macro structure",
                 "Loss of 1960 reopens downside auction"
             ),
-            "market_narrative": "15m and 4h constructive, 1d rotational"
         })
     }
 
@@ -4064,7 +4093,7 @@ mod tests {
                 super::prompt::EntryPromptStage::Scan,
                 prompt_template,
             );
-            assert!(contract.contains("`15m`, `4h`, `1d`, and `market_narrative`"));
+            assert!(contract.contains("`15m`, `4h`, and `1d`"));
             assert!(contract.contains("`supporting_signals`"));
             assert!(!contract.contains("`range_basis`"));
             assert!(!contract.contains("`range_role_used`"));
@@ -4097,7 +4126,6 @@ mod tests {
             "15m": sample_scan_tf("Bullish", "mixed", 2030.0, 2060.0, &["positive cvd", "range support held"], &["funding stretched"], "Push through 2060 extends 15m trend", "Loss of 2030 weakens trigger structure"),
             "4h": sample_scan_tf("Bullish", "strong", 2020.0, 2080.0, &["4h trend up", "support defended"], &[], "Acceptance above 2080 opens continuation", "Failure below 2020 damages setup"),
             "1d": sample_scan_tf("Sideways", "mixed", 2000.0, 2100.0, &["daily auction balanced"], &["macro trend unresolved"], "Breakout above 2100 improves daily backdrop", "Loss of 2000 reopens downside risk"),
-            "market_narrative": "4h and 15m bullish, 1d neutral — tactical long bias"
         });
 
         let event = super::build_entry_finalize_trace_event(&input, &scan, Some(123));
@@ -4117,10 +4145,6 @@ mod tests {
         assert_eq!(
             event.get("stage_mode").and_then(Value::as_str),
             Some("entry")
-        );
-        assert_eq!(
-            event.get("scan_market_narrative").and_then(Value::as_str),
-            Some("4h and 15m bullish, 1d neutral — tactical long bias")
         );
     }
 
@@ -4158,7 +4182,6 @@ mod tests {
             "15m": sample_scan_tf("Bullish", "strong", 1995.0, 2025.0, &["bid wall holding", "positive obi"], &[], "Break through 2025 releases short-term upside", "Loss of 1995 invalidates trigger"),
             "4h": sample_scan_tf("Bullish", "strong", 1990.0, 2030.0, &["4h value accepted", "trend support intact"], &[], "Acceptance above 2030 confirms continuation", "Close back below 1990 weakens 4h structure"),
             "1d": sample_scan_tf("Sideways", "mixed", 1980.0, 2040.0, &["daily rotation intact"], &["top-down breakout not confirmed"], "Breakout above 2040 improves macro context", "Loss of 1980 reopens downside auction"),
-            "market_narrative": "15m and 4h bullish off dom liquidity wall, 1d neutral — tactical long bias"
         });
 
         let serialized =
@@ -4375,7 +4398,6 @@ mod tests {
             "15m": sample_scan_tf("Bullish", "mixed", 1990.0, 2015.0, &["value area re-fill", "flow long"], &["short-term overhead supply"], "Break above 2015 improves trigger quality", "Loss of 1990 weakens immediate setup"),
             "4h": sample_scan_tf("Bullish", "strong", 1985.0, 2020.0, &["4h structure up", "support held"], &[], "Acceptance above 2020 confirms continuation", "Failure below 1985 damages setup"),
             "1d": sample_scan_tf("Bullish", "mixed", 1980.0, 2025.0, &["daily backdrop constructive"], &["macro breakout not complete"], "Daily acceptance above 2025 improves macro trend", "Loss of 1980 increases downside risk"),
-            "market_narrative": "15m and 4h bullish with value area re-fill setup — tactical long near val 1990"
         });
 
         let prompt = super::build_prompt_pair(

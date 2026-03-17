@@ -13,14 +13,10 @@ For each timeframe — 15m, 4h, 1d — give:
   - the main opportunity
   - the main risk
 
-Also give:
-  - market_narrative: one concise top-down explanation of how 1d, 4h, and 15m relate
-
 Return them as top-level keys:
   - 15m
   - 4h
   - 1d
-  - market_narrative
 
 The goal is not to restate the JSON.
 The goal is to turn the JSON into a clear, accurate market read.
@@ -98,7 +94,6 @@ WHAT A GOOD ANSWER LOOKS LIKE
   - 15m gives the immediate trigger context and the short-term bracket
   - each range is meaningful for that timeframe, not just mechanically copied from the nearest level
   - each timeframe clearly states both opportunity and risk
-  - the final narrative connects the three timeframes into one coherent market picture
 
 BEFORE YOU OUTPUT
 Confirm all of these are true:
@@ -106,7 +101,7 @@ Confirm all of these are true:
 2. The reported range is the most meaningful bracket for that timeframe right now, not just the smallest nearby band.
 3. Supporting_signals and conflicting_signals are both specific and grounded in the input data.
 4. Opportunity and risk are concrete and tied to the reported range and current market structure.
-5. The market_narrative clearly explains the relationship between 1d background, 4h setup, and 15m trigger context.
+5. The three timeframe outputs together clearly express the relationship between 1d background, 4h setup, and 15m trigger context.
 
 FORMAT
 Return JSON only. The provider already enforces the exact JSON schema.

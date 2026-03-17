@@ -21,6 +21,7 @@ pub struct AppContext {
     pub mq_consume_channel: Channel,
     pub consume_queue_name: String,
     pub http_client: Client,
+    pub loopback_http_client: Client,
     pub producer_instance_id: String,
 }
 
@@ -103,6 +104,14 @@ pub async fn bootstrap() -> Result<AppContext> {
         );
     }
     let http_client = http_builder.build().context("build llm http client")?;
+    let loopback_http_client = Client::builder()
+        .timeout(Duration::from_secs(config.llm.request_timeout_secs))
+        .user_agent("orderflow-llm/0.1.0")
+        .no_proxy()
+        .pool_max_idle_per_host(0)
+        .pool_idle_timeout(Duration::from_secs(1))
+        .build()
+        .context("build llm loopback http client")?;
 
     let queue_cfg = config
         .mq
@@ -136,6 +145,7 @@ pub async fn bootstrap() -> Result<AppContext> {
         mq_consume_channel,
         consume_queue_name,
         http_client,
+        loopback_http_client,
         producer_instance_id,
     })
 }
