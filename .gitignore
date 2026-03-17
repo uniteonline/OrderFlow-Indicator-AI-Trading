@@ -8,6 +8,7 @@
 /systems/llm/journal/
 /systems/llm/temp_indicator/
 /systems/llm/temp_model_input/
+/systems/llm/temp_model_output/
 
 # Local config / secrets / IDE state
 /config/*.yaml
