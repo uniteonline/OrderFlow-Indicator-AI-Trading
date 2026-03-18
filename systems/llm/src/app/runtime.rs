@@ -1665,16 +1665,17 @@ fn derive_management_telegram_fields(
     else {
         return TelegramPositionFields::default();
     };
+    let position_side = effective_active_position_side(pos);
 
     let take_profit = find_live_exit_trigger_price(
         &state.open_orders,
-        &pos.position_side,
+        &position_side,
         Some(pos.entry_price),
         ExitKind::TakeProfit,
     );
     let stop_loss = find_live_exit_trigger_price(
         &state.open_orders,
-        &pos.position_side,
+        &position_side,
         Some(pos.entry_price),
         ExitKind::StopLoss,
     );
@@ -1810,15 +1811,16 @@ fn build_management_snapshot_for_llm(
         .active_positions
         .iter()
         .map(|p| {
+            let effective_position_side = effective_active_position_side(p);
             let current_tp_price = find_live_exit_trigger_price(
                 &state.open_orders,
-                &p.position_side,
+                &effective_position_side,
                 Some(p.entry_price),
                 ExitKind::TakeProfit,
             );
             let current_sl_price = find_live_exit_trigger_price(
                 &state.open_orders,
-                &p.position_side,
+                &effective_position_side,
                 Some(p.entry_price),
                 ExitKind::StopLoss,
             );
@@ -1865,6 +1867,23 @@ fn compute_pnl_by_latest_price(
     }
 }
 
+fn effective_active_position_side(
+    position: &crate::execution::binance::ActivePositionSnapshot,
+) -> String {
+    let raw = position.position_side.trim();
+    if raw.is_empty() || raw == "-" || raw.eq_ignore_ascii_case("BOTH") {
+        if position.position_amt > 0.0 {
+            "LONG".to_string()
+        } else if position.position_amt < 0.0 {
+            "SHORT".to_string()
+        } else {
+            "BOTH".to_string()
+        }
+    } else {
+        raw.to_ascii_uppercase()
+    }
+}
+
 fn primary_position_key(
     state: &crate::execution::binance::TradingStateSnapshot,
 ) -> Option<(String, f64, f64)> {
@@ -1872,11 +1891,8 @@ fn primary_position_key(
         .active_positions
         .iter()
         .max_by(|a, b| a.position_amt.abs().total_cmp(&b.position_amt.abs()))?;
-    let key = format!(
-        "{}:{}",
-        state.symbol.to_ascii_uppercase(),
-        pos.position_side.to_ascii_uppercase()
-    );
+    let position_side = effective_active_position_side(pos);
+    let key = format!("{}:{}", state.symbol.to_ascii_uppercase(), position_side);
     Some((key, pos.position_amt.abs(), pos.mark_price))
 }
 
@@ -2323,11 +2339,8 @@ async fn hydrate_position_context_from_live_state(
         .iter()
         .max_by(|a, b| a.position_amt.abs().total_cmp(&b.position_amt.abs()))
     {
-        let key = format!(
-            "{}:{}",
-            state.symbol.to_ascii_uppercase(),
-            pos.position_side.to_ascii_uppercase()
-        );
+        let position_side = effective_active_position_side(pos);
+        let key = format!("{}:{}", state.symbol.to_ascii_uppercase(), position_side);
         let entry = symbol_state.contexts.entry(key).or_default();
         let qty = pos.position_amt.abs();
         if entry.original_qty <= f64::EPSILON || qty > entry.original_qty {
@@ -2337,7 +2350,7 @@ async fn hydrate_position_context_from_live_state(
         entry.effective_leverage = Some(pos.leverage);
         if let Some(tp) = find_live_exit_trigger_price(
             &state.open_orders,
-            &pos.position_side,
+            &position_side,
             Some(pos.entry_price),
             ExitKind::TakeProfit,
         ) {
@@ -2345,7 +2358,7 @@ async fn hydrate_position_context_from_live_state(
         }
         if let Some(sl) = find_live_exit_trigger_price(
             &state.open_orders,
-            &pos.position_side,
+            &position_side,
             Some(pos.entry_price),
             ExitKind::StopLoss,
         ) {
@@ -6889,6 +6902,64 @@ mod tests {
     }
 
     #[test]
+    fn hold_telegram_fields_use_both_side_limit_tp_and_conditional_sl() {
+        let state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: true,
+            active_positions: vec![ActivePositionSnapshot {
+                position_side: "BOTH".to_string(),
+                position_amt: -0.05,
+                entry_price: 2244.54,
+                mark_price: 2233.10,
+                unrealized_pnl: 0.53,
+                leverage: 15,
+            }],
+            open_orders: vec![
+                OpenOrderSnapshot {
+                    order_id: 1,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "LIMIT".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.05,
+                    executed_qty: 0.0,
+                    price: 2202.86,
+                    stop_price: 0.0,
+                    close_position: false,
+                    reduce_only: true,
+                },
+                OpenOrderSnapshot {
+                    order_id: 2,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "CONDITIONAL".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.05,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2253.07,
+                    close_position: false,
+                    reduce_only: true,
+                },
+            ],
+            total_wallet_balance: 1000.0,
+            available_balance: 800.0,
+        };
+
+        let fields = derive_management_telegram_fields(Some(&state));
+        assert_eq!(fields.entry_price, Some(2244.54));
+        assert_eq!(fields.leverage, Some(15.0));
+        assert_eq!(fields.take_profit, Some(2202.86));
+        assert_eq!(fields.stop_loss, Some(2253.07));
+        assert_eq!(
+            fields.risk_reward_ratio,
+            Some((2244.54 - 2202.86) / (2253.07 - 2244.54))
+        );
+    }
+
+    #[test]
     fn hold_telegram_fields_are_empty_without_active_position() {
         let state = TradingStateSnapshot {
             symbol: "ETHUSDT".to_string(),
@@ -7126,6 +7197,61 @@ mod tests {
         let position = &snapshot.positions[0];
         assert_eq!(position.current_tp_price, Some(2235.63));
         assert_eq!(position.current_sl_price, Some(2287.22));
+    }
+
+    #[test]
+    fn management_snapshot_uses_both_side_limit_tp_and_conditional_sl() {
+        let state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: true,
+            active_positions: vec![ActivePositionSnapshot {
+                position_side: "BOTH".to_string(),
+                position_amt: -0.05,
+                entry_price: 2244.54,
+                mark_price: 2233.10,
+                unrealized_pnl: 0.53,
+                leverage: 15,
+            }],
+            open_orders: vec![
+                OpenOrderSnapshot {
+                    order_id: 1,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "LIMIT".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.05,
+                    executed_qty: 0.0,
+                    price: 2202.86,
+                    stop_price: 0.0,
+                    close_position: false,
+                    reduce_only: true,
+                },
+                OpenOrderSnapshot {
+                    order_id: 2,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "CONDITIONAL".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.05,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2253.07,
+                    close_position: false,
+                    reduce_only: true,
+                },
+            ],
+            total_wallet_balance: 1000.0,
+            available_balance: 800.0,
+        };
+
+        let snapshot =
+            build_management_snapshot_for_llm(Some(&state), None, None).expect("snapshot exists");
+        assert_eq!(snapshot.positions.len(), 1);
+        let position = &snapshot.positions[0];
+        assert_eq!(position.current_tp_price, Some(2202.86));
+        assert_eq!(position.current_sl_price, Some(2253.07));
     }
 
     #[test]

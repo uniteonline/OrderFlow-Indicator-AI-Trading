@@ -14,8 +14,3 @@
 
 
 
-
-
-请再次确认stage1 scan filter的产出物20260318T083000Z_ETHUSDT_scan_20260318T083257217Z.json，是否已经100%落地了/data/docs/scan数据源过滤规则v6.2.md的优化，同时新输出的产出物没有空值/null
-
-
