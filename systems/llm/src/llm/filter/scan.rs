@@ -210,6 +210,7 @@ fn build_now(
         "price_anchor": build_price_anchor(source, current_price),
         "location_snapshot": build_location_snapshot(source, current_price),
         "value_state_board": build_value_state_board(source, current_price),
+        "momentum_snapshot": build_momentum_snapshot(source),
         "bracket_board": build_bracket_board(
             source,
             current_price,
@@ -1097,6 +1098,95 @@ fn build_current_flow_snapshot(source: &Map<String, Value>, current_price: Optio
         "footprint": footprint,
         "whales": whales,
     })
+}
+
+fn build_momentum_snapshot(source: &Map<String, Value>) -> Value {
+    let mut result = Map::new();
+    for tf in ["15m", "4h", "1d"] {
+        result.insert(
+            tf.to_string(),
+            build_timeframe_momentum_snapshot(source, tf),
+        );
+    }
+    Value::Object(result)
+}
+
+fn build_timeframe_momentum_snapshot(source: &Map<String, Value>, tf: &str) -> Value {
+    let mut result = Map::new();
+
+    let closed_bars = extract_closed_futures_bars(source, tf);
+    let recent_bars = if closed_bars.len() > 3 {
+        &closed_bars[closed_bars.len() - 3..]
+    } else {
+        closed_bars.as_slice()
+    };
+    let bar_return_last_3_pct = recent_bars
+        .iter()
+        .filter_map(|bar| {
+            let open = bar.get("open").and_then(Value::as_f64);
+            let close = bar.get("close").and_then(Value::as_f64);
+            pct_delta(close, open).map(round2)
+        })
+        .collect::<Vec<_>>();
+    result.insert(
+        "bar_return_last_3_pct".to_string(),
+        Value::Array(bar_return_last_3_pct.into_iter().map(Value::from).collect()),
+    );
+    if let (Some(oldest_open), Some(latest_close)) = (
+        recent_bars
+            .first()
+            .and_then(|bar| bar.get("open"))
+            .and_then(Value::as_f64),
+        recent_bars
+            .last()
+            .and_then(|bar| bar.get("close"))
+            .and_then(Value::as_f64),
+    ) {
+        if let Some(value) = pct_delta(Some(latest_close), Some(oldest_open)).map(round2) {
+            result.insert("bar_return_sum_last_3_pct".to_string(), Value::from(value));
+        }
+    }
+
+    let cvd_delta_last_3 = extract_indicator_payload(source, "cvd_pack")
+        .and_then(|payload| payload.get("by_window").and_then(Value::as_object))
+        .and_then(|by_window| by_window.get(tf).and_then(Value::as_object))
+        .and_then(|window| window.get("series").and_then(Value::as_array))
+        .map(|series| {
+            let start = series.len().saturating_sub(3);
+            series[start..]
+                .iter()
+                .filter_map(|entry| entry.get("delta_fut").and_then(Value::as_f64))
+                .map(round2)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    result.insert(
+        "cvd_delta_last_3".to_string(),
+        Value::Array(cvd_delta_last_3.iter().copied().map(Value::from).collect()),
+    );
+    if cvd_delta_last_3.len() >= 2 {
+        let last = cvd_delta_last_3[cvd_delta_last_3.len() - 1];
+        let prev = cvd_delta_last_3[cvd_delta_last_3.len() - 2];
+        result.insert("cvd_slope".to_string(), Value::from(round2(last - prev)));
+    }
+
+    if let Some(whale_delta_notional) = extract_indicator_payload(source, "whale_trades")
+        .and_then(|payload| payload.get("by_window").and_then(Value::as_object))
+        .and_then(|by_window| by_window.get(tf).and_then(Value::as_object))
+        .and_then(|window| {
+            window
+                .get("fut_whale_delta_notional")
+                .and_then(Value::as_f64)
+        })
+        .map(round2)
+    {
+        result.insert(
+            "whale_delta_notional".to_string(),
+            Value::from(whale_delta_notional),
+        );
+    }
+
+    Value::Object(result)
 }
 
 fn build_current_orderbook_snapshot(
@@ -5711,6 +5801,116 @@ mod tests {
                 .pointer("/path_newest_to_oldest/latest_1d_background/current_partial_bar/ts")
                 .and_then(Value::as_str),
             Some("2026-03-14T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn build_value_emits_numeric_momentum_snapshot() {
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-14T08:00:00Z")
+            .expect("parse ts bucket")
+            .with_timezone(&Utc);
+        let input = sample_input(fixture_indicators(), ts_bucket);
+        let value = ScanFilter::build_value(&input).expect("build scan value");
+
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/15m/bar_return_last_3_pct")
+                .and_then(Value::as_array)
+                .map(|v| {
+                    v.iter()
+                        .map(|x| x.as_f64().expect("15m bar return number"))
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec![0.05, 0.12, 0.02])
+        );
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/15m/bar_return_sum_last_3_pct")
+                .and_then(Value::as_f64),
+            Some(0.19)
+        );
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/15m/cvd_delta_last_3")
+                .and_then(Value::as_array)
+                .map(|v| {
+                    v.iter()
+                        .map(|x| x.as_f64().expect("15m cvd number"))
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec![100.0, 300.0, 500.0])
+        );
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/15m/cvd_slope")
+                .and_then(Value::as_f64),
+            Some(200.0)
+        );
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/15m/whale_delta_notional")
+                .and_then(Value::as_f64),
+            Some(1200000.0)
+        );
+
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/4h/bar_return_last_3_pct")
+                .and_then(Value::as_array)
+                .map(|v| {
+                    v.iter()
+                        .map(|x| x.as_f64().expect("4h bar return number"))
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec![0.34, 0.33, 0.1])
+        );
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/4h/bar_return_sum_last_3_pct")
+                .and_then(Value::as_f64),
+            Some(0.77)
+        );
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/4h/cvd_slope")
+                .and_then(Value::as_f64),
+            Some(40.0)
+        );
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/4h/whale_delta_notional")
+                .and_then(Value::as_f64),
+            Some(2400000.0)
+        );
+
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/1d/bar_return_last_3_pct")
+                .and_then(Value::as_array)
+                .map(|v| {
+                    v.iter()
+                        .map(|x| x.as_f64().expect("1d bar return number"))
+                        .collect::<Vec<_>>()
+                }),
+            Some(vec![0.73, 0.82, 0.57])
+        );
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/1d/bar_return_sum_last_3_pct")
+                .and_then(Value::as_f64),
+            Some(2.14)
+        );
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/1d/cvd_slope")
+                .and_then(Value::as_f64),
+            Some(40.0)
+        );
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/1d/whale_delta_notional")
+                .and_then(Value::as_f64),
+            Some(4800000.0)
         );
     }
 

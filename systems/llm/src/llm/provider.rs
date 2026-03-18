@@ -1204,12 +1204,17 @@ async fn invoke_custom_llm_stage(
         http_client
     };
     let is_loopback = is_loopback_chat_completions_url(&url);
+    let stage_name = entry_stage_name(entry_stage);
 
     let max_attempts = 2u32;
     let mut last_err: Option<ProviderFailure> = None;
     for attempt in 0..max_attempts {
         if attempt > 0 {
-            tracing::warn!("custom_llm retry attempt {} after server error", attempt);
+            tracing::warn!(
+                "custom_llm retry attempt {} after retryable error stage={}",
+                attempt,
+                stage_name
+            );
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
         let mut request = client
@@ -1234,7 +1239,8 @@ async fn invoke_custom_llm_stage(
         if status.is_server_error() {
             let body = response.text().await.unwrap_or_default();
             tracing::warn!(
-                "custom_llm chat completions server error status={} body={}",
+                "custom_llm chat completions server error stage={} status={} body={}",
+                stage_name,
                 status,
                 body
             );
@@ -1261,14 +1267,56 @@ async fn invoke_custom_llm_stage(
             });
         }
 
-        let body: QwenChatCompletionsResponse = response
-            .json()
-            .await
-            .context("decode custom_llm chat completions response body")
-            .map_err(|error| ProviderFailure {
-                error,
+        let response_text = match response.text().await {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::warn!(
+                    "custom_llm chat completions body read failed stage={} status={} error={}",
+                    stage_name,
+                    status,
+                    error
+                );
+                last_err = Some(ProviderFailure {
+                    error: anyhow::Error::from(error)
+                        .context("read custom_llm chat completions response body"),
+                    trace: trace.clone(),
+                });
+                continue;
+            }
+        };
+
+        if response_text.trim().is_empty() {
+            tracing::warn!(
+                "custom_llm chat completions returned empty body stage={} status={}",
+                stage_name,
+                status
+            );
+            last_err = Some(ProviderFailure {
+                error: anyhow!("custom_llm chat completions response body is empty"),
                 trace: trace.clone(),
-            })?;
+            });
+            continue;
+        }
+
+        let body: QwenChatCompletionsResponse =
+            match serde_json::from_str::<QwenChatCompletionsResponse>(&response_text) {
+                Ok(body) => body,
+                Err(error) => {
+                    tracing::warn!(
+                    "custom_llm chat completions decode failed stage={} status={} error={} body={}",
+                    stage_name,
+                    status,
+                    error,
+                    response_text
+                );
+                    last_err = Some(ProviderFailure {
+                        error: anyhow::Error::from(error)
+                            .context("decode custom_llm chat completions response body"),
+                        trace: trace.clone(),
+                    });
+                    continue;
+                }
+            };
 
         let text = body
             .choices
@@ -1276,10 +1324,16 @@ async fn invoke_custom_llm_stage(
             .map(|c| c.message.content.trim().to_string())
             .unwrap_or_default();
         if text.is_empty() {
-            return Err(ProviderFailure {
+            tracing::warn!(
+                "custom_llm chat completions response text is empty stage={} status={}",
+                stage_name,
+                status
+            );
+            last_err = Some(ProviderFailure {
                 error: anyhow!("custom_llm chat completions response text is empty"),
-                trace,
+                trace: trace.clone(),
             });
+            continue;
         }
 
         return Ok(ProviderSuccess {
@@ -4460,7 +4514,7 @@ mod tests {
         assert_eq!(value.as_object().map(|obj| obj.len()), Some(9));
         assert_eq!(
             value.get("version").and_then(Value::as_str),
-            Some("scan_v6")
+            Some("scan_v6_1")
         );
         assert!(value.pointer("/now").is_some());
         assert!(value

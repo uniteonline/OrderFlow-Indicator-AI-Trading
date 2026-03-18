@@ -38,7 +38,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use tokio::sync::Mutex;
 use tokio::time::{sleep_until, Duration, Instant, Sleep};
 use tracing::{debug, error, info, warn};
@@ -50,6 +50,8 @@ const LLM_JOURNAL_DIR: &str = "systems/llm/journal";
 const LLM_JOURNAL_FILE: &str = "systems/llm/journal/llm_trade_journal.jsonl";
 const MANAGEMENT_REDUCTION_LEVEL_THRESHOLD: f64 = 0.5;
 const KLINE_DB_BACKFILL_INTERVALS: [(&str, i64); 2] = [("4h", 240), ("1d", 1440)];
+const KLINE_RANGE_CACHE_TTL_MINUTES: i64 = 30;
+const KLINE_RANGE_CACHE_MAX_SERIES: usize = 8;
 
 #[derive(Debug, Default)]
 struct InvokeThrottleState {
@@ -486,6 +488,30 @@ struct KlineHistoryPatchStats {
     divergence_events_patched: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct KlineRangeCacheSeriesKey {
+    symbol: String,
+    market: String,
+    interval_code: String,
+}
+
+#[derive(Debug, Clone)]
+struct KlineRangeCacheEntry {
+    start_open_time: DateTime<Utc>,
+    end_open_time: DateTime<Utc>,
+    bars: Vec<Value>,
+    last_accessed_at: DateTime<Utc>,
+}
+
+static KLINE_RANGE_QUERY_CACHE: OnceLock<
+    StdMutex<HashMap<KlineRangeCacheSeriesKey, KlineRangeCacheEntry>>,
+> = OnceLock::new();
+
+fn kline_range_query_cache(
+) -> &'static StdMutex<HashMap<KlineRangeCacheSeriesKey, KlineRangeCacheEntry>> {
+    KLINE_RANGE_QUERY_CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
 async fn hydrate_missing_kline_history_from_db(
     pool: &PgPool,
     input: &mut ModelInvocationInput,
@@ -510,11 +536,8 @@ async fn hydrate_missing_kline_history_from_db(
 
     stats.bars_patched = apply_backfilled_kline_bars(&mut input.indicators, &replacements);
 
-    let mut divergence_backfill_bars = extract_kline_history_bars(
-        &input.indicators,
-        "futures",
-        "1m",
-    );
+    let mut divergence_backfill_bars =
+        extract_kline_history_bars(&input.indicators, "futures", "1m");
 
     if let Some(range_request) = collect_divergence_kline_coverage_request(&input.indicators) {
         let additional_bars = fetch_kline_bars_range_from_db(
@@ -535,8 +558,10 @@ async fn hydrate_missing_kline_history_from_db(
         divergence_backfill_bars.extend(additional_bars);
     }
 
-    stats.divergence_events_patched =
-        backfill_divergence_event_prices_from_bars(&mut input.indicators, &divergence_backfill_bars);
+    stats.divergence_events_patched = backfill_divergence_event_prices_from_bars(
+        &mut input.indicators,
+        &divergence_backfill_bars,
+    );
 
     Ok(stats)
 }
@@ -658,7 +683,7 @@ async fn fetch_kline_bar_from_db(
     })))
 }
 
-async fn fetch_kline_bars_range_from_db(
+async fn fetch_kline_bars_range_from_db_uncached(
     pool: &PgPool,
     symbol: &str,
     market: &str,
@@ -721,6 +746,181 @@ async fn fetch_kline_bars_range_from_db(
             })
         })
         .collect())
+}
+
+fn kline_cache_series_key(
+    symbol: &str,
+    market: &str,
+    interval_code: &str,
+) -> KlineRangeCacheSeriesKey {
+    KlineRangeCacheSeriesKey {
+        symbol: symbol.to_ascii_uppercase(),
+        market: market.to_string(),
+        interval_code: interval_code.to_string(),
+    }
+}
+
+fn prune_kline_range_query_cache(
+    cache: &mut HashMap<KlineRangeCacheSeriesKey, KlineRangeCacheEntry>,
+    now: DateTime<Utc>,
+) {
+    let ttl_cutoff = now - ChronoDuration::minutes(KLINE_RANGE_CACHE_TTL_MINUTES);
+    cache.retain(|_, entry| entry.last_accessed_at >= ttl_cutoff);
+
+    while cache.len() > KLINE_RANGE_CACHE_MAX_SERIES {
+        let Some(evict_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_accessed_at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        cache.remove(&evict_key);
+    }
+}
+
+fn bar_open_time(bar: &Value) -> Option<DateTime<Utc>> {
+    bar.get("open_time")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339_utc)
+}
+
+fn slice_cached_kline_bars(
+    bars: &[Value],
+    start_open_time: DateTime<Utc>,
+    end_open_time: DateTime<Utc>,
+) -> Vec<Value> {
+    bars.iter()
+        .filter(|bar| {
+            bar_open_time(bar)
+                .map(|open_time| open_time >= start_open_time && open_time <= end_open_time)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+async fn fetch_kline_bars_range_from_db(
+    pool: &PgPool,
+    symbol: &str,
+    market: &str,
+    interval_code: &str,
+    start_open_time: DateTime<Utc>,
+    end_open_time: DateTime<Utc>,
+) -> Result<Vec<Value>> {
+    if end_open_time < start_open_time {
+        return Ok(Vec::new());
+    }
+
+    let series_key = kline_cache_series_key(symbol, market, interval_code);
+    let now = Utc::now();
+
+    {
+        let mut cache = kline_range_query_cache()
+            .lock()
+            .expect("kline range query cache poisoned");
+        prune_kline_range_query_cache(&mut cache, now);
+
+        if let Some(entry) = cache.get_mut(&series_key) {
+            if start_open_time >= entry.start_open_time && end_open_time <= entry.end_open_time {
+                entry.last_accessed_at = now;
+                return Ok(slice_cached_kline_bars(
+                    &entry.bars,
+                    start_open_time,
+                    end_open_time,
+                ));
+            }
+        }
+    }
+
+    let interval_step = ChronoDuration::minutes(interval_minutes(interval_code));
+    let maybe_extension = {
+        let mut cache = kline_range_query_cache()
+            .lock()
+            .expect("kline range query cache poisoned");
+        prune_kline_range_query_cache(&mut cache, now);
+        cache.get_mut(&series_key).and_then(|entry| {
+            if start_open_time == entry.start_open_time && end_open_time > entry.end_open_time {
+                let fetch_start = entry.end_open_time + interval_step;
+                if fetch_start <= end_open_time {
+                    entry.last_accessed_at = now;
+                    return Some((entry.clone(), fetch_start, end_open_time, true));
+                }
+            }
+
+            if end_open_time == entry.end_open_time && start_open_time < entry.start_open_time {
+                let fetch_end = entry.start_open_time - interval_step;
+                if start_open_time <= fetch_end {
+                    entry.last_accessed_at = now;
+                    return Some((entry.clone(), start_open_time, fetch_end, false));
+                }
+            }
+
+            None
+        })
+    };
+
+    if let Some((entry, fetch_start, fetch_end, append_right)) = maybe_extension {
+        let delta_bars = fetch_kline_bars_range_from_db_uncached(
+            pool,
+            symbol,
+            market,
+            interval_code,
+            fetch_start,
+            fetch_end,
+        )
+        .await?;
+
+        let merged_bars = if append_right {
+            let mut bars = entry.bars.clone();
+            bars.extend(delta_bars);
+            bars
+        } else {
+            let mut bars = delta_bars;
+            bars.extend(entry.bars.clone());
+            bars
+        };
+
+        let new_entry = KlineRangeCacheEntry {
+            start_open_time: start_open_time.min(entry.start_open_time),
+            end_open_time: end_open_time.max(entry.end_open_time),
+            bars: merged_bars.clone(),
+            last_accessed_at: now,
+        };
+
+        let mut cache = kline_range_query_cache()
+            .lock()
+            .expect("kline range query cache poisoned");
+        cache.insert(series_key, new_entry);
+        prune_kline_range_query_cache(&mut cache, now);
+        return Ok(merged_bars);
+    }
+
+    let bars = fetch_kline_bars_range_from_db_uncached(
+        pool,
+        symbol,
+        market,
+        interval_code,
+        start_open_time,
+        end_open_time,
+    )
+    .await?;
+
+    let mut cache = kline_range_query_cache()
+        .lock()
+        .expect("kline range query cache poisoned");
+    cache.insert(
+        series_key,
+        KlineRangeCacheEntry {
+            start_open_time,
+            end_open_time,
+            bars: bars.clone(),
+            last_accessed_at: now,
+        },
+    );
+    prune_kline_range_query_cache(&mut cache, now);
+
+    Ok(bars)
 }
 
 fn apply_backfilled_kline_bars(
@@ -1031,8 +1231,11 @@ fn parse_rfc3339_utc(raw: &str) -> Option<DateTime<Utc>> {
 
 fn interval_minutes(interval_code: &str) -> i64 {
     match interval_code {
+        "15m" => 15,
+        "1h" => 60,
         "4h" => 240,
         "1d" => 1440,
+        "3d" => 4320,
         _ => 1,
     }
 }
@@ -1220,31 +1423,142 @@ async fn resolve_invocation_routing_context(
     })
 }
 
-/// Mirror of `extract_existing_exit_trigger` in binance.rs (private there).
-/// Returns the actual trigger price for the first matching TP or SL order on Binance.
-fn find_exit_trigger_price(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitKind {
+    TakeProfit,
+    StopLoss,
+}
+
+fn exit_order_trigger_price(order: &crate::execution::binance::OpenOrderSnapshot) -> Option<f64> {
+    if order.stop_price > 0.0 {
+        Some(order.stop_price)
+    } else if order.price > 0.0 {
+        Some(order.price)
+    } else {
+        None
+    }
+}
+
+fn order_matches_position_side(
+    order: &crate::execution::binance::OpenOrderSnapshot,
+    position_side: &str,
+) -> bool {
+    order.position_side.eq_ignore_ascii_case(position_side)
+        || order.position_side.eq_ignore_ascii_case("BOTH")
+        || order.position_side.trim().is_empty()
+        || order.position_side == "-"
+}
+
+fn exact_order_type_matches_exit_kind(order_type: &str, exit_kind: ExitKind) -> bool {
+    match exit_kind {
+        ExitKind::TakeProfit => {
+            order_type.eq_ignore_ascii_case("TAKE_PROFIT_MARKET")
+                || order_type.eq_ignore_ascii_case("TAKE_PROFIT")
+                || order_type.eq_ignore_ascii_case("TAKE_PROFIT_MARKET_ALGO")
+        }
+        ExitKind::StopLoss => {
+            order_type.eq_ignore_ascii_case("STOP_MARKET")
+                || order_type.eq_ignore_ascii_case("STOP")
+                || order_type.eq_ignore_ascii_case("STOP_MARKET_ALGO")
+        }
+    }
+}
+
+fn inferred_exit_kind(
+    order: &crate::execution::binance::OpenOrderSnapshot,
+    position_side: &str,
+    entry_price: f64,
+) -> Option<ExitKind> {
+    if !(order.reduce_only || order.close_position) {
+        return None;
+    }
+    let trigger = exit_order_trigger_price(order)?;
+    if trigger <= 0.0 {
+        return None;
+    }
+    if position_side.eq_ignore_ascii_case("LONG") {
+        if trigger > entry_price {
+            Some(ExitKind::TakeProfit)
+        } else if trigger < entry_price {
+            Some(ExitKind::StopLoss)
+        } else {
+            None
+        }
+    } else if position_side.eq_ignore_ascii_case("SHORT") {
+        if trigger < entry_price {
+            Some(ExitKind::TakeProfit)
+        } else if trigger > entry_price {
+            Some(ExitKind::StopLoss)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn choose_preferred_exit_price(
+    prices: impl IntoIterator<Item = f64>,
+    entry_price: f64,
+    position_side: &str,
+    exit_kind: ExitKind,
+) -> Option<f64> {
+    let mut candidates = prices.into_iter().filter(|v| *v > 0.0).collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+    match (position_side.eq_ignore_ascii_case("LONG"), exit_kind) {
+        (true, ExitKind::TakeProfit) => candidates.sort_by(|a, b| a.total_cmp(b)),
+        (true, ExitKind::StopLoss) => candidates.sort_by(|a, b| b.total_cmp(a)),
+        (false, ExitKind::TakeProfit) => candidates.sort_by(|a, b| b.total_cmp(a)),
+        (false, ExitKind::StopLoss) => candidates.sort_by(|a, b| a.total_cmp(b)),
+    }
+    candidates
+        .into_iter()
+        .min_by(|a, b| (a - entry_price).abs().total_cmp(&(b - entry_price).abs()))
+}
+
+/// Returns the actual live TP/SL trigger price from Binance open orders.
+///
+/// Binance may surface live exits as typed orders (`TAKE_PROFIT_MARKET`, `STOP_MARKET`) or as
+/// generic `CONDITIONAL` orders. For the latter we infer TP vs SL from reduce-only semantics and
+/// the trigger's location relative to the live entry price.
+fn find_live_exit_trigger_price(
     open_orders: &[crate::execution::binance::OpenOrderSnapshot],
     position_side: &str,
-    order_type: &str,
+    entry_price: Option<f64>,
+    exit_kind: ExitKind,
 ) -> Option<f64> {
-    open_orders
+    let exact_matches = open_orders
         .iter()
-        .filter(|o| o.order_type.eq_ignore_ascii_case(order_type))
-        .filter(|o| {
-            o.position_side.eq_ignore_ascii_case(position_side)
-                || o.position_side.eq_ignore_ascii_case("BOTH")
-                || o.position_side.trim().is_empty()
-                || o.position_side == "-"
+        .filter(|o| order_matches_position_side(o, position_side))
+        .filter(|o| exact_order_type_matches_exit_kind(&o.order_type, exit_kind))
+        .filter_map(exit_order_trigger_price)
+        .collect::<Vec<_>>();
+    if !exact_matches.is_empty() {
+        return entry_price
+            .and_then(|entry| {
+                choose_preferred_exit_price(
+                    exact_matches.iter().copied(),
+                    entry,
+                    position_side,
+                    exit_kind,
+                )
+            })
+            .or_else(|| exact_matches.into_iter().next());
+    }
+
+    let entry_price = entry_price?;
+    let inferred_matches = open_orders
+        .iter()
+        .filter(|o| order_matches_position_side(o, position_side))
+        .filter_map(|o| {
+            inferred_exit_kind(o, position_side, entry_price)
+                .filter(|kind| *kind == exit_kind)
+                .and_then(|_| exit_order_trigger_price(o))
         })
-        .find_map(|o| {
-            if o.stop_price > 0.0 {
-                Some(o.stop_price)
-            } else if o.price > 0.0 {
-                Some(o.price)
-            } else {
-                None
-            }
-        })
+        .collect::<Vec<_>>();
+    choose_preferred_exit_price(inferred_matches, entry_price, position_side, exit_kind)
 }
 
 fn primary_pending_entry_order(
@@ -1294,10 +1608,15 @@ fn build_pending_order_summary_for_llm(
         } else {
             position_context.and_then(|ctx| ctx.effective_entry_price)
         },
-        current_tp_price: find_exit_trigger_price(
+        current_tp_price: find_live_exit_trigger_price(
             &state.open_orders,
             &position_side,
-            "TAKE_PROFIT_MARKET",
+            if order.price > 0.0 {
+                Some(order.price)
+            } else {
+                position_context.and_then(|ctx| ctx.effective_entry_price)
+            },
+            ExitKind::TakeProfit,
         )
         .or_else(|| position_context.and_then(|ctx| ctx.effective_take_profit))
         .or_else(|| {
@@ -1305,10 +1624,15 @@ fn build_pending_order_summary_for_llm(
                 .and_then(|ctx| ctx.entry_context.as_ref())
                 .and_then(|ctx| ctx.original_tp)
         }),
-        current_sl_price: find_exit_trigger_price(
+        current_sl_price: find_live_exit_trigger_price(
             &state.open_orders,
             &position_side,
-            "STOP_MARKET",
+            if order.price > 0.0 {
+                Some(order.price)
+            } else {
+                position_context.and_then(|ctx| ctx.effective_entry_price)
+            },
+            ExitKind::StopLoss,
         )
         .or_else(|| position_context.and_then(|ctx| ctx.effective_stop_loss))
         .or_else(|| {
@@ -1342,9 +1666,18 @@ fn derive_management_telegram_fields(
         return TelegramPositionFields::default();
     };
 
-    let take_profit =
-        find_exit_trigger_price(&state.open_orders, &pos.position_side, "TAKE_PROFIT_MARKET");
-    let stop_loss = find_exit_trigger_price(&state.open_orders, &pos.position_side, "STOP_MARKET");
+    let take_profit = find_live_exit_trigger_price(
+        &state.open_orders,
+        &pos.position_side,
+        Some(pos.entry_price),
+        ExitKind::TakeProfit,
+    );
+    let stop_loss = find_live_exit_trigger_price(
+        &state.open_orders,
+        &pos.position_side,
+        Some(pos.entry_price),
+        ExitKind::StopLoss,
+    );
     let risk_reward_ratio = take_profit
         .zip(stop_loss)
         .and_then(|(tp, sl)| compute_rr_from_levels(pos.entry_price, tp, sl));
@@ -1394,11 +1727,20 @@ async fn derive_pending_order_telegram_fields(
     } else {
         ctx.and_then(|v| v.effective_entry_price)
     };
-    let take_profit =
-        find_exit_trigger_price(&state.open_orders, &position_side, "TAKE_PROFIT_MARKET")
-            .or_else(|| ctx.and_then(|v| v.effective_take_profit));
-    let stop_loss = find_exit_trigger_price(&state.open_orders, &position_side, "STOP_MARKET")
-        .or_else(|| ctx.and_then(|v| v.effective_stop_loss));
+    let take_profit = find_live_exit_trigger_price(
+        &state.open_orders,
+        &position_side,
+        entry_price,
+        ExitKind::TakeProfit,
+    )
+    .or_else(|| ctx.and_then(|v| v.effective_take_profit));
+    let stop_loss = find_live_exit_trigger_price(
+        &state.open_orders,
+        &position_side,
+        entry_price,
+        ExitKind::StopLoss,
+    )
+    .or_else(|| ctx.and_then(|v| v.effective_stop_loss));
     let risk_reward_ratio = entry_price
         .zip(take_profit)
         .zip(stop_loss)
@@ -1468,10 +1810,18 @@ fn build_management_snapshot_for_llm(
         .active_positions
         .iter()
         .map(|p| {
-            let current_tp_price =
-                find_exit_trigger_price(&state.open_orders, &p.position_side, "TAKE_PROFIT_MARKET");
-            let current_sl_price =
-                find_exit_trigger_price(&state.open_orders, &p.position_side, "STOP_MARKET");
+            let current_tp_price = find_live_exit_trigger_price(
+                &state.open_orders,
+                &p.position_side,
+                Some(p.entry_price),
+                ExitKind::TakeProfit,
+            );
+            let current_sl_price = find_live_exit_trigger_price(
+                &state.open_orders,
+                &p.position_side,
+                Some(p.entry_price),
+                ExitKind::StopLoss,
+            );
             PositionSummaryForLlm {
                 position_side: p.position_side.clone(),
                 direction: if p.position_amt > 0.0 {
@@ -1985,14 +2335,20 @@ async fn hydrate_position_context_from_live_state(
         }
         entry.effective_entry_price = Some(pos.entry_price);
         entry.effective_leverage = Some(pos.leverage);
-        if let Some(tp) =
-            find_exit_trigger_price(&state.open_orders, &pos.position_side, "TAKE_PROFIT_MARKET")
-        {
+        if let Some(tp) = find_live_exit_trigger_price(
+            &state.open_orders,
+            &pos.position_side,
+            Some(pos.entry_price),
+            ExitKind::TakeProfit,
+        ) {
             entry.effective_take_profit = Some(tp);
         }
-        if let Some(sl) =
-            find_exit_trigger_price(&state.open_orders, &pos.position_side, "STOP_MARKET")
-        {
+        if let Some(sl) = find_live_exit_trigger_price(
+            &state.open_orders,
+            &pos.position_side,
+            Some(pos.entry_price),
+            ExitKind::StopLoss,
+        ) {
             entry.effective_stop_loss = Some(sl);
         }
     }
@@ -2027,14 +2383,28 @@ async fn hydrate_position_context_from_live_state(
             if let Some(leverage) = pending_leverage {
                 entry.effective_leverage = Some(leverage);
             }
-            if let Some(tp) =
-                find_exit_trigger_price(&state.open_orders, &position_side, "TAKE_PROFIT_MARKET")
-            {
+            if let Some(tp) = find_live_exit_trigger_price(
+                &state.open_orders,
+                &position_side,
+                if order.price > 0.0 {
+                    Some(order.price)
+                } else {
+                    entry.effective_entry_price
+                },
+                ExitKind::TakeProfit,
+            ) {
                 entry.effective_take_profit = Some(tp);
             }
-            if let Some(sl) =
-                find_exit_trigger_price(&state.open_orders, &position_side, "STOP_MARKET")
-            {
+            if let Some(sl) = find_live_exit_trigger_price(
+                &state.open_orders,
+                &position_side,
+                if order.price > 0.0 {
+                    Some(order.price)
+                } else {
+                    entry.effective_entry_price
+                },
+                ExitKind::StopLoss,
+            ) {
                 entry.effective_stop_loss = Some(sl);
             }
         }
@@ -5904,6 +6274,22 @@ mod tests {
         })
     }
 
+    fn sample_kline_bar(open_time: &str, close_time: &str, close: f64) -> Value {
+        json!({
+            "open_time": open_time,
+            "close_time": close_time,
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume_base": 1.0,
+            "volume_quote": 1.0,
+            "is_closed": true,
+            "minutes_covered": 1,
+            "expected_minutes": 1
+        })
+    }
+
     fn sample_trading_state() -> TradingStateSnapshot {
         TradingStateSnapshot {
             symbol: "ETHUSDT".to_string(),
@@ -6014,6 +6400,46 @@ mod tests {
             indicators.pointer("/kline_history/payload/intervals/4h/markets/futures/bars/0/open"),
             Some(&json!(1942.01))
         );
+    }
+
+    #[test]
+    fn interval_minutes_supports_expected_timeframes() {
+        assert_eq!(interval_minutes("1m"), 1);
+        assert_eq!(interval_minutes("15m"), 15);
+        assert_eq!(interval_minutes("1h"), 60);
+        assert_eq!(interval_minutes("4h"), 240);
+        assert_eq!(interval_minutes("1d"), 1440);
+        assert_eq!(interval_minutes("3d"), 4320);
+    }
+
+    #[test]
+    fn slice_cached_kline_bars_returns_requested_subset() {
+        let bars = vec![
+            sample_kline_bar(
+                "2026-03-18T11:00:00+00:00",
+                "2026-03-18T11:01:00+00:00",
+                2301.0,
+            ),
+            sample_kline_bar(
+                "2026-03-18T11:01:00+00:00",
+                "2026-03-18T11:02:00+00:00",
+                2302.0,
+            ),
+            sample_kline_bar(
+                "2026-03-18T11:02:00+00:00",
+                "2026-03-18T11:03:00+00:00",
+                2303.0,
+            ),
+        ];
+        let subset = slice_cached_kline_bars(
+            &bars,
+            parse_rfc3339_utc("2026-03-18T11:01:00+00:00").expect("parse start"),
+            parse_rfc3339_utc("2026-03-18T11:02:00+00:00").expect("parse end"),
+        );
+
+        assert_eq!(subset.len(), 2);
+        assert_eq!(subset[0].get("close"), Some(&json!(2302.0)));
+        assert_eq!(subset[1].get("close"), Some(&json!(2303.0)));
     }
 
     fn sample_indicators_with_known_v() -> Value {
@@ -6405,6 +6831,64 @@ mod tests {
     }
 
     #[test]
+    fn hold_telegram_fields_use_conditional_live_exit_orders() {
+        let state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: true,
+            active_positions: vec![ActivePositionSnapshot {
+                position_side: "SHORT".to_string(),
+                position_amt: -0.07,
+                entry_price: 2271.45,
+                mark_price: 2259.13,
+                unrealized_pnl: 0.86,
+                leverage: 32,
+            }],
+            open_orders: vec![
+                OpenOrderSnapshot {
+                    order_id: 1,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "CONDITIONAL".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.07,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2235.63,
+                    close_position: false,
+                    reduce_only: true,
+                },
+                OpenOrderSnapshot {
+                    order_id: 2,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "CONDITIONAL".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.07,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2287.22,
+                    close_position: false,
+                    reduce_only: true,
+                },
+            ],
+            total_wallet_balance: 1000.0,
+            available_balance: 800.0,
+        };
+
+        let fields = derive_management_telegram_fields(Some(&state));
+        assert_eq!(fields.entry_price, Some(2271.45));
+        assert_eq!(fields.leverage, Some(32.0));
+        assert_eq!(fields.take_profit, Some(2235.63));
+        assert_eq!(fields.stop_loss, Some(2287.22));
+        assert_eq!(
+            fields.risk_reward_ratio,
+            Some((2271.45 - 2235.63) / (2287.22 - 2271.45))
+        );
+    }
+
+    #[test]
     fn hold_telegram_fields_are_empty_without_active_position() {
         let state = TradingStateSnapshot {
             symbol: "ETHUSDT".to_string(),
@@ -6587,6 +7071,61 @@ mod tests {
         assert_eq!(position.pnl_by_latest_price, 1.0);
         assert_eq!(position.current_tp_price, Some(2050.0));
         assert_eq!(position.current_sl_price, Some(2125.0));
+    }
+
+    #[test]
+    fn management_snapshot_uses_conditional_live_binance_exit_levels() {
+        let state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: true,
+            active_positions: vec![ActivePositionSnapshot {
+                position_side: "SHORT".to_string(),
+                position_amt: -0.07,
+                entry_price: 2271.45,
+                mark_price: 2259.13,
+                unrealized_pnl: 0.86,
+                leverage: 32,
+            }],
+            open_orders: vec![
+                OpenOrderSnapshot {
+                    order_id: 1,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "CONDITIONAL".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.07,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2235.63,
+                    close_position: false,
+                    reduce_only: true,
+                },
+                OpenOrderSnapshot {
+                    order_id: 2,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "CONDITIONAL".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.07,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2287.22,
+                    close_position: false,
+                    reduce_only: true,
+                },
+            ],
+            total_wallet_balance: 1000.0,
+            available_balance: 800.0,
+        };
+
+        let snapshot =
+            build_management_snapshot_for_llm(Some(&state), None, None).expect("snapshot exists");
+        assert_eq!(snapshot.positions.len(), 1);
+        let position = &snapshot.positions[0];
+        assert_eq!(position.current_tp_price, Some(2235.63));
+        assert_eq!(position.current_sl_price, Some(2287.22));
     }
 
     #[test]
@@ -7213,14 +7752,26 @@ mod tests {
             events[0].get("pivot_price").and_then(Value::as_f64),
             Some(98.8)
         );
-        assert_eq!(events[0].get("price_low").and_then(Value::as_f64), Some(98.8));
-        assert_eq!(events[0].get("price_high").and_then(Value::as_f64), Some(101.0));
+        assert_eq!(
+            events[0].get("price_low").and_then(Value::as_f64),
+            Some(98.8)
+        );
+        assert_eq!(
+            events[0].get("price_high").and_then(Value::as_f64),
+            Some(101.0)
+        );
         assert_eq!(
             events[1].get("pivot_price").and_then(Value::as_f64),
             Some(102.4)
         );
-        assert_eq!(events[1].get("price_low").and_then(Value::as_f64), Some(100.5));
-        assert_eq!(events[1].get("price_high").and_then(Value::as_f64), Some(102.4));
+        assert_eq!(
+            events[1].get("price_low").and_then(Value::as_f64),
+            Some(100.5)
+        );
+        assert_eq!(
+            events[1].get("price_high").and_then(Value::as_f64),
+            Some(102.4)
+        );
     }
 
     #[test]

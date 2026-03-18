@@ -184,8 +184,32 @@ async fn build_db_pool(config: &RootConfig) -> Result<PgPool> {
         .execute(&pool)
         .await
         .context("postgres health query")?;
+    ensure_kline_bar_covering_index(&pool).await?;
     info!("llm db pool connected");
     Ok(pool)
+}
+
+async fn ensure_kline_bar_covering_index(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_kline_bar_lookup_cover
+        ON md.kline_bar (market, symbol, interval_code, open_time)
+        INCLUDE (
+            close_time,
+            open_price,
+            high_price,
+            low_price,
+            close_price,
+            volume_base,
+            quote_volume,
+            is_closed
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("ensure md.kline_bar covering index")?;
+    Ok(())
 }
 
 async fn declare_topology_for_llm(channel: &Channel, mq: &MqConfig, queue_key: &str) -> Result<()> {
