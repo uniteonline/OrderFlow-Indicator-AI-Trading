@@ -1,0 +1,132 @@
+{
+  "version": "scan_v6_1",
+  "symbol": "ETHUSDT",
+  "ts_bucket": "2026-03-18T09:37:26.138186436Z",
+  "now": {
+    "price_anchor": {
+      "futures_last_price": null,
+      "futures_mark_price": 2001.57,
+      "spot_proxy_price": null
+    },
+    "location_snapshot": {
+      "vs_avwap": {
+        "avwap_fut": null,
+        "price_minus_avwap_fut": null,
+        "price_minus_avwap_pct": null,
+        "xmk_avwap_gap_f_minus_s": null
+      },
+      "vs_ema_band": {
+        "ema_13": null,
+        "ema_21": null,
+        "ema_34": null,
+        "ema_band_low": null,
+        "ema_band_high": null,
+        "position": "unknown",
+        "distance_to_band_low_pct": null,
+        "distance_to_band_high_pct": null
+      },
+      "vs_rvwap": []
+    },
+    "value_state_board": [],
+    "bracket_board": {
+      "current_inside": [],
+      "nearest_above": [],
+      "nearest_below": [],
+      "higher_context": []
+    },
+    "structure_nodes_near_current": {
+      "above": [],
+      "below": []
+    },
+    "current_flow_snapshot": {
+      "cvd": null,
+      "orderbook": null,
+      "footprint": null,
+      "whales": null
+    },
+    "current_volume_nodes": {
+      "high_volume_pulse": null
+    }
+  },
+  "path_newest_to_oldest": {
+    "latest_15m_detail": {
+      "summary": {
+        "bars_count": 0,
+        "oldest_open": null,
+        "latest_close": null,
+        "atr14": null,
+        "atr14_pct": null,
+        "net_change_pct": null,
+        "range_high": null,
+        "range_low": null,
+        "range_pct": null
+      },
+      "current_partial_bar": null,
+      "bars_newest_to_oldest": []
+    },
+    "latest_4h_context": {
+      "summary": {
+        "bars_count": 0,
+        "oldest_open": null,
+        "latest_close": null,
+        "atr14": null,
+        "atr14_pct": null,
+        "net_change_pct": null,
+        "range_high": null,
+        "range_low": null,
+        "range_pct": null
+      },
+      "current_partial_bar": null,
+      "bars_newest_to_oldest": []
+    },
+    "latest_1d_background": {
+      "summary": {
+        "bars_count": 0,
+        "oldest_open": null,
+        "latest_close": null,
+        "atr14": null,
+        "atr14_pct": null,
+        "net_change_pct": null,
+        "range_high": null,
+        "range_low": null,
+        "range_pct": null
+      },
+      "current_partial_bar": null,
+      "bars_newest_to_oldest": []
+    }
+  },
+  "events_newest_to_oldest": {
+    "latest_24h_detail": [],
+    "latest_7d_major": []
+  },
+  "supporting_context": {
+    "cvd_path_snapshot": null,
+    "indicator_snapshots": {
+      "vpin": null,
+      "funding_rate": {
+        "funding_current": -0.00004527,
+        "funding_summary": {
+          "ema_8h": null,
+          "ema_24h": null,
+          "z_score_7d": null,
+          "consecutive_direction_hours": 0
+        }
+      },
+      "liquidation_density": null,
+      "high_volume_pulse_full": null
+    }
+  },
+  "raw_overflow": {
+    "price_structures": [],
+    "price_levels": [
+      {
+        "price": 2000.99,
+        "source_count": 1,
+        "sources": [
+          "avwap_fut_15m"
+        ],
+        "reference_ts": "2026-03-14T06:15:00+00:00"
+      }
+    ]
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "symbol": "ETHUSDT",
+  "ts_bucket": "2026-03-18T06:53:55.698978079Z",
+  "indicators": {
+    "avwap": {
+      "payload": {
+        "fut_mark_price": 2001.57,
+        "series_by_window": {
+          "15m": [
+            {
+              "ts": "2026-03-14T06:15:00Z",
+              "avwap_fut": 2000.99
+            },
+            {
+              "ts": "2026-03-14T06:00:00Z",
+              "avwap_fut": 2000.12
+            }
+          ]
+        }
+      }
+    },
+    "funding_rate": {
+      "payload": {
+        "funding_current": -0.00004527,
+        "funding_trend_hourly": [],
+        "funding_trend_stats": {
+          "avg_7d": 0.0,
+          "slope_per_hour": 0.0,
+          "pct_negative_hours": 0.0
+        },
+        "funding_summary": {
+          "consecutive_direction_hours": 0
+        }
+      }
+    }
+  }
+}

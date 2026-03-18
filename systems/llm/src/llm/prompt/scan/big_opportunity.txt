@@ -18,87 +18,44 @@ Return them as top-level keys:
   - 4h
   - 1d
 
-The goal is not to restate the JSON.
-The goal is to turn the JSON into a clear, accurate market read.
-
 HOW TO READ THE INPUT
-The input has two layers:
-  - timeframe_evidence: compressed neutral evidence that organizes the market
-  - by_timeframe: raw feature details that let you verify and interpret that evidence
+The input is a global evidence pool, not a pre-decided timeframe verdict.
 
-Use timeframe_evidence to see the market structure quickly.
-Use by_timeframe and indicators to confirm what is actually happening.
+Key blocks:
+  - price_structures:
+    neutral candidate price bands and price clusters from different source windows
+  - price_levels:
+    neutral candidate price levels such as POC, EMA, AVWAP, intrabar POC, and heatmap peaks
+  - position_metrics:
+    raw distance and location facts
+  - recent_price_action:
+    what price actually did recently in each source window
+  - window_metrics:
+    event facts, flow facts, volatility, and local execution context
+  - cross_market_metrics:
+    futures vs spot differences
+  - cross_window_metrics:
+    key cross-timeframe comparisons
+  - indicators:
+    selected raw indicator blocks that remain useful as source evidence
 
-RANGE SEMANTICS
-Each timeframe may contain several range layers:
-  - ranges.micro_range:
-    the nearest tight bracket around current price; useful for compression and immediate trigger context
-  - ranges.local_structure_range:
-    the main nearby structural bracket; usually the best default final range
-  - ranges.session_value_area_range:
-    the wider auction/value-area context; useful when the local range is too narrow or fragile
-  - breakout_above / breakdown_below:
-    extension levels outside the current bracket, not the bracket itself
-
-Choose the range that best represents the timeframe right now.
-It does not have to be the narrowest range in the file.
-If micro_range is too tight to represent the timeframe, report a more meaningful structural range.
-If session_value_area_range does not contain current price, treat it as context unless the wider structure is clearly the right answer.
-
-KEY INPUT FIELDS
-timeframe_evidence["15m"|"4h"|"1d"]:
-  .display_range
-  .ranges.micro_range
-  .ranges.local_structure_range
-  .ranges.session_value_area_range
-  .balance_scores
-  .risk_opportunity
-  .clearance_atr
-  .signal_snapshot
-  .temporal_stability
-  .breakout_above
-  .breakdown_below
-
-multi_timeframe_evidence:
-  .balance_scores
-  .pair_coherence
-  .range_nesting
-
-by_timeframe["15m"|"4h"|"1d"]:
-  .structure.level_book
-  .structure.swing_high
-  .structure.swing_low
-  .trend.ema_regime
-  .trend.value_area_position
-  .trend.close_vs_ema21_pct
-  .trend.close_vs_ema100_htf_pct
-  .flow.cvd
-  .flow.absorption
-  .flow.buying_exhaustion
-  .flow.selling_exhaustion
-  .flow.divergence
-  .flow.initiation
-  .flow.whale
-  .flow.vpin
-  .flow.funding
-  .volatility.atr14
-
-indicators:
-  .footprint
-  .tpo_market_profile.payload
-  .orderbook_depth
+IMPORTANT
+  - source_window tells you which window produced the evidence
+  - a 4h structure or 1d structure may still matter for the 15m answer
+  - do not let the nearest tiny band automatically become the reported timeframe range
+  - choose the range that best represents the active structure of that timeframe right now
 
 WHAT A GOOD ANSWER LOOKS LIKE
   - 1d gives the higher-timeframe background and the important daily bracket
   - 4h gives the active structure and the current setup zone
   - 15m gives the immediate trigger context and the short-term bracket
-  - each range is meaningful for that timeframe, not just mechanically copied from the nearest level
+  - each range is meaningful for that timeframe, not just mechanically copied from the nearest candidate
   - each timeframe clearly states both opportunity and risk
 
 BEFORE YOU OUTPUT
 Confirm all of these are true:
 1. Each timeframe answer would still make sense to a downstream reader who never sees the raw scan JSON.
-2. The reported range is the most meaningful bracket for that timeframe right now, not just the smallest nearby band.
+2. The reported range is the most meaningful active bracket for that timeframe right now, not just the smallest nearby candidate.
 3. Supporting_signals and conflicting_signals are both specific and grounded in the input data.
 4. Opportunity and risk are concrete and tied to the reported range and current market structure.
 5. The three timeframe outputs together clearly express the relationship between 1d background, 4h setup, and 15m trigger context.

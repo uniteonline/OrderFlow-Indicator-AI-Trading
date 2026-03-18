@@ -942,7 +942,6 @@ mod tests {
                     "score": idx as f64 / 10.0,
                     "score_base": idx as f64 / 20.0,
                     "strength_score_xmk": idx as f64 / 20.0,
-                    "sig_pass": idx % 2 == 0,
                     "trigger_side": if idx % 2 == 0 { "buy" } else { "sell" },
                     "type": "absorption",
                     "delta_sum": idx as f64 * 10.0,
@@ -965,7 +964,6 @@ mod tests {
                 json!({
                     "type": "bearish_divergence",
                     "score": (count - idx) as f64 / 10.0,
-                    "sig_pass": true,
                     "price_start": 2000.0 + idx as f64,
                     "price_end": 2010.0 + idx as f64,
                     "likely_driver": if idx % 2 == 0 { "spot_led" } else { "mixed" }
@@ -1549,7 +1547,6 @@ mod tests {
                         "direction": -1,
                         "pivot_price": 2293.0,
                         "score": 0.64,
-                        "sig_pass": true,
                         "type": "bearish_absorption"
                     },
                     {
@@ -1558,7 +1555,6 @@ mod tests {
                         "direction": 1,
                         "pivot_price": 2261.0,
                         "score": 0.7,
-                        "sig_pass": true,
                         "type": "bullish_absorption"
                     }
                 ]),
@@ -1580,7 +1576,6 @@ mod tests {
                         "direction": -1,
                         "pivot_price": 2279.13,
                         "score": 0.77,
-                        "sig_pass": true,
                         "type": "buying_exhaustion"
                     }
                 ]),

@@ -405,7 +405,7 @@ pub async fn execute_trade_intent(
     // A maker entry is a limit order that sits below (long) or above (short) the current
     // market price waiting to be filled. In this case Binance rejects a TAKE_PROFIT_MARKET
     // algo-order placed at the TP level because no position exists yet and the trigger
-    // is already beyond the current market. We detect this and use a STOP limit order
+    // is already beyond the current market. We detect this and use a STOP limit algo-order
     // triggered at the entry price instead (see place_staged_exit_orders).
     let is_maker_entry = match intent.decision {
         TradeDecision::Long => maker_entry_price < best_bid_price,
@@ -2189,10 +2189,9 @@ pub(crate) async fn fetch_pending_order_leverage(
 
 /// Returns `(take_profit_order_id, tp_is_algo_order, stop_loss_order_id)`.
 ///
-/// When `is_maker_entry` is true the TP is placed as a STOP order on /fapi/v1/order
-/// (triggered at entry_price_str, limit at tp_trigger_price) so that Binance does not
-/// reject it for having a trigger beyond current market with no open position.
-/// In that case `tp_is_algo_order` is false; otherwise it is true.
+/// When `is_maker_entry` is true the TP is placed as a conditional STOP algo-order
+/// (triggered at entry_price_str, limit at tp_trigger_price) so that Binance accepts
+/// the order type on the algo endpoint even before a position exists.
 async fn place_staged_exit_orders(
     http_client: &Client,
     api_config: &BinanceApiConfig,
@@ -2246,11 +2245,11 @@ async fn place_staged_exit_orders(
 
     // For maker (pending limit) entries the TP trigger price may already be beyond the
     // current market price, causing Binance to reject TAKE_PROFIT_MARKET algo-orders
-    // because there is no open position yet. Use a STOP limit order on /fapi/v1/order
-    // with stopPrice=entry_price instead: it activates when the entry fills and leaves a
-    // GTC limit sell at tp_trigger_price that executes once price rebounds to target.
+    // because there is no open position yet. Use a STOP limit algo-order instead: it
+    // activates at the maker entry price and leaves a GTC reduce-only limit exit at the
+    // take-profit level once the entry has filled.
     let tp_result = if is_maker_entry {
-        place_tp_as_stop_limit(
+        place_tp_as_stop_limit_algo_order(
             http_client,
             api_config,
             exec_config,
@@ -2262,7 +2261,7 @@ async fn place_staged_exit_orders(
             tp_trigger_price,
         )
         .await
-        .map(|id| (id, false))
+        .map(|id| (id, true))
     } else {
         place_close_order(
             http_client,
@@ -2284,6 +2283,40 @@ async fn place_staged_exit_orders(
             Ok((take_profit_order_id, tp_is_algo, stop_loss_order_id))
         }
         Err(err) => {
+            let err_chain = format!("{:#}", err);
+            let tp_order_mode = if is_maker_entry {
+                "STOP_LIMIT_PENDING_EXIT_ALGO"
+            } else {
+                "TAKE_PROFIT_MARKET_ALGO"
+            };
+            warn!(
+                symbol = %symbol,
+                position_side = %position_side,
+                exit_side = %exit_side,
+                quantity = %quantity,
+                entry_price = %entry_price_str,
+                tp_trigger_price = %tp_trigger_price,
+                sl_trigger_price = %sl_trigger_price,
+                stop_loss_order_id = stop_loss_order_id,
+                is_maker_entry = is_maker_entry,
+                tp_order_mode = tp_order_mode,
+                error = %err_chain,
+                "stage take-profit rejected by binance while staging synchronized exits"
+            );
+            println!(
+                "LLM_STAGE_TAKE_PROFIT_ERROR symbol={} position_side={} exit_side={} quantity={} entry_price={} tp_trigger_price={} sl_trigger_price={} stop_loss_order_id={} is_maker_entry={} tp_order_mode={} error={}",
+                symbol,
+                position_side,
+                exit_side,
+                quantity,
+                entry_price_str,
+                tp_trigger_price,
+                sl_trigger_price,
+                stop_loss_order_id,
+                is_maker_entry,
+                tp_order_mode,
+                err_chain.replace('\n', " | "),
+            );
             // SL is always an algo order — cancel it to avoid orphaned exits
             if let Err(cancel_err) = cancel_algo_order_by_id(
                 http_client,
@@ -2705,6 +2738,34 @@ fn build_close_order_params(
     params
 }
 
+fn build_limit_algo_close_order_params(
+    symbol: &str,
+    side: &str,
+    position_side: &str,
+    order_type: &str,
+    quantity: &str,
+    trigger_price: &str,
+    limit_price: &str,
+    time_in_force: &str,
+    client_algo_id_prefix: &str,
+) -> Vec<(String, String)> {
+    let mut params = build_close_order_params(
+        symbol,
+        side,
+        position_side,
+        order_type,
+        quantity,
+        trigger_price,
+    );
+    params.push(("price".to_string(), limit_price.to_string()));
+    params.push(("timeInForce".to_string(), time_in_force.to_string()));
+    params.push((
+        "clientAlgoId".to_string(),
+        build_client_order_id(client_algo_id_prefix),
+    ));
+    params
+}
+
 async fn place_close_order(
     http_client: &Client,
     api_config: &BinanceApiConfig,
@@ -2744,13 +2805,13 @@ async fn place_close_order(
 /// and the trigger price is already beyond the current market (e.g. tp=2129 while market=2125
 /// for a long pending at 2111). The exchange sees no position to reduce and rejects.
 ///
-/// Solution: place a STOP order on /fapi/v1/order with
-///   stopPrice = maker_entry_price  (same level the entry fills)
-///   price     = tp_price           (GTC limit sell placed the moment entry triggers)
+/// Solution: place a STOP algo-order on /fapi/v1/algoOrder with
+///   triggerPrice = maker_entry_price  (same level the entry fills)
+///   price        = tp_price           (GTC limit sell placed the moment entry triggers)
 ///
 /// When price drops to the entry level both the limit-buy entry and this stop-limit TP
 /// activate simultaneously. The limit sell at tp_price then sits open until price rebounds.
-async fn place_tp_as_stop_limit(
+async fn place_tp_as_stop_limit_algo_order(
     http_client: &Client,
     api_config: &BinanceApiConfig,
     exec_config: &LlmExecutionConfig,
@@ -2761,33 +2822,29 @@ async fn place_tp_as_stop_limit(
     entry_price: &str,
     tp_limit_price: &str,
 ) -> Result<i64> {
-    let mut params = vec![
-        ("symbol".to_string(), symbol.to_string()),
-        ("side".to_string(), side.to_string()),
-        ("positionSide".to_string(), position_side.to_string()),
-        ("type".to_string(), "STOP".to_string()),
-        ("quantity".to_string(), quantity.to_string()),
-        ("price".to_string(), tp_limit_price.to_string()),
-        ("stopPrice".to_string(), entry_price.to_string()),
-        ("timeInForce".to_string(), "GTC".to_string()),
-        ("workingType".to_string(), "MARK_PRICE".to_string()),
-        (
-            "newClientOrderId".to_string(),
-            build_client_order_id("tp_maker"),
-        ),
-    ];
-    if position_side.eq_ignore_ascii_case("BOTH") {
-        params.push(("reduceOnly".to_string(), "true".to_string()));
-    }
-    let response: FuturesOrderResponse = signed_post_json(
+    let response: Value = signed_post_json(
         http_client,
         api_config,
         exec_config,
-        "/fapi/v1/order",
-        params,
+        "/fapi/v1/algoOrder",
+        build_limit_algo_close_order_params(
+            symbol,
+            side,
+            position_side,
+            "STOP",
+            quantity,
+            entry_price,
+            tp_limit_price,
+            "GTC",
+            "tp_maker",
+        ),
     )
     .await?;
-    Ok(response.order_id)
+    parse_numeric_id(
+        &response,
+        &["algoId", "orderId", "id"],
+        "algo close order id",
+    )
 }
 
 async fn place_market_order_with_side(
@@ -3557,6 +3614,36 @@ mod tests {
             .into_iter()
             .collect::<std::collections::HashMap<_, _>>();
         assert!(!params_map.contains_key("reduceOnly"));
+    }
+
+    #[test]
+    fn build_limit_algo_close_order_params_include_limit_fields_for_one_way_mode() {
+        let params = build_limit_algo_close_order_params(
+            "ETHUSDT", "SELL", "BOTH", "STOP", "0.01", "2305.00", "2345.34", "GTC", "tp_maker",
+        );
+
+        let params_map = params
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            params_map.get("algoType").map(String::as_str),
+            Some("CONDITIONAL")
+        );
+        assert_eq!(params_map.get("type").map(String::as_str), Some("STOP"));
+        assert_eq!(
+            params_map.get("triggerPrice").map(String::as_str),
+            Some("2305.00")
+        );
+        assert_eq!(params_map.get("price").map(String::as_str), Some("2345.34"));
+        assert_eq!(
+            params_map.get("timeInForce").map(String::as_str),
+            Some("GTC")
+        );
+        assert_eq!(
+            params_map.get("reduceOnly").map(String::as_str),
+            Some("true")
+        );
+        assert!(params_map.contains_key("clientAlgoId"));
     }
 
     #[test]

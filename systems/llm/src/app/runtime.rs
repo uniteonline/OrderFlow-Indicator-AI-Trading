@@ -15,11 +15,12 @@ use crate::llm::decision::{
 use crate::llm::filter::{core::CoreFilter, scan::ScanFilter};
 use crate::llm::helper::PreComputedVHelper;
 use crate::llm::provider::{
-    invoke_models, EntryContextForLlm, EntryStagePromptInputCapture, ManagementSnapshotForLlm,
+    invoke_models_finalize_stage, invoke_models_scan_stage, EntryContextForLlm,
+    EntryStagePromptInputCapture, FinalizeStageContext, ManagementSnapshotForLlm,
     ModelInvocationInput, PendingOrderSummaryForLlm, PositionContextForLlm, PositionSummaryForLlm,
     ReductionHistoryItemForLlm,
 };
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDateTime, Timelike, Utc};
 use futures_util::StreamExt;
 use lapin::{
@@ -27,10 +28,11 @@ use lapin::{
     types::FieldTable,
 };
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
-use std::collections::{BTreeSet, HashMap};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -187,7 +189,7 @@ struct EntryRrGateResult {
     passed: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct MinuteBundleEnvelope {
     msg_type: String,
     routing_key: String,
@@ -470,14 +472,26 @@ struct MissingKlineBarRequest {
     open_time: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KlineHistoryRangeRequest {
+    market: String,
+    interval_code: String,
+    start_open_time: DateTime<Utc>,
+    end_open_time: DateTime<Utc>,
+}
+
+#[derive(Default)]
+struct KlineHistoryPatchStats {
+    bars_patched: usize,
+    divergence_events_patched: usize,
+}
+
 async fn hydrate_missing_kline_history_from_db(
     pool: &PgPool,
     input: &mut ModelInvocationInput,
-) -> Result<usize> {
+) -> Result<KlineHistoryPatchStats> {
     let requests = collect_missing_kline_bar_requests(&input.indicators);
-    if requests.is_empty() {
-        return Ok(0);
-    }
+    let mut stats = KlineHistoryPatchStats::default();
 
     let mut replacements = Vec::new();
     for request in &requests {
@@ -494,10 +508,37 @@ async fn hydrate_missing_kline_history_from_db(
         }
     }
 
-    Ok(apply_backfilled_kline_bars(
-        &mut input.indicators,
-        &replacements,
-    ))
+    stats.bars_patched = apply_backfilled_kline_bars(&mut input.indicators, &replacements);
+
+    let mut divergence_backfill_bars = extract_kline_history_bars(
+        &input.indicators,
+        "futures",
+        "1m",
+    );
+
+    if let Some(range_request) = collect_divergence_kline_coverage_request(&input.indicators) {
+        let additional_bars = fetch_kline_bars_range_from_db(
+            pool,
+            &input.symbol,
+            &range_request.market,
+            &range_request.interval_code,
+            range_request.start_open_time,
+            range_request.end_open_time,
+        )
+        .await?;
+        stats.bars_patched += prepend_backfilled_kline_bars(
+            &mut input.indicators,
+            &range_request.market,
+            &range_request.interval_code,
+            &additional_bars,
+        );
+        divergence_backfill_bars.extend(additional_bars);
+    }
+
+    stats.divergence_events_patched =
+        backfill_divergence_event_prices_from_bars(&mut input.indicators, &divergence_backfill_bars);
+
+    Ok(stats)
 }
 
 fn collect_missing_kline_bar_requests(indicators: &Value) -> Vec<MissingKlineBarRequest> {
@@ -557,8 +598,7 @@ fn empty_kline_bar_open_time(bar: &Value) -> Option<DateTime<Utc>> {
     object
         .get("open_time")
         .and_then(Value::as_str)
-        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
-        .map(|dt| dt.with_timezone(&Utc))
+        .and_then(parse_rfc3339_utc)
 }
 
 async fn fetch_kline_bar_from_db(
@@ -618,6 +658,71 @@ async fn fetch_kline_bar_from_db(
     })))
 }
 
+async fn fetch_kline_bars_range_from_db(
+    pool: &PgPool,
+    symbol: &str,
+    market: &str,
+    interval_code: &str,
+    start_open_time: DateTime<Utc>,
+    end_open_time: DateTime<Utc>,
+) -> Result<Vec<Value>> {
+    if end_open_time < start_open_time {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            open_time,
+            close_time,
+            open_price,
+            high_price,
+            low_price,
+            close_price,
+            COALESCE(volume_base, 0.0) AS volume_base,
+            COALESCE(quote_volume, 0.0) AS volume_quote,
+            is_closed
+        FROM md.kline_bar
+        WHERE market = $1::cfg.market_type
+          AND symbol = $2
+          AND interval_code = $3
+          AND open_time >= $4
+          AND open_time <= $5
+        ORDER BY open_time ASC
+        "#,
+    )
+    .bind(market)
+    .bind(symbol.to_uppercase())
+    .bind(interval_code)
+    .bind(start_open_time)
+    .bind(end_open_time)
+    .fetch_all(pool)
+    .await
+    .context("query kline bar range from db")?;
+
+    let expected_minutes = interval_minutes(interval_code);
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let open_time: DateTime<Utc> = row.get("open_time");
+            let close_time: DateTime<Utc> = row.get("close_time");
+            json!({
+                "open_time": open_time.to_rfc3339(),
+                "close_time": close_time.to_rfc3339(),
+                "open": row.get::<f64, _>("open_price"),
+                "high": row.get::<f64, _>("high_price"),
+                "low": row.get::<f64, _>("low_price"),
+                "close": row.get::<f64, _>("close_price"),
+                "volume_base": row.get::<f64, _>("volume_base"),
+                "volume_quote": row.get::<f64, _>("volume_quote"),
+                "is_closed": row.get::<bool, _>("is_closed"),
+                "minutes_covered": expected_minutes,
+                "expected_minutes": expected_minutes,
+            })
+        })
+        .collect())
+}
+
 fn apply_backfilled_kline_bars(
     indicators: &mut Value,
     replacements: &[(MissingKlineBarRequest, Value)],
@@ -667,6 +772,263 @@ fn apply_backfilled_kline_bars(
     patched
 }
 
+fn prepend_backfilled_kline_bars(
+    indicators: &mut Value,
+    market: &str,
+    interval_code: &str,
+    replacements: &[Value],
+) -> usize {
+    if replacements.is_empty() {
+        return 0;
+    }
+
+    let Some(market_node) = indicators
+        .get_mut("kline_history")
+        .and_then(Value::as_object_mut)
+        .and_then(|indicator| indicator.get_mut("payload"))
+        .and_then(Value::as_object_mut)
+        .and_then(|payload| payload.get_mut("intervals"))
+        .and_then(Value::as_object_mut)
+        .and_then(|intervals| intervals.get_mut(interval_code))
+        .and_then(Value::as_object_mut)
+        .and_then(|interval| interval.get_mut("markets"))
+        .and_then(Value::as_object_mut)
+        .and_then(|markets| markets.get_mut(market))
+        .and_then(Value::as_object_mut)
+    else {
+        return 0;
+    };
+
+    let (inserted, merged_len) = {
+        let Some(existing_bars) = market_node.get_mut("bars").and_then(Value::as_array_mut) else {
+            return 0;
+        };
+
+        let existing_open_times = existing_bars
+            .iter()
+            .filter_map(|bar| {
+                bar.get("open_time")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .collect::<HashSet<_>>();
+
+        let mut merged = replacements
+            .iter()
+            .filter(|bar| {
+                bar.get("open_time")
+                    .and_then(Value::as_str)
+                    .map(|open_time| !existing_open_times.contains(open_time))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let inserted = merged.len();
+        if inserted == 0 {
+            return 0;
+        }
+
+        merged.extend(existing_bars.drain(..));
+        *existing_bars = merged;
+        (inserted, existing_bars.len())
+    };
+
+    market_node.insert("returned_count".to_string(), json!(merged_len));
+    inserted
+}
+
+fn extract_kline_history_bars(indicators: &Value, market: &str, interval_code: &str) -> Vec<Value> {
+    indicators
+        .pointer(&format!(
+            "/kline_history/payload/intervals/{interval_code}/markets/{market}/bars"
+        ))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn backfill_divergence_event_prices_from_bars(
+    indicators: &mut Value,
+    one_minute_bars: &[Value],
+) -> usize {
+    if one_minute_bars.is_empty() {
+        return 0;
+    }
+
+    let Some(payload) = indicators
+        .get_mut("divergence")
+        .and_then(Value::as_object_mut)
+        .and_then(|indicator| indicator.get_mut("payload"))
+        .and_then(Value::as_object_mut)
+    else {
+        return 0;
+    };
+
+    if let Some(events) = payload
+        .get_mut("recent_7d")
+        .and_then(Value::as_object_mut)
+        .and_then(|recent| recent.get_mut("events"))
+        .and_then(Value::as_array_mut)
+    {
+        return backfill_divergence_event_array_from_bars(events, one_minute_bars);
+    }
+
+    payload
+        .get_mut("events")
+        .and_then(Value::as_array_mut)
+        .map(|events| backfill_divergence_event_array_from_bars(events, one_minute_bars))
+        .unwrap_or(0)
+}
+
+fn backfill_divergence_event_array_from_bars(
+    events: &mut [Value],
+    one_minute_bars: &[Value],
+) -> usize {
+    let mut patched = 0usize;
+
+    for event in events.iter_mut().filter_map(Value::as_object_mut) {
+        let has_all_prices = event.get("pivot_price").and_then(Value::as_f64).is_some()
+            && event.get("price_low").and_then(Value::as_f64).is_some()
+            && event.get("price_high").and_then(Value::as_f64).is_some();
+        if has_all_prices {
+            continue;
+        }
+
+        let Some(event_start) = event
+            .get("event_start_ts")
+            .or_else(|| event.get("start_ts"))
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_utc)
+        else {
+            continue;
+        };
+        let Some(event_end) = event
+            .get("event_end_ts")
+            .or_else(|| event.get("end_ts"))
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_utc)
+        else {
+            continue;
+        };
+
+        let relevant_bars = one_minute_bars
+            .iter()
+            .filter_map(Value::as_object)
+            .filter(|bar| {
+                bar.get("open_time")
+                    .and_then(Value::as_str)
+                    .and_then(parse_rfc3339_utc)
+                    .map(|open_time| open_time >= event_start && open_time <= event_end)
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        if relevant_bars.is_empty() {
+            continue;
+        }
+
+        let derived_low = relevant_bars
+            .iter()
+            .filter_map(|bar| bar.get("low").and_then(Value::as_f64))
+            .min_by(|left, right| left.partial_cmp(right).unwrap_or(CmpOrdering::Equal));
+        let derived_high = relevant_bars
+            .iter()
+            .filter_map(|bar| bar.get("high").and_then(Value::as_f64))
+            .max_by(|left, right| left.partial_cmp(right).unwrap_or(CmpOrdering::Equal));
+        let derived_pivot = match event.get("pivot_side").and_then(Value::as_str) {
+            Some("low") => derived_low,
+            Some("high") => derived_high,
+            _ => event
+                .get("pivot_price")
+                .and_then(Value::as_f64)
+                .or(derived_low)
+                .or(derived_high),
+        };
+
+        let mut event_patched = false;
+        if event.get("pivot_price").and_then(Value::as_f64).is_none() {
+            if let Some(value) = derived_pivot {
+                event.insert("pivot_price".to_string(), json!(value));
+                event_patched = true;
+            }
+        }
+        if event.get("price_low").and_then(Value::as_f64).is_none() {
+            if let Some(value) = derived_low.or(derived_pivot) {
+                event.insert("price_low".to_string(), json!(value));
+                event_patched = true;
+            }
+        }
+        if event.get("price_high").and_then(Value::as_f64).is_none() {
+            if let Some(value) = derived_high.or(derived_pivot) {
+                event.insert("price_high".to_string(), json!(value));
+                event_patched = true;
+            }
+        }
+
+        if event_patched {
+            patched += 1;
+        }
+    }
+
+    patched
+}
+
+fn collect_divergence_kline_coverage_request(
+    indicators: &Value,
+) -> Option<KlineHistoryRangeRequest> {
+    let earliest_existing_open = indicators
+        .pointer("/kline_history/payload/intervals/1m/markets/futures/bars")
+        .and_then(Value::as_array)
+        .and_then(|bars| {
+            bars.iter()
+                .filter_map(|bar| bar.get("open_time").and_then(Value::as_str))
+                .filter_map(parse_rfc3339_utc)
+                .min()
+        })?;
+
+    let divergence_events = indicators
+        .pointer("/divergence/payload/recent_7d/events")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            indicators
+                .pointer("/divergence/payload/events")
+                .and_then(Value::as_array)
+        })?;
+
+    let earliest_required_open = divergence_events
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(|event| {
+            event
+                .get("event_start_ts")
+                .or_else(|| event.get("start_ts"))
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339_utc)
+        })
+        .min()?;
+
+    if earliest_required_open >= earliest_existing_open {
+        return None;
+    }
+
+    let end_open_time = earliest_existing_open - ChronoDuration::minutes(1);
+    if end_open_time < earliest_required_open {
+        return None;
+    }
+
+    Some(KlineHistoryRangeRequest {
+        market: "futures".to_string(),
+        interval_code: "1m".to_string(),
+        start_open_time: earliest_required_open,
+        end_open_time,
+    })
+}
+
+fn parse_rfc3339_utc(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
 fn interval_minutes(interval_code: &str) -> i64 {
     match interval_code {
         "4h" => 240,
@@ -680,20 +1042,47 @@ async fn patch_input_kline_history_from_db(
     input: &mut ModelInvocationInput,
     trigger: &str,
 ) -> Result<()> {
-    let patched = hydrate_missing_kline_history_from_db(pool, input).await?;
-    if patched > 0 {
+    let stats = hydrate_missing_kline_history_from_db(pool, input).await?;
+    if stats.bars_patched > 0 || stats.divergence_events_patched > 0 {
         info!(
             symbol = %input.symbol,
             ts_bucket = %input.ts_bucket,
             trigger = trigger,
-            patched_bars = patched,
-            "patched missing kline_history bars from db before llm invocation"
+            patched_bars = stats.bars_patched,
+            patched_divergence_events = stats.divergence_events_patched,
+            "patched kline_history/divergence prices from db before llm invocation"
         );
     }
     Ok(())
 }
 
-#[cfg(test)]
+async fn prepare_live_invocation(
+    config: &RootConfig,
+    http_client: &Client,
+    db_pool: &PgPool,
+    bundle: LatestBundle,
+    runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
+    patch_trigger: &str,
+) -> Result<PreparedInvocation> {
+    let routing_context =
+        resolve_invocation_routing_context(config, http_client, &bundle, runtime_lifecycle_state)
+            .await?;
+    let mut input = build_invocation_input(
+        &bundle,
+        routing_context.management_mode,
+        routing_context.pending_order_mode,
+        routing_context.trading_state.clone(),
+        routing_context.invoke_management_reason.clone(),
+        routing_context.position_context.clone(),
+    );
+    patch_input_kline_history_from_db(db_pool, &mut input, patch_trigger).await?;
+    Ok(PreparedInvocation {
+        bundle,
+        routing_context,
+        input,
+    })
+}
+
 fn build_persist_only_input(bundle: &LatestBundle) -> ModelInvocationInput {
     ModelInvocationInput {
         symbol: bundle.raw.symbol.clone(),
@@ -724,19 +1113,11 @@ struct InvocationRoutingContext {
     position_context: Option<PositionContextForLlm>,
 }
 
-impl InvocationRoutingContext {
-    fn persist_fallback() -> Self {
-        Self {
-            trading_state: None,
-            management_mode: false,
-            pending_order_mode: false,
-            active_position_count: 0,
-            open_order_count: 0,
-            context_state: "NO_ACTIVE_CONTEXT",
-            invoke_management_reason: None,
-            position_context: None,
-        }
-    }
+#[derive(Debug, Clone)]
+struct PreparedInvocation {
+    bundle: LatestBundle,
+    routing_context: InvocationRoutingContext,
+    input: ModelInvocationInput,
 }
 
 fn context_state_from_trading_state(
@@ -2254,145 +2635,382 @@ async fn invoke_bundle_models(
 ) {
     let mut execution_done = false;
     let mut execution_blocked_due_to_stale = false;
-    let routing_context = match resolve_invocation_routing_context(
-        &config,
-        &http_client,
-        &bundle,
-        &runtime_lifecycle_state,
+    let stage1_bundle = bundle.clone();
+    let stage1_management_mode = false;
+    let stage1_pending_order_mode = false;
+    let stage1_active_position_count = 0usize;
+    let stage1_open_order_count = 0usize;
+    let stage1_context_state = "SCAN_ONLY";
+    let stage1_invoke_management_reason: Option<String> = None;
+    let mut stage1_input = build_persist_only_input(&stage1_bundle);
+    if let Err(err) = patch_input_kline_history_from_db(
+        &db_pool,
+        &mut stage1_input,
+        &format!("{}:stage1_scan", trigger.as_ref()),
     )
     .await
     {
-        Ok(ctx) => ctx,
-        Err(err) if !config.llm.request_enabled => {
+        warn!(
+            symbol = %stage1_bundle.raw.symbol,
+            ts_bucket = %stage1_bundle.raw.ts_bucket,
+            trigger = %trigger,
+            error = %err,
+            "failed to patch missing kline_history bars from db"
+        );
+    }
+    let stage1_source_file = minute_bundle_path(&stage1_bundle.raw);
+    let stage1_scan_input_path = match persist_scan_input_to_disk(
+        &stage1_bundle.raw,
+        &stage1_input,
+        config.llm.temp_cache_retention_minutes,
+    )
+    .await
+    {
+        Ok(path) => Some(path),
+        Err(err) => {
             warn!(
-                symbol = %bundle.raw.symbol,
-                ts_bucket = %bundle.raw.ts_bucket,
+                symbol = %stage1_bundle.raw.symbol,
+                ts_bucket = %stage1_bundle.raw.ts_bucket,
                 trigger = %trigger,
                 error = %err,
-                "llm.request_enabled=false fallback to entry-shaped temp_model_input because trading state fetch failed"
+                "persist stage1 scan input to temp_model_input failed"
             );
-            InvocationRoutingContext::persist_fallback()
+            None
         }
+    };
+    println!(
+        "LLM_STAGE1_SOURCE ts_bucket={} trigger={} symbol={} source_temp_indicator_file={} source_file_exists={} source_scan_input_file={} scan_input_file_exists={} indicator_count={} missing_count={} management_mode={} pending_order_mode={}",
+        stage1_bundle.raw.ts_bucket,
+        &*trigger,
+        stage1_bundle.raw.symbol,
+        stage1_source_file.display(),
+        stage1_source_file.exists(),
+        stage1_scan_input_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        stage1_scan_input_path
+            .as_ref()
+            .map(|path| path.exists())
+            .unwrap_or(false),
+        stage1_bundle.raw.indicator_count,
+        stage1_bundle.missing_indicator_codes.len(),
+        stage1_management_mode,
+        stage1_pending_order_mode,
+    );
+
+    if !config.llm.request_enabled {
+        info!(
+            ts_bucket = %stage1_bundle.raw.ts_bucket,
+            trigger = %trigger,
+            indicator_count = stage1_bundle.raw.indicator_count,
+            missing_count = stage1_bundle.missing_indicator_codes.len(),
+            management_mode = stage1_management_mode,
+            pending_order_mode = stage1_pending_order_mode,
+            "llm request skipped because llm.request_enabled=false; persisted stage1 scan input only"
+        );
+        return;
+    }
+
+    println!(
+        "LLM_INVOKE_CONTEXT ts_bucket={} trigger={} symbol={} stage=stage1_scan management_mode={} pending_order_mode={} context_state={} active_position_count={} open_order_count={} default_model={} prompt_template={} last_management_reason={}",
+        stage1_bundle.raw.ts_bucket,
+        &*trigger,
+        stage1_bundle.raw.symbol,
+        stage1_management_mode,
+        stage1_pending_order_mode,
+        stage1_context_state,
+        stage1_active_position_count,
+        stage1_open_order_count,
+        config.active_default_model(),
+        config.llm.prompt_template,
+        stage1_invoke_management_reason.as_deref().unwrap_or("-"),
+    );
+    let event = json!({
+        "event_type": "llm_invoke_context",
+        "event_ts": Utc::now().to_rfc3339(),
+        "ts_bucket": stage1_bundle.raw.ts_bucket.to_rfc3339(),
+        "trigger": &*trigger,
+        "symbol": stage1_bundle.raw.symbol,
+        "stage": "stage1_scan",
+        "management_mode": stage1_management_mode,
+        "pending_order_mode": stage1_pending_order_mode,
+        "context_state": stage1_context_state,
+        "active_position_count": stage1_active_position_count,
+        "open_order_count": stage1_open_order_count,
+        "default_model": config.active_default_model(),
+        "prompt_template": config.llm.prompt_template,
+        "last_management_reason": stage1_invoke_management_reason.clone(),
+    });
+    if let Err(err) = append_journal_event(event) {
+        warn!(error = %err, "append llm_invoke_context journal failed");
+    }
+
+    debug!(
+        ts_bucket = %stage1_bundle.raw.ts_bucket,
+        trigger = %trigger,
+        stage = "stage1_scan",
+        management_mode = stage1_management_mode,
+        active_position_count = stage1_active_position_count,
+        open_order_count = stage1_open_order_count,
+        indicator_count = stage1_bundle.raw.indicator_count,
+        missing_count = stage1_bundle.missing_indicator_codes.len(),
+        "llm invoking stage1 market scan"
+    );
+
+    let stage1_outputs =
+        invoke_models_scan_stage(&http_client, &loopback_http_client, &config, &stage1_input).await;
+    let mut successful_stage1_outputs = Vec::new();
+    for out in stage1_outputs {
+        if out.batch_id.is_some() || out.batch_status.is_some() {
+            println!(
+                "LLM_STAGE1_BATCH_INFO ts_bucket={} trigger={} model={} provider={} model_id={} batch_id={} batch_status={}",
+                stage1_bundle.raw.ts_bucket,
+                &*trigger,
+                out.model_name,
+                out.provider,
+                out.model,
+                out.batch_id.as_deref().unwrap_or("-"),
+                out.batch_status.as_deref().unwrap_or("-")
+            );
+        }
+        if out.provider_finish_reason.is_some() || out.provider_usage.is_some() {
+            println!(
+                "LLM_STAGE1_PROVIDER_TRACE ts_bucket={} trigger={} model={} provider={} model_id={} finish_reason={} usage={}",
+                stage1_bundle.raw.ts_bucket,
+                &*trigger,
+                out.model_name,
+                out.provider,
+                out.model,
+                out.provider_finish_reason.as_deref().unwrap_or("-"),
+                out.provider_usage
+                    .as_ref()
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "-".to_string())
+            );
+        }
+        if let Some(captures) = out.entry_stage_prompt_inputs.as_deref() {
+            match persist_entry_stage_prompt_inputs_to_disk(
+                &stage1_bundle.raw,
+                trigger.as_ref(),
+                stage1_management_mode,
+                stage1_pending_order_mode,
+                &out.model_name,
+                &out.provider,
+                &out.model,
+                captures,
+                config.llm.temp_cache_retention_minutes,
+            )
+            .await
+            {
+                Ok(files) => {
+                    for (stage, path) in files {
+                        println!(
+                            "LLM_STAGE_INPUT_SOURCE ts_bucket={} trigger={} symbol={} model={} provider={} model_id={} stage={} source_stage_input_file={} stage_input_file_exists={}",
+                            stage1_bundle.raw.ts_bucket,
+                            &*trigger,
+                            stage1_bundle.raw.symbol,
+                            out.model_name,
+                            out.provider,
+                            out.model,
+                            stage,
+                            path.display(),
+                            path.exists(),
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        symbol = %stage1_bundle.raw.symbol,
+                        ts_bucket = %stage1_bundle.raw.ts_bucket,
+                        trigger = %trigger,
+                        model_name = %out.model_name,
+                        provider = %out.provider,
+                        model_id = %out.model,
+                        error = %err,
+                        "persist stage1 prompt inputs to temp_model_output failed"
+                    );
+                }
+            }
+        }
+        if let Some(err) = &out.error {
+            if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
+                print_entry_stage_timing(
+                    &stage1_bundle.raw.ts_bucket,
+                    &trigger,
+                    &out.model_name,
+                    &out.provider,
+                    &out.model,
+                    stage1_management_mode,
+                    stage1_pending_order_mode,
+                    out.latency_ms,
+                    stage_trace,
+                );
+            }
+            if print_response {
+                if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
+                    print_entry_stage_trace(
+                        &stage1_bundle.raw.ts_bucket,
+                        &trigger,
+                        &out.model_name,
+                        &out.provider,
+                        &out.model,
+                        stage_trace,
+                    );
+                }
+                println!(
+                    "LLM_STAGE1_SCAN_ERROR ts_bucket={} trigger={} management_mode={} model={} provider={} model_id={} batch_id={} batch_status={} finish_reason={}:\n{}",
+                    stage1_bundle.raw.ts_bucket,
+                    &*trigger,
+                    stage1_management_mode,
+                    out.model_name,
+                    out.provider,
+                    out.model,
+                    out.batch_id.as_deref().unwrap_or("-"),
+                    out.batch_status.as_deref().unwrap_or("-"),
+                    out.provider_finish_reason.as_deref().unwrap_or("-"),
+                    err
+                );
+            }
+            let event = json!({
+                "event_type": "llm_stage1_scan_error",
+                "event_ts": Utc::now().to_rfc3339(),
+                "ts_bucket": stage1_bundle.raw.ts_bucket.to_rfc3339(),
+                "trigger": &*trigger,
+                "symbol": stage1_bundle.raw.symbol,
+                "management_mode": stage1_management_mode,
+                "pending_order_mode": stage1_pending_order_mode,
+                "model_name": out.model_name.clone(),
+                "provider": out.provider.clone(),
+                "model_id": out.model.clone(),
+                "batch_id": out.batch_id.clone(),
+                "batch_status": out.batch_status.clone(),
+                "provider_finish_reason": out.provider_finish_reason.clone(),
+                "provider_usage": out.provider_usage.clone(),
+                "entry_stage_trace": out.entry_stage_trace.clone(),
+                "error": err,
+            });
+            if let Err(err) = append_journal_event(event) {
+                warn!(error = %err, "append llm_stage1_scan_error journal failed");
+            }
+            continue;
+        }
+        if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
+            print_entry_stage_timing(
+                &stage1_bundle.raw.ts_bucket,
+                &trigger,
+                &out.model_name,
+                &out.provider,
+                &out.model,
+                stage1_management_mode,
+                stage1_pending_order_mode,
+                out.latency_ms,
+                stage_trace,
+            );
+        }
+        if print_response {
+            if let Some(stage_trace) = out.entry_stage_trace.as_ref() {
+                print_entry_stage_trace(
+                    &stage1_bundle.raw.ts_bucket,
+                    &trigger,
+                    &out.model_name,
+                    &out.provider,
+                    &out.model,
+                    stage_trace,
+                );
+            }
+        }
+        let response_event = json!({
+            "event_type": "llm_stage1_scan_response",
+            "event_ts": Utc::now().to_rfc3339(),
+            "ts_bucket": stage1_bundle.raw.ts_bucket.to_rfc3339(),
+            "trigger": &*trigger,
+            "symbol": stage1_bundle.raw.symbol,
+            "management_mode": stage1_management_mode,
+            "pending_order_mode": stage1_pending_order_mode,
+            "model_name": out.model_name.clone(),
+            "provider": out.provider.clone(),
+            "model_id": out.model.clone(),
+            "batch_id": out.batch_id.clone(),
+            "batch_status": out.batch_status.clone(),
+            "provider_finish_reason": out.provider_finish_reason.clone(),
+            "provider_usage": out.provider_usage.clone(),
+            "parsed_scan": out.parsed_decision.clone(),
+            "entry_stage_trace": out.entry_stage_trace.clone(),
+            "raw_response_text": out.raw_response_text.clone(),
+        });
+        if let Err(err) = append_journal_event(response_event) {
+            warn!(error = %err, "append llm_stage1_scan_response journal failed");
+        }
+        if out.parsed_decision.is_some() {
+            successful_stage1_outputs.push(out);
+        }
+    }
+
+    if successful_stage1_outputs.is_empty() {
+        warn!(
+            symbol = %stage1_bundle.raw.symbol,
+            ts_bucket = %stage1_bundle.raw.ts_bucket,
+            trigger = %trigger,
+            "llm stage2 skipped: no successful stage1 scans"
+        );
+        return;
+    }
+
+    let stage2_bundle = match load_latest_temp_indicator_bundle(&stage1_bundle.raw.symbol).await {
+        Ok(bundle) => bundle,
         Err(err) => {
-            let error_chain = format!("{err:#}");
             error!(
-                symbol = %bundle.raw.symbol,
-                error = %error_chain,
-                "llm invoke aborted: failed to fetch trading state"
+                symbol = %stage1_bundle.raw.symbol,
+                stage1_ts_bucket = %stage1_bundle.raw.ts_bucket,
+                trigger = %trigger,
+                error = %err,
+                "llm stage2 aborted: failed to load latest temp_indicator bundle"
             );
             return;
         }
     };
-
-    if !config.llm.request_enabled {
-        let input = build_invocation_input(
-            &bundle,
-            routing_context.management_mode,
-            routing_context.pending_order_mode,
-            routing_context.trading_state.clone(),
-            routing_context.invoke_management_reason.clone(),
-            routing_context.position_context.clone(),
-        );
-        let mut input = input;
-        if let Err(err) =
-            patch_input_kline_history_from_db(&db_pool, &mut input, trigger.as_ref()).await
-        {
-            warn!(
-                symbol = %bundle.raw.symbol,
-                ts_bucket = %bundle.raw.ts_bucket,
+    let stage2_prepared = match prepare_live_invocation(
+        &config,
+        &http_client,
+        &db_pool,
+        stage2_bundle,
+        &runtime_lifecycle_state,
+        &format!("{}:stage2_core", trigger.as_ref()),
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            error!(
+                symbol = %stage1_bundle.raw.symbol,
+                stage1_ts_bucket = %stage1_bundle.raw.ts_bucket,
                 trigger = %trigger,
                 error = %err,
-                "failed to patch missing kline_history bars from db"
+                "llm stage2 aborted: failed to build latest invocation input"
             );
+            return;
         }
-        let source_file = minute_bundle_path(&bundle.raw);
-        let model_input_files = match persist_model_input_to_disk(
-            &bundle.raw,
-            trigger.as_ref(),
-            routing_context.management_mode,
-            routing_context.pending_order_mode,
-            &input,
-            config.llm.temp_cache_retention_minutes,
-        )
-        .await
-        {
-            Ok(path) => Some(path),
-            Err(err) => {
-                warn!(
-                    symbol = %bundle.raw.symbol,
-                    ts_bucket = %bundle.raw.ts_bucket,
-                    trigger = %trigger,
-                    error = %err,
-                    "persist llm model input to temp_model_input failed while llm.request_enabled=false"
-                );
-                None
-            }
-        };
-        let scan_input_path = model_input_files
-            .as_ref()
-            .map(|files| files.scan.display().to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let core_input_path = model_input_files
-            .as_ref()
-            .map(|files| files.core.display().to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let scan_input_exists = model_input_files
-            .as_ref()
-            .map(|files| files.scan.exists())
-            .unwrap_or(false);
-        let core_input_exists = model_input_files
-            .as_ref()
-            .map(|files| files.core.exists())
-            .unwrap_or(false);
-        println!(
-            "LLM_INPUT_SOURCE ts_bucket={} trigger={} symbol={} source_temp_indicator_file={} source_file_exists={} source_scan_input_file={} scan_input_file_exists={} source_core_input_file={} core_input_file_exists={} indicator_count={} missing_count={} management_mode={} pending_order_mode={}",
-            bundle.raw.ts_bucket,
-            &*trigger,
-            bundle.raw.symbol,
-            source_file.display(),
-            source_file.exists(),
-            scan_input_path,
-            scan_input_exists,
-            core_input_path,
-            core_input_exists,
-            bundle.raw.indicator_count,
-            bundle.missing_indicator_codes.len(),
-            routing_context.management_mode,
-            routing_context.pending_order_mode,
-        );
-        info!(
-            ts_bucket = %bundle.raw.ts_bucket,
-            trigger = %trigger,
-            indicator_count = bundle.raw.indicator_count,
-            missing_count = bundle.missing_indicator_codes.len(),
-            management_mode = routing_context.management_mode,
-            pending_order_mode = routing_context.pending_order_mode,
-            "llm request skipped because llm.request_enabled=false; persisted temp_indicator and temp_model_input only"
-        );
-        return;
-    }
-    let trading_state = routing_context.trading_state.clone();
-    let management_mode = routing_context.management_mode;
-    let active_position_count = routing_context.active_position_count;
-    let open_order_count = routing_context.open_order_count;
-    let pending_order_mode = routing_context.pending_order_mode;
-    let context_state = routing_context.context_state;
-    let invoke_management_reason = routing_context.invoke_management_reason.clone();
+    };
     println!(
-        "LLM_INVOKE_CONTEXT ts_bucket={} trigger={} symbol={} management_mode={} pending_order_mode={} context_state={} active_position_count={} open_order_count={} default_model={} prompt_template={} last_management_reason={}",
-        bundle.raw.ts_bucket,
+        "LLM_INVOKE_CONTEXT ts_bucket={} trigger={} symbol={} stage=stage2_core management_mode={} pending_order_mode={} context_state={} active_position_count={} open_order_count={} default_model={} prompt_template={} last_management_reason={}",
+        stage2_prepared.bundle.raw.ts_bucket,
         &*trigger,
-        bundle.raw.symbol,
-        management_mode,
-        pending_order_mode,
-        context_state,
-        active_position_count,
-        open_order_count,
+        stage2_prepared.bundle.raw.symbol,
+        stage2_prepared.routing_context.management_mode,
+        stage2_prepared.routing_context.pending_order_mode,
+        stage2_prepared.routing_context.context_state,
+        stage2_prepared.routing_context.active_position_count,
+        stage2_prepared.routing_context.open_order_count,
         config.active_default_model(),
         config.llm.prompt_template,
-        invoke_management_reason.as_deref().unwrap_or("-"),
+        stage2_prepared
+            .routing_context
+            .invoke_management_reason
+            .as_deref()
+            .unwrap_or("-"),
     );
-    if let Some(state) = trading_state.as_ref() {
+    if let Some(state) = stage2_prepared.routing_context.trading_state.as_ref() {
         let total_unrealized_pnl: f64 = state
             .active_positions
             .iter()
@@ -2401,17 +3019,18 @@ async fn invoke_bundle_models(
         let event = json!({
             "event_type": "llm_invoke_context",
             "event_ts": Utc::now().to_rfc3339(),
-            "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
+            "ts_bucket": stage2_prepared.bundle.raw.ts_bucket.to_rfc3339(),
             "trigger": &*trigger,
-            "symbol": bundle.raw.symbol,
-            "management_mode": management_mode,
-            "pending_order_mode": pending_order_mode,
-            "context_state": context_state,
-            "active_position_count": active_position_count,
-            "open_order_count": open_order_count,
+            "symbol": stage2_prepared.bundle.raw.symbol,
+            "stage": "stage2_core",
+            "management_mode": stage2_prepared.routing_context.management_mode,
+            "pending_order_mode": stage2_prepared.routing_context.pending_order_mode,
+            "context_state": stage2_prepared.routing_context.context_state,
+            "active_position_count": stage2_prepared.routing_context.active_position_count,
+            "open_order_count": stage2_prepared.routing_context.open_order_count,
             "default_model": config.active_default_model(),
             "prompt_template": config.llm.prompt_template,
-            "last_management_reason": invoke_management_reason.clone(),
+            "last_management_reason": stage2_prepared.routing_context.invoke_management_reason.clone(),
             "total_wallet_balance": state.total_wallet_balance,
             "available_balance": state.available_balance,
             "total_unrealized_pnl": total_unrealized_pnl,
@@ -2420,44 +3039,11 @@ async fn invoke_bundle_models(
             warn!(error = %err, "append llm_invoke_context journal failed");
         }
     }
-    let input = build_invocation_input(
-        &bundle,
-        management_mode,
-        pending_order_mode,
-        trading_state.clone(),
-        invoke_management_reason,
-        routing_context.position_context.clone(),
-    );
-    let mut input = input;
-    if let Err(err) =
-        patch_input_kline_history_from_db(&db_pool, &mut input, trigger.as_ref()).await
-    {
-        warn!(
-            symbol = %bundle.raw.symbol,
-            ts_bucket = %bundle.raw.ts_bucket,
-            trigger = %trigger,
-            error = %err,
-            "failed to patch missing kline_history bars from db"
-        );
-    }
-
-    debug!(
-        ts_bucket = %bundle.raw.ts_bucket,
-        trigger = %trigger,
-        management_mode = management_mode,
-        active_position_count = active_position_count,
-        open_order_count = open_order_count,
-        indicator_count = bundle.raw.indicator_count,
-        missing_count = bundle.missing_indicator_codes.len(),
-        "llm invoking models"
-    );
-    let source_file = minute_bundle_path(&bundle.raw);
-    let model_input_files = match persist_model_input_to_disk(
-        &bundle.raw,
-        trigger.as_ref(),
-        management_mode,
-        pending_order_mode,
-        &input,
+    let stage2_core_input_path = match persist_core_input_to_disk(
+        &stage2_prepared.bundle.raw,
+        stage2_prepared.routing_context.management_mode,
+        stage2_prepared.routing_context.pending_order_mode,
+        &stage2_prepared.input,
         config.llm.temp_cache_retention_minutes,
     )
     .await
@@ -2465,56 +3051,86 @@ async fn invoke_bundle_models(
         Ok(path) => Some(path),
         Err(err) => {
             warn!(
-                symbol = %bundle.raw.symbol,
-                ts_bucket = %bundle.raw.ts_bucket,
+                symbol = %stage2_prepared.bundle.raw.symbol,
+                ts_bucket = %stage2_prepared.bundle.raw.ts_bucket,
                 trigger = %trigger,
                 error = %err,
-                "persist llm model input to temp_model_input failed"
+                "persist stage2 core input to temp_model_input failed"
             );
             None
         }
     };
-    let scan_input_path = model_input_files
-        .as_ref()
-        .map(|files| files.scan.display().to_string())
-        .unwrap_or_else(|| "-".to_string());
-    let core_input_path = model_input_files
-        .as_ref()
-        .map(|files| files.core.display().to_string())
-        .unwrap_or_else(|| "-".to_string());
-    let scan_input_exists = model_input_files
-        .as_ref()
-        .map(|files| files.scan.exists())
-        .unwrap_or(false);
-    let core_input_exists = model_input_files
-        .as_ref()
-        .map(|files| files.core.exists())
-        .unwrap_or(false);
+    let stage2_source_file = minute_bundle_path(&stage2_prepared.bundle.raw);
+    let stage_gap_seconds = stage2_prepared
+        .bundle
+        .raw
+        .ts_bucket
+        .signed_duration_since(stage1_bundle.raw.ts_bucket)
+        .num_seconds();
+    let stage_gap_minutes = (stage_gap_seconds as f64) / 60.0;
     println!(
-        "LLM_INPUT_SOURCE ts_bucket={} trigger={} symbol={} source_temp_indicator_file={} source_file_exists={} source_scan_input_file={} scan_input_file_exists={} source_core_input_file={} core_input_file_exists={} indicator_count={} missing_count={} management_mode={} pending_order_mode={}",
-        bundle.raw.ts_bucket,
+        "LLM_STAGE_DATA_SOURCE trigger={} symbol={} stage1_scan_ts_bucket={} stage1_source_temp_indicator_file={} stage1_source_file_exists={} stage1_scan_input_file={} stage1_scan_input_file_exists={} stage1_indicator_count={} stage1_missing_count={} stage1_management_mode={} stage1_pending_order_mode={} stage2_core_ts_bucket={} stage2_source_temp_indicator_file={} stage2_source_file_exists={} stage2_core_input_file={} stage2_core_input_file_exists={} stage2_indicator_count={} stage2_missing_count={} stage2_management_mode={} stage2_pending_order_mode={} stage1_to_stage2_gap_seconds={} stage1_to_stage2_gap_minutes={:.2}",
         &*trigger,
-        bundle.raw.symbol,
-        source_file.display(),
-        source_file.exists(),
-        scan_input_path,
-        scan_input_exists,
-        core_input_path,
-        core_input_exists,
-        bundle.raw.indicator_count,
-        bundle.missing_indicator_codes.len(),
-        management_mode,
-        pending_order_mode,
+        stage1_bundle.raw.symbol,
+        stage1_bundle.raw.ts_bucket,
+        stage1_source_file.display(),
+        stage1_source_file.exists(),
+        stage1_scan_input_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        stage1_scan_input_path
+            .as_ref()
+            .map(|path| path.exists())
+            .unwrap_or(false),
+        stage1_bundle.raw.indicator_count,
+        stage1_bundle.missing_indicator_codes.len(),
+        stage1_management_mode,
+        stage1_pending_order_mode,
+        stage2_prepared.bundle.raw.ts_bucket,
+        stage2_source_file.display(),
+        stage2_source_file.exists(),
+        stage2_core_input_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        stage2_core_input_path
+            .as_ref()
+            .map(|path| path.exists())
+            .unwrap_or(false),
+        stage2_prepared.bundle.raw.indicator_count,
+        stage2_prepared.bundle.missing_indicator_codes.len(),
+        stage2_prepared.routing_context.management_mode,
+        stage2_prepared.routing_context.pending_order_mode,
+        stage_gap_seconds,
+        stage_gap_minutes,
     );
+
+    let bundle = stage2_prepared.bundle;
+    let input = stage2_prepared.input;
+    let routing_context = stage2_prepared.routing_context;
+    let trading_state = routing_context.trading_state.clone();
+    let management_mode = routing_context.management_mode;
+    let active_position_count = routing_context.active_position_count;
+    let open_order_count = routing_context.open_order_count;
+    let pending_order_mode = routing_context.pending_order_mode;
+
     let telegram_operator = TelegramOperator::from_config(&config.api.telegram);
     let x_operator = XOperator::from_config(&config.api.x);
 
-    let outputs = invoke_models(&http_client, &loopback_http_client, &config, &input).await;
+    let outputs = invoke_models_finalize_stage(
+        &http_client,
+        &loopback_http_client,
+        &config,
+        &input,
+        &successful_stage1_outputs,
+        FinalizeStageContext {
+            stage1_scan_ts_bucket: stage1_bundle.raw.ts_bucket,
+            stage2_core_ts_bucket: bundle.raw.ts_bucket,
+        },
+    )
+    .await;
 
-    // Post-invocation freshness gate. For Claude batch mode, invoke_models blocks
-    // while polling (30 s intervals) until results arrive, which can take 60–300 s.
-    // The indicator data keeps aging during that wait. If execution is enabled, block
-    // it when the data has grown too stale to act on safely.
     let post_invoke_data_age_secs = Utc::now()
         .signed_duration_since(bundle.raw.ts_bucket)
         .num_seconds();
@@ -2523,14 +3139,16 @@ async fn invoke_bundle_models(
         if post_invoke_data_age_secs > max_exec_stale_secs {
             warn!(
                 ts_bucket = %bundle.raw.ts_bucket,
+                stage = "stage2_core",
                 post_invoke_data_age_secs = post_invoke_data_age_secs,
                 max_execution_stale_secs = max_exec_stale_secs,
-                "llm execution skipped: indicator data too stale after model invocation (batch latency)"
+                "llm execution skipped: indicator data too stale after model invocation (stage2 latency)"
             );
             execution_blocked_due_to_stale = true;
         } else {
             debug!(
                 ts_bucket = %bundle.raw.ts_bucket,
+                stage = "stage2_core",
                 post_invoke_data_age_secs = post_invoke_data_age_secs,
                 max_execution_stale_secs = max_exec_stale_secs,
                 "llm post-invoke data freshness ok"
@@ -4568,6 +5186,69 @@ fn temp_indicator_ts_bucket_from_path(path: &Path) -> Option<DateTime<Utc>> {
     Some(DateTime::from_naive_utc_and_offset(naive, Utc))
 }
 
+fn temp_indicator_symbol_from_path(path: &Path) -> Option<String> {
+    let file_name = path.file_name()?.to_str()?;
+    let mut parts = file_name.trim_end_matches(".json").splitn(2, '_');
+    let _ts = parts.next()?;
+    parts.next().map(ToString::to_string)
+}
+
+async fn load_latest_temp_indicator_bundle(symbol: &str) -> Result<LatestBundle> {
+    ensure_temp_indicator_dir().await?;
+
+    let expected_symbol = sanitize_filename_component(symbol);
+    let mut latest_path: Option<PathBuf> = None;
+    let mut latest_ts_bucket: Option<DateTime<Utc>> = None;
+
+    for entry in fs::read_dir(TEMP_INDICATOR_DIR)
+        .with_context(|| format!("read temp indicator dir {}", TEMP_INDICATOR_DIR))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(file_symbol) = temp_indicator_symbol_from_path(&path) else {
+            continue;
+        };
+        if file_symbol != expected_symbol {
+            continue;
+        }
+        let Some(file_ts_bucket) = temp_indicator_ts_bucket_from_path(&path) else {
+            continue;
+        };
+        if latest_ts_bucket
+            .map(|current| file_ts_bucket > current)
+            .unwrap_or(true)
+        {
+            latest_ts_bucket = Some(file_ts_bucket);
+            latest_path = Some(path);
+        }
+    }
+
+    let path = latest_path.ok_or_else(|| {
+        anyhow!(
+            "latest temp_indicator bundle not found for symbol {} in {}",
+            symbol,
+            TEMP_INDICATOR_DIR
+        )
+    })?;
+    let raw_text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let raw: MinuteBundleEnvelope =
+        serde_json::from_str(&raw_text).with_context(|| format!("parse {}", path.display()))?;
+
+    Ok(LatestBundle {
+        indicators: raw.indicators.clone(),
+        raw,
+        missing_indicator_codes: Vec::new(),
+        received_at: Utc::now(),
+    })
+}
+
+#[cfg(test)]
 async fn persist_model_input_to_disk(
     bundle: &MinuteBundleEnvelope,
     _trigger: &str,
@@ -4580,14 +5261,34 @@ async fn persist_model_input_to_disk(
 
     let scan_value = ScanFilter::build_value(input).context("build scan model input")?;
     let core_value = CoreFilter::build_value(input).context("build core model input")?;
-    let scan_path = llm_filtered_model_input_path(bundle, "scan");
     let core_stage = CoreFilter::stage_label_for_flags(management_mode, pending_order_mode);
-    let core_path = llm_filtered_model_input_path(bundle, core_stage);
+    let scan_path =
+        persist_filtered_model_input_value_to_disk(bundle, "scan", &scan_value, retention_minutes)
+            .await?;
+    let core_path = persist_filtered_model_input_value_to_disk(
+        bundle,
+        core_stage,
+        &core_value,
+        retention_minutes,
+    )
+    .await?;
 
-    write_pretty_json_file(&scan_path, &scan_value)
-        .with_context(|| format!("write {}", scan_path.display()))?;
-    write_pretty_json_file(&core_path, &core_value)
-        .with_context(|| format!("write {}", core_path.display()))?;
+    Ok(PersistedModelInputFiles {
+        scan: scan_path,
+        core: core_path,
+    })
+}
+
+async fn persist_filtered_model_input_value_to_disk(
+    bundle: &MinuteBundleEnvelope,
+    stage: &str,
+    value: &Value,
+    retention_minutes: u64,
+) -> Result<PathBuf> {
+    ensure_temp_model_input_dir().await?;
+
+    let path = llm_filtered_model_input_path(bundle, stage);
+    write_pretty_json_file(&path, value).with_context(|| format!("write {}", path.display()))?;
     let removed = prune_expired_temp_model_input_files(
         Path::new(TEMP_MODEL_INPUT_DIR),
         bundle.ts_bucket,
@@ -4602,11 +5303,28 @@ async fn persist_model_input_to_disk(
             "pruned expired temp_model_input cache"
         );
     }
+    Ok(path)
+}
 
-    Ok(PersistedModelInputFiles {
-        scan: scan_path,
-        core: core_path,
-    })
+async fn persist_scan_input_to_disk(
+    bundle: &MinuteBundleEnvelope,
+    input: &ModelInvocationInput,
+    retention_minutes: u64,
+) -> Result<PathBuf> {
+    let scan_value = ScanFilter::build_value(input).context("build scan model input")?;
+    persist_filtered_model_input_value_to_disk(bundle, "scan", &scan_value, retention_minutes).await
+}
+
+async fn persist_core_input_to_disk(
+    bundle: &MinuteBundleEnvelope,
+    management_mode: bool,
+    pending_order_mode: bool,
+    input: &ModelInvocationInput,
+    retention_minutes: u64,
+) -> Result<PathBuf> {
+    let core_value = CoreFilter::build_value(input).context("build core model input")?;
+    let stage = CoreFilter::stage_label_for_flags(management_mode, pending_order_mode);
+    persist_filtered_model_input_value_to_disk(bundle, stage, &core_value, retention_minutes).await
 }
 
 async fn persist_entry_stage_prompt_inputs_to_disk(
@@ -4679,6 +5397,7 @@ fn minute_bundle_path(bundle: &MinuteBundleEnvelope) -> PathBuf {
     Path::new(TEMP_INDICATOR_DIR).join(format!("{}_{}.json", ts, symbol))
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct PersistedModelInputFiles {
     scan: PathBuf,
@@ -5429,18 +6148,14 @@ mod tests {
             .expect("parse core model input");
 
             assert_eq!(
-                scan_value.pointer("/indicators/funding_rate/payload/funding_current"),
+                scan_value.pointer(
+                    "/supporting_context/indicator_snapshots/funding_rate/funding_current"
+                ),
                 Some(&json!(-0.00004527))
             );
             assert_eq!(
-                scan_value.pointer("/indicators/avwap/payload/fut_mark_price"),
+                scan_value.pointer("/now/price_anchor/futures_mark_price"),
                 Some(&json!(2001.57))
-            );
-            assert_eq!(
-                scan_value
-                    .pointer("/indicators/avwap/payload/series_by_window/15m/0/ts")
-                    .and_then(Value::as_str),
-                Some("2026-03-14T06:15:00Z")
             );
             assert_eq!(
                 core_value
@@ -5448,8 +6163,9 @@ mod tests {
                     .and_then(Value::as_str),
                 Some("2026-03-14T06:15:00Z")
             );
-            assert_eq!(scan_value.as_object().map(|obj| obj.len()), Some(3));
+            assert_eq!(scan_value.pointer("/version"), Some(&json!("scan_v6_1")));
             assert!(scan_value.pointer("/indicator_count").is_none());
+            assert!(scan_value.pointer("/indicators").is_none());
             assert!(scan_value.pointer("/indicators/pre_computed_v").is_none());
             assert!(core_value.pointer("/indicators/pre_computed_v").is_none());
 
@@ -6348,6 +7064,166 @@ mod tests {
     }
 
     #[test]
+    fn collect_divergence_kline_coverage_request_detects_gap_before_existing_1m_history() {
+        let indicators = json!({
+            "kline_history": {
+                "payload": {
+                    "intervals": {
+                        "1m": {
+                            "markets": {
+                                "futures": {
+                                    "bars": [
+                                        {"open_time": "2026-03-18T00:10:00Z", "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5, "is_closed": true},
+                                        {"open_time": "2026-03-18T00:11:00Z", "open": 100.5, "high": 101.2, "low": 100.0, "close": 101.0, "is_closed": true}
+                                    ],
+                                    "returned_count": 2
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "divergence": {
+                "payload": {
+                    "recent_7d": {
+                        "events": [
+                            {"event_start_ts": "2026-03-18T00:02:00Z", "event_end_ts": "2026-03-18T00:05:00Z"},
+                            {"event_start_ts": "2026-03-18T00:08:00Z", "event_end_ts": "2026-03-18T00:09:00Z"}
+                        ]
+                    }
+                }
+            }
+        });
+
+        let request =
+            collect_divergence_kline_coverage_request(&indicators).expect("range request");
+
+        assert_eq!(request.market, "futures");
+        assert_eq!(request.interval_code, "1m");
+        assert_eq!(
+            request.start_open_time,
+            DateTime::parse_from_rfc3339("2026-03-18T00:02:00Z")
+                .expect("parse start")
+                .with_timezone(&Utc)
+        );
+        assert_eq!(
+            request.end_open_time,
+            DateTime::parse_from_rfc3339("2026-03-18T00:09:00Z")
+                .expect("parse end")
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[test]
+    fn prepend_backfilled_kline_bars_prepends_unique_older_bars_and_updates_count() {
+        let mut indicators = json!({
+            "kline_history": {
+                "payload": {
+                    "intervals": {
+                        "1m": {
+                            "markets": {
+                                "futures": {
+                                    "bars": [
+                                        {"open_time": "2026-03-18T00:10:00Z", "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5, "is_closed": true},
+                                        {"open_time": "2026-03-18T00:11:00Z", "open": 100.5, "high": 101.2, "low": 100.0, "close": 101.0, "is_closed": true}
+                                    ],
+                                    "returned_count": 2
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let replacements = vec![
+            json!({"open_time": "2026-03-18T00:08:00Z", "close_time": "2026-03-18T00:08:59Z", "open": 99.0, "high": 99.5, "low": 98.8, "close": 99.2, "volume_base": 1.0, "volume_quote": 2.0, "is_closed": true, "minutes_covered": 1, "expected_minutes": 1}),
+            json!({"open_time": "2026-03-18T00:09:00Z", "close_time": "2026-03-18T00:09:59Z", "open": 99.2, "high": 100.0, "low": 99.1, "close": 100.0, "volume_base": 1.0, "volume_quote": 2.0, "is_closed": true, "minutes_covered": 1, "expected_minutes": 1}),
+            json!({"open_time": "2026-03-18T00:10:00Z", "close_time": "2026-03-18T00:10:59Z", "open": 100.0, "high": 101.0, "low": 99.5, "close": 100.5, "volume_base": 1.0, "volume_quote": 2.0, "is_closed": true, "minutes_covered": 1, "expected_minutes": 1}),
+        ];
+
+        let inserted =
+            prepend_backfilled_kline_bars(&mut indicators, "futures", "1m", &replacements);
+
+        assert_eq!(inserted, 2);
+        assert_eq!(
+            indicators
+                .pointer("/kline_history/payload/intervals/1m/markets/futures/returned_count"),
+            Some(&json!(4))
+        );
+
+        let bars = indicators
+            .pointer("/kline_history/payload/intervals/1m/markets/futures/bars")
+            .and_then(Value::as_array)
+            .expect("bars array");
+        let open_times = bars
+            .iter()
+            .filter_map(|bar| bar.get("open_time").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            open_times,
+            vec![
+                "2026-03-18T00:08:00Z",
+                "2026-03-18T00:09:00Z",
+                "2026-03-18T00:10:00Z",
+                "2026-03-18T00:11:00Z"
+            ]
+        );
+    }
+
+    #[test]
+    fn backfill_divergence_event_prices_from_bars_derives_missing_price_fields() {
+        let mut indicators = json!({
+            "divergence": {
+                "payload": {
+                    "recent_7d": {
+                        "events": [
+                            {
+                                "type": "hidden_bullish_divergence",
+                                "event_start_ts": "2026-03-18T00:02:00Z",
+                                "event_end_ts": "2026-03-18T00:05:00Z",
+                                "pivot_side": "low"
+                            },
+                            {
+                                "type": "hidden_bearish_divergence",
+                                "event_start_ts": "2026-03-18T00:07:00Z",
+                                "event_end_ts": "2026-03-18T00:09:00Z",
+                                "pivot_side": "high"
+                            }
+                        ]
+                    }
+                }
+            }
+        });
+        let bars = vec![
+            json!({"open_time": "2026-03-18T00:02:00Z", "low": 99.5, "high": 100.2}),
+            json!({"open_time": "2026-03-18T00:03:00Z", "low": 98.8, "high": 100.6}),
+            json!({"open_time": "2026-03-18T00:05:00Z", "low": 99.1, "high": 101.0}),
+            json!({"open_time": "2026-03-18T00:07:00Z", "low": 100.5, "high": 101.8}),
+            json!({"open_time": "2026-03-18T00:09:00Z", "low": 100.7, "high": 102.4}),
+        ];
+
+        let patched = backfill_divergence_event_prices_from_bars(&mut indicators, &bars);
+        assert_eq!(patched, 2);
+
+        let events = indicators
+            .pointer("/divergence/payload/recent_7d/events")
+            .and_then(Value::as_array)
+            .expect("events array");
+        assert_eq!(
+            events[0].get("pivot_price").and_then(Value::as_f64),
+            Some(98.8)
+        );
+        assert_eq!(events[0].get("price_low").and_then(Value::as_f64), Some(98.8));
+        assert_eq!(events[0].get("price_high").and_then(Value::as_f64), Some(101.0));
+        assert_eq!(
+            events[1].get("pivot_price").and_then(Value::as_f64),
+            Some(102.4)
+        );
+        assert_eq!(events[1].get("price_low").and_then(Value::as_f64), Some(100.5));
+        assert_eq!(events[1].get("price_high").and_then(Value::as_f64), Some(102.4));
+    }
+
+    #[test]
     fn sync_snapshot_backfills_pending_entry_context_from_both_alias() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6453,6 +7329,69 @@ mod tests {
         assert!(dir.join(".gitignore").exists());
 
         fs::remove_dir_all(&dir).expect("cleanup temp indicator dir");
+    }
+
+    #[test]
+    fn load_latest_temp_indicator_bundle_selects_newest_file_for_symbol() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        runtime.block_on(async {
+            let symbol = format!("ATEST{}", uuid::Uuid::new_v4().simple())
+                .chars()
+                .take(12)
+                .collect::<String>()
+                .to_ascii_uppercase();
+            let older = MinuteBundleEnvelope {
+                msg_type: "ind.minute_bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: symbol.clone(),
+                ts_bucket: DateTime::parse_from_rfc3339("2026-03-18T07:00:00Z")
+                    .expect("parse older ts")
+                    .with_timezone(&Utc),
+                window_code: "1m".to_string(),
+                indicator_count: 1,
+                published_at: None,
+                indicators: json!({"older": true}),
+            };
+            let newer = MinuteBundleEnvelope {
+                msg_type: "ind.minute_bundle".to_string(),
+                routing_key: "test.route".to_string(),
+                symbol: symbol.clone(),
+                ts_bucket: DateTime::parse_from_rfc3339("2026-03-18T07:05:00Z")
+                    .expect("parse newer ts")
+                    .with_timezone(&Utc),
+                window_code: "1m".to_string(),
+                indicator_count: 1,
+                published_at: None,
+                indicators: json!({"newer": true}),
+            };
+
+            let older_raw = serde_json::to_vec(&older).expect("serialize older bundle");
+            let newer_raw = serde_json::to_vec(&newer).expect("serialize newer bundle");
+            persist_bundle_to_disk(&older, &older_raw, 5)
+                .await
+                .expect("persist older bundle");
+            persist_bundle_to_disk(&newer, &newer_raw, 5)
+                .await
+                .expect("persist newer bundle");
+
+            let loaded = load_latest_temp_indicator_bundle(&symbol)
+                .await
+                .expect("load latest temp indicator bundle");
+            assert_eq!(loaded.raw.ts_bucket, newer.ts_bucket);
+            assert_eq!(
+                loaded.indicators.get("newer").and_then(Value::as_bool),
+                Some(true)
+            );
+
+            let older_path = minute_bundle_path(&older);
+            let newer_path = minute_bundle_path(&newer);
+            let _ = fs::remove_file(older_path);
+            let _ = fs::remove_file(newer_path);
+        });
     }
 
     #[test]

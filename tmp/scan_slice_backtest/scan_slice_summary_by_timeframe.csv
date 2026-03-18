@@ -1,0 +1,4 @@
+timeframe,trigger_minute,total_rows,complete_rows,incomplete_rows,direction_comparable_rows,direction_matches,direction_mismatches,direction_accuracy_pct,range_comparable_rows,range_matches,range_mismatches,range_accuracy_pct
+15m,,50,50,0,50,15,35,30.0,50,50,0,100.0
+4h,,50,37,13,37,17,20,45.95,37,36,1,97.3
+1d,,50,0,50,0,0,0,0.0,0,0,0,0.0

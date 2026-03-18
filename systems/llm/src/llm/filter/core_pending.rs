@@ -407,9 +407,6 @@ fn build_most_recent_event_summary(
     if let Some(score) = event.get("score").cloned() {
         summary.insert("score".to_string(), score);
     }
-    if let Some(sig_pass) = event.get("sig_pass").cloned() {
-        summary.insert("sig_pass".to_string(), sig_pass);
-    }
 
     match prune_nulls(Value::Object(summary)) {
         Value::Object(object) if !object.is_empty() => Some(Value::Object(object)),

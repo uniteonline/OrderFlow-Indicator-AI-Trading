@@ -1711,14 +1711,7 @@ fn top_divergence_candidates(candidates: &[Value], limit: usize) -> Vec<Value> {
             copy_fields(
                 &mut filtered,
                 &entry,
-                &[
-                    "type",
-                    "score",
-                    "sig_pass",
-                    "price_start",
-                    "price_end",
-                    "likely_driver",
-                ],
+                &["type", "score", "price_start", "price_end", "likely_driver"],
             );
             Value::Object(filtered)
         })
@@ -2514,9 +2507,6 @@ fn build_most_recent_event_summary_v4(
     }
     if let Some(score) = event.get("score").cloned() {
         summary.insert("score".to_string(), score);
-    }
-    if let Some(sig_pass) = event.get("sig_pass").cloned() {
-        summary.insert("sig_pass".to_string(), sig_pass);
     }
 
     match prune_nulls(Value::Object(summary)) {

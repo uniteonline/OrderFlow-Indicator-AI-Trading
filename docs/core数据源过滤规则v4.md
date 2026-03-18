@@ -33,6 +33,7 @@ v4 **不允许**保留以下会替 LLM 先下判断的字段：
 - 直接给出 `bull/bear/neutral` 结论的 regime / bias / state
 - 将一组原始事件折叠成 `signal=true/false` 的顶层判断
 - 将连续数值硬分类成 `high/low/toxic` 等离散标签
+- 过滤后恒为常量的冗余字段（如 `sig_pass` 恒为 `true`）
 
 原则上：**entry_core 可以保留证据压缩，但不能保留结论压缩。**
 
@@ -339,7 +340,13 @@ by_z_window.*.is_volume_spike_z2
 by_z_window.*.is_volume_spike_z3
 ```
 
-理由：旁边已经有 `volume_spike_z_w` 连续值，LLM 可自行判断是否达到 z2 / z3 阈值；保留布尔字段会把同一信息以“算法已判定”的形式重复输出。
+理由：旁边已经有 `volume_spike_z_w` 连续值，LLM 可自行判断是否达到 z2 / z3 阈值；保留布尔字段会把同一信息以”算法已判定”的形式重复输出。
+
+#### `sig_pass`（全局删除）
+
+**删除**：所有 indicator 事件及 `events_summary` 中的 `sig_pass` 字段。
+
+理由：过滤阶段已只保留 `sig_pass=true` 的事件，输出中 `sig_pass` 恒为 `true`（实测 61/61），是零信息量的常量字段。保留它只会增加 token 消耗，不提供任何区分度。
 
 **预期节省**：体积收益小（<1KB），但可显著减少对 LLM 的方向引导。
 
@@ -495,6 +502,9 @@ for bucket in high_volume_pulse["by_z_window"].values_mut() {
     bucket.remove("is_volume_spike_z2");
     bucket.remove("is_volume_spike_z3");
 }
+
+// sig_pass: 过滤后恒为 true，零信息量，全局删除
+// 已从 events_summary builder 和 divergence candidates 白名单中移除
 ```
 
 ### 6.6 通用 null 省略规则
@@ -551,6 +561,18 @@ for bucket in hvp.get("by_z_window", {}).values():
     assert "is_volume_spike_z2" not in bucket                 # HVP 布尔阈值标签已删除
     assert "is_volume_spike_z3" not in bucket
     assert "volume_spike_z_w" in bucket                       # 保留连续 z-score
+
+# sig_pass 全局删除（过滤后恒为 true，零信息量）
+def assert_no_sig_pass(node):
+    if isinstance(node, dict):
+        assert "sig_pass" not in node, f"sig_pass found in {list(node.keys())}"
+        for v in node.values():
+            assert_no_sig_pass(v)
+    elif isinstance(node, list):
+        for v in node:
+            assert_no_sig_pass(v)
+
+assert_no_sig_pass(filtered_json)
 
 fp_1d = footprint["by_window"]["1d"]
 assert all(s["length"] >= 7 for s in fp_1d["buy_stacks"])   # 1d min_length=7

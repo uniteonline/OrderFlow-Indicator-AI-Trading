@@ -1,103 +1,109 @@
 use crate::llm::provider::ModelInvocationInput;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
 
 const SCAN_WINDOWS: &[&str] = &["15m", "4h", "1d"];
-const SCAN_VA_TOP_LEVELS: usize = 5;
-const EVENT_INDICATOR_RULES: &[(&str, usize)] = &[
-    ("absorption", 20),
-    ("buying_exhaustion", 20),
-    ("selling_exhaustion", 20),
-    ("bullish_absorption", 20),
-    ("bearish_absorption", 20),
-    ("bullish_initiation", 10),
-    ("bearish_initiation", 10),
-];
-const EVENT_DROP_FIELDS: &[&str] = &[
-    "event_id",
-    "end_ts",
-    "start_ts",
-    "event_available_ts",
-    "indicator_code",
-    "min_follow_required_minutes",
-    "strength_score_xmk",
-    "spot_rdelta_mean",
-    "score_base",
-    "spot_flow_confirm_score",
-    "spot_whale_confirm_score",
-    "spot_cvd_1m_change",
-];
-const INITIATION_EVENT_DROP_FIELDS: &[&str] = &[
-    "follow_through_delta_sum",
-    "follow_through_hold_ok",
-    "follow_through_minutes",
-    "follow_through_max_adverse_excursion_ticks",
-    "spot_cvd_change",
-    "spot_rdelta_1m_mean",
-];
-const DIVERGENCE_EVENT_DROP_FIELDS: &[&str] = &[
-    "event_id",
-    "end_ts",
-    "start_ts",
-    "event_available_ts",
-    "price_norm_diff",
-    "cvd_norm_diff_fut",
-    "cvd_norm_diff_spot",
-    "sig_test_mode",
-];
-const FVG_DROP_FIELDS: &[&str] = &["fvg_id", "event_available_ts", "tf"];
+const SCAN_CONTEXT_WINDOWS: &[&str] = &["15m", "1h", "4h", "1d", "3d"];
+const CLUSTER_MERGE_TICK_MULTIPLIER: f64 = 2.0;
+const PVS_CLUSTER_NEAR_PER_SIDE: usize = 2;
+const PVS_CLUSTER_STRONG_PER_SIDE: usize = 2;
+const PVS_CLUSTER_MID_PER_SIDE: usize = 1;
+const PVS_CLUSTER_DEEP_PER_SIDE: usize = 1;
+const FOOTPRINT_CLUSTER_NEAR_PER_SIDE: usize = 2;
+const FOOTPRINT_CLUSTER_STRONG_PER_SIDE: usize = 1;
+const FOOTPRINT_CLUSTER_MID_PER_SIDE: usize = 1;
+const FOOTPRINT_CLUSTER_DEEP_PER_SIDE: usize = 1;
+const ORDERBOOK_CLUSTER_NEAR_PER_SIDE: usize = 2;
+const ORDERBOOK_CLUSTER_STRONG_PER_SIDE: usize = 1;
+const ORDERBOOK_CLUSTER_MID_PER_SIDE: usize = 1;
+const ORDERBOOK_CLUSTER_DEEP_PER_SIDE: usize = 1;
+const PVS_PEAK_MIN_PERCENTILE: f64 = 0.90;
+const PVS_PEAK_NEIGHBOR_STEPS: usize = 2;
+const PATH_15M_DETAIL_BARS: usize = 12;
+const PATH_4H_CONTEXT_BARS: usize = 8;
+const PATH_1D_BACKGROUND_BARS: usize = 10;
+const BRACKET_BOARD_LIMIT: usize = 8;
+const STRUCTURE_NODE_LIMIT_PER_SIDE: usize = 10;
+const ACCEPTANCE_BASIS_BARS: usize = 3;
+const EVENTS_7D_MAJOR_LIMIT: usize = 16;
+const EVENT_DEDUPE_WINDOW_MINUTES: i64 = 30;
+const EVENT_DEDUPE_PRICE_PCT: f64 = 0.15;
+const RAW_OVERFLOW_AGGREGATION_PCT: f64 = 0.02;
+const RAW_OVERFLOW_NEAR_MAX_ZONES: usize = 36;
+const RAW_OVERFLOW_MID_MAX_ZONES: usize = 18;
+const RAW_OVERFLOW_FAR_MAX_ZONES: usize = 12;
+const RAW_OVERFLOW_FAR_ABSORPTION_MAX_ZONES: usize = 3;
+const RAW_OVERFLOW_FAR_ABSORPTION_SCORE_MIN: f64 = 0.70;
+const RAW_OVERFLOW_ABSORPTION_MAX_PER_SCOPE_DIRECTION: usize = 10;
 
 pub(crate) struct ScanFilter;
 
-#[derive(Debug, Clone)]
-struct EvidenceSnapshot {
-    ts_bucket: String,
-    trend_balance_score: f64,
-    flow_balance_score: f64,
-    evidence_balance_score: f64,
-    primary_support: f64,
-    primary_resistance: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct BiasEvidence {
-    trend_balance_score: f64,
-    flow_balance_score: f64,
-    structure_balance_score: f64,
-    evidence_balance_score: f64,
-    conflict_score: f64,
-    compression_score: f64,
-}
-
-#[derive(Debug, Clone)]
-struct LevelMember {
-    price: f64,
+#[derive(Clone, Debug)]
+struct PriceClusterCandidate {
+    low: f64,
+    high: f64,
+    mid: f64,
+    count: usize,
     weight: f64,
-    source: &'static str,
 }
 
-#[derive(Debug, Clone)]
-struct LevelCluster {
-    price: f64,
-    strength: f64,
-    sources: Vec<&'static str>,
+#[derive(Default)]
+struct ClusterSelection {
+    above: Vec<PriceClusterCandidate>,
+    below: Vec<PriceClusterCandidate>,
+    cross: Vec<PriceClusterCandidate>,
 }
 
-#[derive(Debug, Clone)]
-struct LevelAnchor {
-    price: f64,
-    strength: f64,
-    source_count: usize,
+#[derive(Clone, Debug)]
+struct BracketCandidate {
+    scopes: Vec<String>,
+    kind: String,
+    source_indicators: Vec<String>,
+    reference_ts: Option<String>,
+    support: f64,
+    resistance: f64,
+    support_evidence: Vec<String>,
+    resistance_evidence: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct WeightedEvent {
-    event: Map<String, Value>,
-    weighted_score: f64,
+#[derive(Clone, Debug)]
+struct RawStructureZone {
+    source_kind: String,
+    source_window: String,
+    direction: Option<String>,
+    side: Option<String>,
+    state: Option<String>,
+    event_type: Option<String>,
+    count: usize,
+    price_low: f64,
+    price_high: f64,
+    max_score: f64,
+    total_touch_count: f64,
+    reference_ts_latest: Option<String>,
+    representative_direction: String,
+}
+
+#[derive(Clone, Debug)]
+struct NormalizedEvent {
+    indicator_code: String,
+    event_type: String,
+    direction: String,
+    scope: Option<String>,
+    event_start_ts: Option<String>,
+    event_end_ts: Option<String>,
+    confirm_ts: Option<String>,
+    age_minutes: Option<i64>,
+    pivot_price: Option<f64>,
+    price_low: Option<f64>,
+    price_high: Option<f64>,
+    score: Option<f64>,
+    spot_confirm: Option<bool>,
+    trigger_side: Option<String>,
+    distance_to_current_pct: Option<f64>,
+    event_count: usize,
 }
 
 impl ScanFilter {
@@ -125,7 +131,7 @@ fn build_scan_root(root: &Value) -> Value {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let symbol = root
+    let _symbol = root
         .get("symbol")
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -138,180 +144,3282 @@ fn build_scan_root(root: &Value) -> Value {
     let current_ts = parse_rfc3339_utc(&ts_bucket);
     let current_price = extract_current_price(&indicators);
     let kline_derived = build_kline_derived(&indicators);
-    let level_book = current_price
-        .map(|price| build_level_book(&indicators, price, &kline_derived))
-        .unwrap_or_else(empty_tf_object);
-    let cvd_summary = build_cvd_summary(
-        indicators
-            .get("cvd_pack")
-            .and_then(|indicator| indicator.get("payload")),
-    );
-    let absorption_summary = build_event_summary(
-        indicators
-            .get("absorption")
-            .and_then(|indicator| indicator.get("payload")),
-        current_ts.clone(),
-        current_price,
-        &kline_derived,
-        event_direction_default,
-    );
-    let buying_exhaustion_summary = build_event_summary(
-        indicators
-            .get("buying_exhaustion")
-            .and_then(|indicator| indicator.get("payload")),
-        current_ts.clone(),
-        current_price,
-        &kline_derived,
-        event_direction_default,
-    );
-    let selling_exhaustion_summary = build_event_summary(
-        indicators
-            .get("selling_exhaustion")
-            .and_then(|indicator| indicator.get("payload")),
-        current_ts.clone(),
-        current_price,
-        &kline_derived,
-        event_direction_default,
-    );
-    let divergence_summary = build_event_summary(
-        indicators
-            .get("divergence")
-            .and_then(|indicator| indicator.get("payload")),
-        current_ts.clone(),
-        current_price,
-        &kline_derived,
-        event_direction_divergence,
-    );
-    let initiation_summary = build_combined_initiation_summary(
-        indicators
-            .get("bullish_initiation")
-            .and_then(|indicator| indicator.get("payload")),
-        indicators
-            .get("bearish_initiation")
-            .and_then(|indicator| indicator.get("payload")),
-        current_ts.clone(),
-        current_price,
-        &kline_derived,
-    );
-    let by_timeframe = build_by_timeframe(
+    let raw_price_structures = build_price_structures(
         &indicators,
+        current_price,
+        current_ts.as_ref(),
         &kline_derived,
-        &level_book,
-        &cvd_summary,
-        &absorption_summary,
-        &buying_exhaustion_summary,
-        &selling_exhaustion_summary,
-        &divergence_summary,
-        &initiation_summary,
     );
-    let history = load_recent_scan_evidence(&symbol, &ts_bucket);
-    let timeframe_evidence =
-        build_timeframe_evidence(&symbol, &ts_bucket, current_price, &by_timeframe, &history);
-    let multi_timeframe_evidence =
-        build_multi_timeframe_evidence(current_price, &timeframe_evidence);
+    let overflow_price_structures =
+        build_raw_overflow_price_structures(&raw_price_structures, current_price);
+    let raw_price_levels = build_price_levels(&indicators, current_price, current_ts.as_ref());
 
+    result.insert(
+        "version".to_string(),
+        Value::String("scan_v6_1".to_string()),
+    );
     if let Some(symbol) = root.get("symbol") {
         result.insert("symbol".to_string(), symbol.clone());
     }
     if let Some(ts_bucket) = root.get("ts_bucket") {
         result.insert("ts_bucket".to_string(), ts_bucket.clone());
     }
+    if let Some(current_price) = current_price {
+        result.insert("current_price".to_string(), Value::from(current_price));
+    }
     result.insert(
-        "current_price".to_string(),
-        current_price.map(Value::from).unwrap_or(Value::Null),
+        "now".to_string(),
+        build_now(
+            &indicators,
+            current_price,
+            current_ts.as_ref(),
+            &kline_derived,
+            &raw_price_structures,
+        ),
     );
-    result.insert("by_timeframe".to_string(), Value::Object(by_timeframe));
     result.insert(
-        "timeframe_evidence".to_string(),
-        Value::Object(timeframe_evidence),
+        "path_newest_to_oldest".to_string(),
+        build_path_newest_to_oldest(&indicators),
     );
     result.insert(
-        "multi_timeframe_evidence".to_string(),
-        multi_timeframe_evidence,
+        "events_newest_to_oldest".to_string(),
+        build_events_newest_to_oldest(&indicators, current_price, current_ts.as_ref()),
     );
     result.insert(
-        "indicators".to_string(),
-        Value::Object(filter_indicators(&indicators, current_price)),
+        "supporting_context".to_string(),
+        build_supporting_context(&indicators),
+    );
+    result.insert(
+        "raw_overflow".to_string(),
+        json!({
+            "price_structures": overflow_price_structures,
+            "price_levels": raw_price_levels,
+        }),
     );
     Value::Object(result)
 }
 
-fn filter_indicators(
+fn build_now(
     source: &Map<String, Value>,
     current_price: Option<f64>,
-) -> Map<String, Value> {
-    let mut indicators = Map::new();
-
-    insert_filtered_indicator(
-        &mut indicators,
-        source,
-        "tpo_market_profile",
-        filter_tpo_market_profile,
-    );
-
-    insert_filtered_indicator(
-        &mut indicators,
-        source,
-        "price_volume_structure",
-        filter_price_volume_structure,
-    );
-    insert_filtered_indicator(&mut indicators, source, "fvg", filter_fvg);
-    insert_filtered_indicator(&mut indicators, source, "avwap", filter_avwap);
-    insert_filtered_indicator(
-        &mut indicators,
-        source,
-        "rvwap_sigma_bands",
-        filter_rvwap_sigma_bands,
-    );
-    insert_filtered_indicator(
-        &mut indicators,
-        source,
-        "ema_trend_regime",
-        filter_ema_trend_regime,
-    );
-    insert_filtered_indicator(&mut indicators, source, "footprint", |payload| {
-        filter_footprint_with_price(payload, current_price)
-    });
-    insert_filtered_indicator(
-        &mut indicators,
-        source,
-        "orderbook_depth",
-        filter_orderbook_depth,
-    );
-
-    indicators
+    current_ts: Option<&DateTime<Utc>>,
+    kline_derived: &Value,
+    raw_price_structures: &[Value],
+) -> Value {
+    json!({
+        "price_anchor": build_price_anchor(source, current_price),
+        "location_snapshot": build_location_snapshot(source, current_price),
+        "value_state_board": build_value_state_board(source, current_price),
+        "bracket_board": build_bracket_board(
+            source,
+            current_price,
+            current_ts,
+            kline_derived,
+            raw_price_structures,
+        ),
+        "structure_nodes_near_current": build_structure_nodes_near_current(
+            raw_price_structures,
+            current_price,
+        ),
+        "current_flow_snapshot": build_current_flow_snapshot(source, current_price),
+        "current_volume_nodes": build_current_volume_nodes(source),
+    })
 }
 
-fn insert_full_indicator(target: &mut Map<String, Value>, source: &Map<String, Value>, code: &str) {
-    if let Some(indicator) = source.get(code) {
-        let payload = indicator.get("payload").cloned().unwrap_or(Value::Null);
-        target.insert(code.to_string(), rebuild_indicator(indicator, payload));
+fn build_price_anchor(source: &Map<String, Value>, current_price: Option<f64>) -> Value {
+    let avwap = extract_indicator_payload(source, "avwap");
+    let funding = extract_indicator_payload(source, "funding_rate");
+
+    json!({
+        "futures_last_price": avwap
+            .and_then(|payload| payload.get("fut_last_price"))
+            .and_then(Value::as_f64)
+            .or(current_price),
+        "futures_mark_price": avwap
+            .and_then(|payload| payload.get("fut_mark_price"))
+            .and_then(Value::as_f64)
+            .or_else(|| funding.and_then(|payload| payload.get("mark_price_last")).and_then(Value::as_f64)),
+        "spot_proxy_price": avwap
+            .and_then(|payload| payload.get("avwap_spot"))
+            .and_then(Value::as_f64),
+    })
+}
+
+fn build_location_snapshot(source: &Map<String, Value>, current_price: Option<f64>) -> Value {
+    json!({
+        "vs_avwap": build_vs_avwap_snapshot(source, current_price),
+        "vs_ema_band": build_vs_ema_band_snapshot(source, current_price),
+        "vs_rvwap": build_vs_rvwap_snapshot(source),
+    })
+}
+
+fn build_vs_avwap_snapshot(source: &Map<String, Value>, current_price: Option<f64>) -> Value {
+    let avwap = extract_indicator_payload(source, "avwap");
+    let avwap_fut = avwap
+        .and_then(|payload| payload.get("avwap_fut"))
+        .and_then(Value::as_f64);
+    let price_minus_avwap_fut = avwap
+        .and_then(|payload| payload.get("price_minus_avwap_fut"))
+        .and_then(Value::as_f64)
+        .or_else(|| match (current_price, avwap_fut) {
+            (Some(price), Some(anchor)) => Some(price - anchor),
+            _ => None,
+        });
+    json!({
+        "avwap_fut": avwap_fut,
+        "price_minus_avwap_fut": price_minus_avwap_fut.map(round2),
+        "price_minus_avwap_pct": pct_delta(current_price, avwap_fut).map(round2),
+        "xmk_avwap_gap_f_minus_s": avwap
+            .and_then(|payload| payload.get("xmk_avwap_gap_f_minus_s"))
+            .and_then(Value::as_f64)
+            .map(round2),
+    })
+}
+
+fn build_vs_ema_band_snapshot(source: &Map<String, Value>, current_price: Option<f64>) -> Value {
+    let ema = extract_indicator_payload(source, "ema_trend_regime");
+    let ema_13 = ema
+        .and_then(|payload| payload.get("ema_13"))
+        .and_then(Value::as_f64);
+    let ema_21 = ema
+        .and_then(|payload| payload.get("ema_21"))
+        .and_then(Value::as_f64);
+    let ema_34 = ema
+        .and_then(|payload| payload.get("ema_34"))
+        .and_then(Value::as_f64);
+    let ema_band_low = ema
+        .and_then(|payload| payload.get("ema_band_low"))
+        .and_then(Value::as_f64)
+        .or_else(|| match (ema_13, ema_21, ema_34) {
+            (Some(a), Some(b), Some(c)) => Some(a.min(b).min(c)),
+            _ => None,
+        });
+    let ema_band_high = ema
+        .and_then(|payload| payload.get("ema_band_high"))
+        .and_then(Value::as_f64)
+        .or_else(|| match (ema_13, ema_21, ema_34) {
+            (Some(a), Some(b), Some(c)) => Some(a.max(b).max(c)),
+            _ => None,
+        });
+
+    json!({
+        "ema_13": ema_13,
+        "ema_21": ema_21,
+        "ema_34": ema_34,
+        "ema_band_low": ema_band_low,
+        "ema_band_high": ema_band_high,
+        "position": classify_price_position(current_price, ema_band_low, ema_band_high),
+        "distance_to_band_low_pct": pct_delta(current_price, ema_band_low).map(round2),
+        "distance_to_band_high_pct": pct_delta(current_price, ema_band_high).map(round2),
+    })
+}
+
+fn build_vs_rvwap_snapshot(source: &Map<String, Value>) -> Vec<Value> {
+    let mut snapshots = Vec::new();
+    let Some(by_window) = extract_indicator_payload(source, "rvwap_sigma_bands")
+        .and_then(|payload| payload.get("by_window"))
+        .and_then(Value::as_object)
+    else {
+        return snapshots;
+    };
+
+    for scope in SCAN_WINDOWS {
+        let Some(window) = by_window.get(*scope).and_then(Value::as_object) else {
+            continue;
+        };
+        snapshots.push(json!({
+            "scope": scope,
+            "rvwap": window.get("rvwap_w").and_then(Value::as_f64),
+            "sigma_w": window.get("rvwap_sigma_w").and_then(Value::as_f64),
+            "z_price_minus_rvwap": window.get("z_price_minus_rvwap").and_then(Value::as_f64),
+            "band_minus_1": window.get("rvwap_band_minus_1").and_then(Value::as_f64),
+            "band_plus_1": window.get("rvwap_band_plus_1").and_then(Value::as_f64),
+            "band_minus_2": window.get("rvwap_band_minus_2").and_then(Value::as_f64),
+            "band_plus_2": window.get("rvwap_band_plus_2").and_then(Value::as_f64),
+        }));
     }
+
+    snapshots
 }
 
-fn insert_filtered_indicator<F>(
-    target: &mut Map<String, Value>,
+fn build_value_state_board(source: &Map<String, Value>, current_price: Option<f64>) -> Vec<Value> {
+    let mut board = Vec::new();
+
+    if let Some(by_window) = extract_indicator_payload(source, "price_volume_structure")
+        .and_then(|payload| payload.get("by_window"))
+        .and_then(Value::as_object)
+    {
+        for scope in SCAN_WINDOWS {
+            let Some(window) = by_window.get(*scope).and_then(Value::as_object) else {
+                continue;
+            };
+            board.push(build_value_state_entry(
+                source,
+                scope,
+                "price_volume_structure",
+                window.get("val").and_then(Value::as_f64),
+                window.get("vah").and_then(Value::as_f64),
+                window.get("poc_price").and_then(Value::as_f64),
+                current_price,
+            ));
+        }
+    }
+
+    if let Some(by_session) = extract_indicator_payload(source, "tpo_market_profile")
+        .and_then(|payload| payload.get("by_session"))
+        .and_then(Value::as_object)
+    {
+        for scope in collect_available_windows(by_session) {
+            let Some(session) = by_session.get(&scope).and_then(Value::as_object) else {
+                continue;
+            };
+            board.push(build_value_state_entry(
+                source,
+                &scope,
+                "tpo_market_profile",
+                session.get("tpo_val").and_then(Value::as_f64),
+                session.get("tpo_vah").and_then(Value::as_f64),
+                session.get("tpo_poc").and_then(Value::as_f64),
+                current_price,
+            ));
+        }
+    }
+
+    if let Some(tpo) = extract_indicator_payload(source, "tpo_market_profile") {
+        let value_low = tpo.get("tpo_val").and_then(Value::as_f64);
+        let value_high = tpo.get("tpo_vah").and_then(Value::as_f64);
+        if value_low.is_some() && value_high.is_some() {
+            board.push(build_value_state_entry(
+                source,
+                "15m",
+                "tpo_market_profile",
+                value_low,
+                value_high,
+                tpo.get("tpo_poc").and_then(Value::as_f64),
+                current_price,
+            ));
+        }
+    }
+
+    board
+}
+
+fn build_value_state_entry(
     source: &Map<String, Value>,
-    code: &str,
-    filter_fn: F,
-) where
-    F: FnOnce(&Value) -> Value,
-{
-    if let Some(indicator) = source.get(code) {
-        let payload = indicator
-            .get("payload")
-            .map(filter_fn)
-            .unwrap_or(Value::Null);
-        target.insert(code.to_string(), rebuild_indicator(indicator, payload));
+    scope: &str,
+    source_name: &str,
+    value_low: Option<f64>,
+    value_high: Option<f64>,
+    poc: Option<f64>,
+    current_price: Option<f64>,
+) -> Value {
+    let closed_bars = extract_closed_futures_bars(source, scope);
+    let recent_closes = closed_bars
+        .iter()
+        .rev()
+        .take(ACCEPTANCE_BASIS_BARS)
+        .filter_map(|bar| bar.get("close").and_then(Value::as_f64))
+        .collect::<Vec<_>>();
+    let recent_closes_inside_count = recent_closes
+        .iter()
+        .filter(|close| is_inside_range(**close, value_low, value_high))
+        .count();
+
+    json!({
+        "scope": scope,
+        "source": source_name,
+        "value_low": value_low,
+        "value_high": value_high,
+        "poc": poc,
+        "position": classify_price_position(current_price, value_low, value_high),
+        "distance_to_low_pct": pct_delta(current_price, value_low).map(round2),
+        "distance_to_high_pct": pct_delta(current_price, value_high).map(round2),
+        "recent_closes_inside_count": recent_closes_inside_count,
+        "basis_bars": recent_closes.len(),
+        "state": classify_acceptance_state(current_price, &recent_closes, value_low, value_high),
+    })
+}
+
+fn classify_acceptance_state(
+    current_price: Option<f64>,
+    recent_closes: &[f64],
+    value_low: Option<f64>,
+    value_high: Option<f64>,
+) -> &'static str {
+    let current_position = classify_price_position(current_price, value_low, value_high);
+    let last_close = recent_closes.first().copied();
+    let prev_close = recent_closes.get(1).copied();
+
+    match current_position {
+        "inside" => {
+            if matches!(
+                classify_price_position(prev_close, value_low, value_high),
+                "above" | "below"
+            ) {
+                "reentered_value"
+            } else {
+                "inside_value"
+            }
+        }
+        "above" => {
+            if matches!(
+                classify_price_position(prev_close, value_low, value_high),
+                "inside"
+            ) || matches!(
+                classify_price_position(last_close, value_low, value_high),
+                "inside"
+            ) {
+                "rejected_from_above"
+            } else {
+                "accepted_above"
+            }
+        }
+        "below" => {
+            if matches!(
+                classify_price_position(prev_close, value_low, value_high),
+                "inside"
+            ) || matches!(
+                classify_price_position(last_close, value_low, value_high),
+                "inside"
+            ) {
+                "rejected_from_below"
+            } else {
+                "accepted_below"
+            }
+        }
+        _ => "inside_value",
     }
 }
 
-fn empty_tf_object() -> Value {
-    let mut map = Map::new();
-    for tf in SCAN_WINDOWS {
-        map.insert((*tf).to_string(), Value::Object(Map::new()));
+fn classify_price_position(
+    price: Option<f64>,
+    low: Option<f64>,
+    high: Option<f64>,
+) -> &'static str {
+    let (Some(price), Some(low), Some(high)) = (price, low, high) else {
+        return "unknown";
+    };
+    if price < low {
+        "below"
+    } else if price > high {
+        "above"
+    } else {
+        "inside"
     }
-    Value::Object(map)
+}
+
+fn is_inside_range(price: f64, low: Option<f64>, high: Option<f64>) -> bool {
+    let (Some(low), Some(high)) = (low, high) else {
+        return false;
+    };
+    low <= price && price <= high
+}
+
+fn build_bracket_board(
+    source: &Map<String, Value>,
+    current_price: Option<f64>,
+    current_ts: Option<&DateTime<Utc>>,
+    kline_derived: &Value,
+    raw_price_structures: &[Value],
+) -> Value {
+    let mut candidates = build_bracket_candidates(
+        source,
+        current_price,
+        current_ts,
+        kline_derived,
+        raw_price_structures,
+    );
+    candidates = merge_bracket_candidates(candidates);
+    candidates.sort_by(|left, right| {
+        bracket_distance_to_current(left, current_price)
+            .partial_cmp(&bracket_distance_to_current(right, current_price))
+            .unwrap_or(Ordering::Equal)
+    });
+
+    let mut current_inside = Vec::new();
+    let mut nearest_above = Vec::new();
+    let mut nearest_below = Vec::new();
+    let mut higher_context = Vec::new();
+
+    for candidate in candidates {
+        if current_price
+            .is_some_and(|price| candidate.support <= price && price <= candidate.resistance)
+        {
+            current_inside.push(bracket_candidate_to_value(&candidate, current_price));
+            continue;
+        }
+
+        if candidate
+            .scopes
+            .iter()
+            .any(|scope| matches!(scope.as_str(), "1d" | "3d"))
+        {
+            higher_context.push(bracket_candidate_to_value(&candidate, current_price));
+            continue;
+        }
+
+        if current_price.is_some_and(|price| candidate.support > price) {
+            nearest_above.push(bracket_candidate_to_value(&candidate, current_price));
+        } else {
+            nearest_below.push(bracket_candidate_to_value(&candidate, current_price));
+        }
+    }
+
+    json!({
+        "current_inside": limit_values(current_inside, BRACKET_BOARD_LIMIT),
+        "nearest_above": limit_values(nearest_above, BRACKET_BOARD_LIMIT),
+        "nearest_below": limit_values(nearest_below, BRACKET_BOARD_LIMIT),
+        "higher_context": limit_values(higher_context, BRACKET_BOARD_LIMIT),
+    })
+}
+
+fn build_bracket_candidates(
+    source: &Map<String, Value>,
+    current_price: Option<f64>,
+    current_ts: Option<&DateTime<Utc>>,
+    kline_derived: &Value,
+    raw_price_structures: &[Value],
+) -> Vec<BracketCandidate> {
+    let mut candidates = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for structure in raw_price_structures.iter().filter_map(Value::as_object) {
+        let Some(kind) = structure.get("source_kind").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(scope) = structure.get("source_window").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(support) = structure.get("price_low").and_then(Value::as_f64) else {
+            continue;
+        };
+        let Some(resistance) = structure.get("price_high").and_then(Value::as_f64) else {
+            continue;
+        };
+
+        let Some((candidate_kind, source_indicator)) = structure_kind_to_bracket_kind(kind) else {
+            continue;
+        };
+        let candidate = BracketCandidate {
+            scopes: vec![scope.to_string()],
+            kind: candidate_kind.to_string(),
+            source_indicators: vec![source_indicator.to_string()],
+            reference_ts: structure
+                .get("reference_ts")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            support,
+            resistance,
+            support_evidence: vec![format!("{kind} support {:.2}", support)],
+            resistance_evidence: vec![format!("{kind} resistance {:.2}", resistance)],
+        };
+        insert_bracket_candidate(&mut candidates, &mut seen, candidate);
+    }
+
+    if let Some(by_window) = kline_derived.as_object() {
+        for scope in SCAN_WINDOWS {
+            let Some(window) = by_window.get(*scope).and_then(Value::as_object) else {
+                continue;
+            };
+            let Some(support) = window.get("swing_low").and_then(Value::as_f64) else {
+                continue;
+            };
+            let Some(resistance) = window.get("swing_high").and_then(Value::as_f64) else {
+                continue;
+            };
+            let candidate = BracketCandidate {
+                scopes: vec![(*scope).to_string()],
+                kind: "recent_swing_bracket".to_string(),
+                source_indicators: vec!["kline_history".to_string()],
+                reference_ts: current_ts.map(DateTime::<Utc>::to_rfc3339),
+                support,
+                resistance,
+                support_evidence: vec![format!("recent swing low {:.2}", support)],
+                resistance_evidence: vec![format!("recent swing high {:.2}", resistance)],
+            };
+            insert_bracket_candidate(&mut candidates, &mut seen, candidate);
+        }
+    }
+
+    if let Some(by_window) = extract_indicator_payload(source, "fvg")
+        .and_then(|payload| payload.get("by_window"))
+        .and_then(Value::as_object)
+    {
+        for scope in SCAN_WINDOWS {
+            let Some(window) = by_window.get(*scope).and_then(Value::as_object) else {
+                continue;
+            };
+            for (field, label) in [
+                ("nearest_bull_fvg", "bull_fvg"),
+                ("nearest_bear_fvg", "bear_fvg"),
+            ] {
+                let Some(fvg) = window.get(field).and_then(Value::as_object) else {
+                    continue;
+                };
+                let support = fvg
+                    .get("lower")
+                    .or_else(|| fvg.get("fvg_bottom"))
+                    .and_then(Value::as_f64);
+                let resistance = fvg
+                    .get("upper")
+                    .or_else(|| fvg.get("fvg_top"))
+                    .and_then(Value::as_f64);
+                let (Some(support), Some(resistance)) = (support, resistance) else {
+                    continue;
+                };
+                let candidate = BracketCandidate {
+                    scopes: vec![(*scope).to_string()],
+                    kind: "active_imbalance_bracket".to_string(),
+                    source_indicators: vec!["fvg".to_string()],
+                    reference_ts: current_ts.map(DateTime::<Utc>::to_rfc3339),
+                    support,
+                    resistance,
+                    support_evidence: vec![format!("{label} lower {:.2}", support)],
+                    resistance_evidence: vec![format!("{label} upper {:.2}", resistance)],
+                };
+                insert_bracket_candidate(&mut candidates, &mut seen, candidate);
+            }
+        }
+    }
+
+    if let Some(by_session) = extract_indicator_payload(source, "tpo_market_profile")
+        .and_then(|payload| payload.get("by_session"))
+        .and_then(Value::as_object)
+    {
+        for scope in collect_available_windows(by_session) {
+            let Some(session) = by_session.get(&scope).and_then(Value::as_object) else {
+                continue;
+            };
+            let support = session.get("initial_balance_low").and_then(Value::as_f64);
+            let resistance = session.get("initial_balance_high").and_then(Value::as_f64);
+            let (Some(support), Some(resistance)) = (support, resistance) else {
+                continue;
+            };
+            let candidate = BracketCandidate {
+                scopes: vec![scope],
+                kind: "session_ib_bracket".to_string(),
+                source_indicators: vec!["tpo_market_profile".to_string()],
+                reference_ts: current_ts.map(DateTime::<Utc>::to_rfc3339),
+                support,
+                resistance,
+                support_evidence: vec![format!("initial balance low {:.2}", support)],
+                resistance_evidence: vec![format!("initial balance high {:.2}", resistance)],
+            };
+            insert_bracket_candidate(&mut candidates, &mut seen, candidate);
+        }
+    }
+
+    attach_absorption_evidence(&mut candidates, source, current_price, current_ts);
+    candidates.sort_by(|left, right| {
+        bracket_distance_to_current(left, current_price)
+            .partial_cmp(&bracket_distance_to_current(right, current_price))
+            .unwrap_or(Ordering::Equal)
+    });
+    candidates
+}
+
+fn insert_bracket_candidate(
+    target: &mut Vec<BracketCandidate>,
+    seen: &mut BTreeSet<String>,
+    candidate: BracketCandidate,
+) {
+    let key = format!(
+        "{}:{}:{:.4}:{:.4}",
+        candidate
+            .scopes
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default(),
+        candidate.kind,
+        candidate.support,
+        candidate.resistance
+    );
+    if seen.insert(key) {
+        target.push(candidate);
+    }
+}
+
+fn merge_bracket_candidates(candidates: Vec<BracketCandidate>) -> Vec<BracketCandidate> {
+    let mut merged: BTreeMap<String, BracketCandidate> = BTreeMap::new();
+
+    for candidate in candidates {
+        let key = format!(
+            "{}:{:.4}:{:.4}",
+            candidate.kind, candidate.support, candidate.resistance
+        );
+        if let Some(existing) = merged.get_mut(&key) {
+            extend_unique_strings(&mut existing.scopes, candidate.scopes);
+            existing.scopes.sort_by_key(|scope| scope_sort_key(scope));
+            extend_unique_strings(&mut existing.source_indicators, candidate.source_indicators);
+            merge_option_timestamp_max(&mut existing.reference_ts, candidate.reference_ts);
+            extend_unique_strings(&mut existing.support_evidence, candidate.support_evidence);
+            extend_unique_strings(
+                &mut existing.resistance_evidence,
+                candidate.resistance_evidence,
+            );
+        } else {
+            let mut candidate = candidate;
+            candidate.scopes.sort_by_key(|scope| scope_sort_key(scope));
+            merged.insert(key, candidate);
+        }
+    }
+
+    merged.into_values().collect()
+}
+
+fn extend_unique_strings(target: &mut Vec<String>, mut incoming: Vec<String>) {
+    for item in incoming.drain(..) {
+        if !target.iter().any(|existing| existing == &item) {
+            target.push(item);
+        }
+    }
+}
+
+fn merge_option_timestamp_max(target: &mut Option<String>, incoming: Option<String>) {
+    match (target.as_deref(), incoming.as_deref()) {
+        (None, Some(_)) => *target = incoming,
+        (Some(existing), Some(candidate)) => {
+            let existing_ts = parse_rfc3339_utc(existing);
+            let candidate_ts = parse_rfc3339_utc(candidate);
+            if candidate_ts > existing_ts {
+                *target = incoming;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scope_sort_key(scope: &str) -> usize {
+    SCAN_CONTEXT_WINDOWS
+        .iter()
+        .position(|candidate| *candidate == scope)
+        .unwrap_or(SCAN_CONTEXT_WINDOWS.len())
+}
+
+fn structure_kind_to_bracket_kind(kind: &str) -> Option<(&'static str, &'static str)> {
+    match kind {
+        "pvs_value_area" => Some(("pvs_value_area", "price_volume_structure")),
+        "tpo_value_area" => Some(("tpo_value_area", "tpo_market_profile")),
+        "initial_balance" => Some(("session_ib_bracket", "tpo_market_profile")),
+        "rvwap_sigma1" | "rvwap_sigma2" => Some(("active_imbalance_bracket", "rvwap_sigma_bands")),
+        "fvg_boundary" => Some(("active_imbalance_bracket", "fvg")),
+        "liquidation_density_zone" => Some(("liquidation_bracket", "liquidation_density")),
+        "orderbook_wall_band" => Some(("wall_bracket", "orderbook_depth")),
+        _ => None,
+    }
+}
+
+fn attach_absorption_evidence(
+    candidates: &mut [BracketCandidate],
+    source: &Map<String, Value>,
+    current_price: Option<f64>,
+    current_ts: Option<&DateTime<Utc>>,
+) {
+    let absorption_events = collect_absorption_events(source, current_price, current_ts);
+    if absorption_events.is_empty() {
+        return;
+    }
+
+    for candidate in candidates {
+        if let Some(event) =
+            nearest_absorption_event(&absorption_events, "bullish", candidate.support)
+        {
+            let evidence = format_absorption_evidence("support", event);
+            if !candidate
+                .support_evidence
+                .iter()
+                .any(|item| item == &evidence)
+            {
+                candidate.support_evidence.push(evidence);
+            }
+        }
+        if let Some(event) =
+            nearest_absorption_event(&absorption_events, "bearish", candidate.resistance)
+        {
+            let evidence = format_absorption_evidence("resistance", event);
+            if !candidate
+                .resistance_evidence
+                .iter()
+                .any(|item| item == &evidence)
+            {
+                candidate.resistance_evidence.push(evidence);
+            }
+        }
+    }
+}
+
+fn collect_absorption_events(
+    source: &Map<String, Value>,
+    current_price: Option<f64>,
+    current_ts: Option<&DateTime<Utc>>,
+) -> Vec<NormalizedEvent> {
+    let mut specific = Vec::new();
+    specific.extend(collect_events_from_indicator(
+        source,
+        "bullish_absorption",
+        current_price,
+        current_ts,
+    ));
+    specific.extend(collect_events_from_indicator(
+        source,
+        "bearish_absorption",
+        current_price,
+        current_ts,
+    ));
+    if specific.is_empty() {
+        collect_events_from_indicator(source, "absorption", current_price, current_ts)
+    } else {
+        specific
+    }
+}
+
+fn nearest_absorption_event<'a>(
+    events: &'a [NormalizedEvent],
+    direction: &str,
+    reference_price: f64,
+) -> Option<&'a NormalizedEvent> {
+    events
+        .iter()
+        .filter(|event| event.direction == direction)
+        .filter_map(|event| {
+            let level = absorption_event_level(event)?;
+            let pct = ((level - reference_price).abs() / reference_price.abs().max(1e-9)) * 100.0;
+            (pct <= 1.0).then_some((pct, event))
+        })
+        .min_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal))
+        .map(|(_, event)| event)
+}
+
+fn absorption_event_level(event: &NormalizedEvent) -> Option<f64> {
+    event
+        .pivot_price
+        .or_else(|| match (event.price_low, event.price_high) {
+            (Some(low), Some(high)) => Some((low + high) / 2.0),
+            (Some(low), None) => Some(low),
+            (None, Some(high)) => Some(high),
+            _ => None,
+        })
+}
+
+fn format_absorption_evidence(side: &str, event: &NormalizedEvent) -> String {
+    let level = absorption_event_level(event)
+        .map(round2)
+        .unwrap_or_default();
+    match event.age_minutes {
+        Some(age) => format!("{} {} {:.2} ({}m ago)", event.event_type, side, level, age),
+        None => format!("{} {} {:.2}", event.event_type, side, level),
+    }
+}
+
+fn bracket_candidate_to_value(candidate: &BracketCandidate, current_price: Option<f64>) -> Value {
+    let mid_price = (candidate.support + candidate.resistance) / 2.0;
+    let current_inside = current_price
+        .map(|price| candidate.support <= price && price <= candidate.resistance)
+        .unwrap_or(false);
+    json!({
+        "scopes": candidate.scopes,
+        "kind": candidate.kind,
+        "source_indicators": candidate.source_indicators,
+        "reference_ts": candidate.reference_ts,
+        "support": round2(candidate.support),
+        "resistance": round2(candidate.resistance),
+        "width_pct": band_width_pct(candidate.support, candidate.resistance),
+        "current_inside": current_inside,
+        "mid_price": round2(mid_price),
+        "distance_to_support_pct": pct_delta(current_price, Some(candidate.support)).map(round2),
+        "distance_to_resistance_pct": pct_delta(current_price, Some(candidate.resistance)).map(round2),
+        "support_evidence": candidate.support_evidence,
+        "resistance_evidence": candidate.resistance_evidence,
+    })
+}
+
+fn band_width_pct(low: f64, high: f64) -> Option<f64> {
+    let mid = (low + high) / 2.0;
+    if mid.abs() <= f64::EPSILON {
+        None
+    } else {
+        Some(round2((high - low) / mid * 100.0))
+    }
+}
+
+fn bracket_distance_to_current(candidate: &BracketCandidate, current_price: Option<f64>) -> f64 {
+    let Some(price) = current_price else {
+        return f64::INFINITY;
+    };
+    if candidate.support <= price && price <= candidate.resistance {
+        0.0
+    } else if price < candidate.support {
+        ((candidate.support - price) / price.abs().max(1e-9)) * 100.0
+    } else {
+        ((price - candidate.resistance) / price.abs().max(1e-9)) * 100.0
+    }
+}
+
+fn build_structure_nodes_near_current(
+    raw_price_structures: &[Value],
+    current_price: Option<f64>,
+) -> Value {
+    let Some(current_price) = current_price else {
+        return json!({"above": [], "below": []});
+    };
+
+    let mut above = Vec::new();
+    let mut below = Vec::new();
+
+    for structure in raw_price_structures.iter().filter_map(Value::as_object) {
+        let Some(price_low) = structure.get("price_low").and_then(Value::as_f64) else {
+            continue;
+        };
+        let Some(price_high) = structure.get("price_high").and_then(Value::as_f64) else {
+            continue;
+        };
+        let position =
+            classify_price_position(Some(current_price), Some(price_low), Some(price_high));
+        if position == "inside" {
+            continue;
+        }
+        let simplified = simplify_structure_node(structure, current_price, position);
+        if position == "above" {
+            above.push(simplified);
+        } else if position == "below" {
+            below.push(simplified);
+        }
+    }
+
+    above.sort_by(compare_distance_field);
+    below.sort_by(compare_distance_field);
+
+    json!({
+        "above": limit_values(above, STRUCTURE_NODE_LIMIT_PER_SIDE),
+        "below": limit_values(below, STRUCTURE_NODE_LIMIT_PER_SIDE),
+    })
+}
+
+fn simplify_structure_node(
+    structure: &Map<String, Value>,
+    current_price: f64,
+    position_vs_current: &str,
+) -> Value {
+    let price_low = structure.get("price_low").and_then(Value::as_f64);
+    let price_high = structure.get("price_high").and_then(Value::as_f64);
+    let mid_price = structure
+        .get("price_mid")
+        .and_then(Value::as_f64)
+        .or_else(|| match (price_low, price_high) {
+            (Some(low), Some(high)) => Some((low + high) / 2.0),
+            _ => None,
+        });
+
+    json!({
+        "scope": structure.get("source_window").and_then(Value::as_str),
+        "kind": structure.get("source_kind").and_then(Value::as_str),
+        "source_indicator": source_indicator_for_structure_kind(
+            structure.get("source_kind").and_then(Value::as_str).unwrap_or_default()
+        ),
+        "reference_ts": structure.get("reference_ts").and_then(Value::as_str),
+        "price_low": price_low.map(round2),
+        "price_high": price_high.map(round2),
+        "mid_price": mid_price.map(round2),
+        "distance_to_current_pct": mid_price
+            .and_then(|mid| pct_delta(Some(mid), Some(current_price)))
+            .map(round2),
+        "position_vs_current": position_vs_current,
+        "status": structure
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("active"),
+    })
+}
+
+fn source_indicator_for_structure_kind(kind: &str) -> &'static str {
+    match kind {
+        "pvs_value_area" | "pvs_value_cluster" => "price_volume_structure",
+        "tpo_value_area" | "initial_balance" | "tpo_single_print_zone" => "tpo_market_profile",
+        "recent_swing_bracket" => "kline_history",
+        "rvwap_sigma1" | "rvwap_sigma2" => "rvwap_sigma_bands",
+        "fvg_boundary" => "fvg",
+        "footprint_price_cluster" => "footprint",
+        "orderbook_depth_cluster" | "orderbook_wall_band" => "orderbook_depth",
+        "liquidation_density_zone" => "liquidation_density",
+        "absorption_zone" => "absorption",
+        _ => "unknown",
+    }
+}
+
+fn compare_distance_field(left: &Value, right: &Value) -> Ordering {
+    let left_dist = left
+        .get("distance_to_current_pct")
+        .and_then(Value::as_f64)
+        .map(f64::abs)
+        .unwrap_or(f64::INFINITY);
+    let right_dist = right
+        .get("distance_to_current_pct")
+        .and_then(Value::as_f64)
+        .map(f64::abs)
+        .unwrap_or(f64::INFINITY);
+    left_dist
+        .partial_cmp(&right_dist)
+        .unwrap_or(Ordering::Equal)
+}
+
+fn limit_values(mut values: Vec<Value>, limit: usize) -> Vec<Value> {
+    values.truncate(limit);
+    values
+}
+
+fn build_current_flow_snapshot(source: &Map<String, Value>, current_price: Option<f64>) -> Value {
+    let cvd = extract_indicator_payload(source, "cvd_pack")
+        .map(|payload| {
+            json!({
+                "delta_fut": payload.get("delta_fut").and_then(Value::as_f64),
+                "delta_spot": payload.get("delta_spot").and_then(Value::as_f64),
+                "relative_delta_fut": payload.get("relative_delta_fut").and_then(Value::as_f64),
+                "relative_delta_spot": payload.get("relative_delta_spot").and_then(Value::as_f64),
+                "likely_driver": payload.get("likely_driver").and_then(Value::as_str),
+                "spot_flow_dominance": payload.get("spot_flow_dominance").cloned().unwrap_or(Value::Null),
+                "window_latest": build_cvd_latest_by_window(payload),
+            })
+        })
+        .unwrap_or(Value::Null);
+    let orderbook = extract_indicator_payload(source, "orderbook_depth")
+        .map(|payload| build_current_orderbook_snapshot(payload, current_price))
+        .unwrap_or(Value::Null);
+    let footprint = extract_indicator_payload(source, "footprint")
+        .map(|payload| filter_footprint_with_price(&Value::Object(payload.clone()), current_price))
+        .unwrap_or(Value::Null);
+    let whales = extract_indicator_payload(source, "whale_trades")
+        .map(|payload| filter_whale_trades(&Value::Object(payload.clone())))
+        .unwrap_or(Value::Null);
+
+    json!({
+        "cvd": cvd,
+        "orderbook": orderbook,
+        "footprint": footprint,
+        "whales": whales,
+    })
+}
+
+fn build_current_orderbook_snapshot(
+    payload: &Map<String, Value>,
+    current_price: Option<f64>,
+) -> Value {
+    let filtered = filter_orderbook_depth(&Value::Object(payload.clone()), current_price);
+    let mut result = filtered.as_object().cloned().unwrap_or_default();
+    if let Some(by_window) = payload.get("by_window").and_then(Value::as_object) {
+        let mut current_window = Map::new();
+        if let Some(window_15m) = by_window.get("15m").and_then(Value::as_object) {
+            copy_fields(
+                &mut current_window,
+                window_15m,
+                &[
+                    "obi_fut",
+                    "spread_twa_fut",
+                    "microprice_adj_fut",
+                    "topk_depth_twa_fut",
+                    "ofi_norm_fut",
+                ],
+            );
+        }
+        if !current_window.is_empty() {
+            result.insert(
+                "current_window_15m".to_string(),
+                Value::Object(current_window),
+            );
+        }
+    }
+    Value::Object(result)
+}
+
+fn build_cvd_latest_by_window(payload: &Map<String, Value>) -> Value {
+    let mut latest = Map::new();
+    let Some(by_window) = payload.get("by_window").and_then(Value::as_object) else {
+        return Value::Object(latest);
+    };
+    for scope in SCAN_WINDOWS {
+        let Some(entry) = by_window.get(*scope).and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(series) = entry.get("series").and_then(Value::as_array) else {
+            continue;
+        };
+        let Some(last) = series.last().and_then(Value::as_object) else {
+            continue;
+        };
+        latest.insert(
+            (*scope).to_string(),
+            object_subset_value(
+                last,
+                &[
+                    "ts",
+                    "close_fut",
+                    "close_spot",
+                    "delta_fut",
+                    "delta_spot",
+                    "relative_delta_fut",
+                    "relative_delta_spot",
+                    "spot_flow_dominance",
+                    "xmk_delta_gap_s_minus_f",
+                ],
+            ),
+        );
+    }
+    Value::Object(latest)
+}
+
+fn build_current_volume_nodes(source: &Map<String, Value>) -> Value {
+    let high_volume_pulse = extract_indicator_payload(source, "high_volume_pulse")
+        .map(|payload| filter_high_volume_pulse(&Value::Object(payload.clone())))
+        .unwrap_or(Value::Null);
+    json!({
+        "high_volume_pulse": high_volume_pulse,
+    })
+}
+
+fn build_path_newest_to_oldest(source: &Map<String, Value>) -> Value {
+    json!({
+        "latest_15m_detail": build_path_block(source, "15m", PATH_15M_DETAIL_BARS, true),
+        "latest_4h_context": build_path_block(source, "4h", PATH_4H_CONTEXT_BARS, true),
+        "latest_1d_background": build_path_block(source, "1d", PATH_1D_BACKGROUND_BARS, true),
+    })
+}
+
+fn build_path_block(
+    source: &Map<String, Value>,
+    tf: &str,
+    limit: usize,
+    include_partial_bar: bool,
+) -> Value {
+    let bars = extract_futures_bars(source, tf);
+    let mut closed_bars = extract_closed_futures_bars(source, tf);
+    let atr14 = compute_atr14(&closed_bars);
+    let current_partial_bar = if include_partial_bar {
+        bars.last()
+            .filter(|bar| {
+                !bar.get("is_closed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true)
+            })
+            .map(compact_bar_with_derived)
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+
+    if closed_bars.len() > limit {
+        let keep_from = closed_bars.len() - limit;
+        closed_bars = closed_bars.split_off(keep_from);
+    }
+    let newest_to_oldest = closed_bars
+        .iter()
+        .rev()
+        .map(compact_bar_with_derived)
+        .collect::<Vec<_>>();
+
+    json!({
+        "summary": build_path_summary(&closed_bars, atr14),
+        "current_partial_bar": current_partial_bar,
+        "bars_newest_to_oldest": newest_to_oldest,
+    })
+}
+
+fn build_path_summary(bars: &[Map<String, Value>], atr14: Option<f64>) -> Value {
+    let Some(oldest) = bars.first() else {
+        return json!({
+            "bars_count": 0,
+            "oldest_open": Value::Null,
+            "latest_close": Value::Null,
+            "atr14": Value::Null,
+            "atr14_pct": Value::Null,
+            "net_change_pct": Value::Null,
+            "range_high": Value::Null,
+            "range_low": Value::Null,
+            "range_pct": Value::Null,
+        });
+    };
+    let Some(latest) = bars.last() else {
+        return Value::Null;
+    };
+
+    let oldest_open = oldest.get("open").and_then(Value::as_f64);
+    let latest_close = latest.get("close").and_then(Value::as_f64);
+    let range_high = bars
+        .iter()
+        .filter_map(|bar| bar.get("high").and_then(Value::as_f64))
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let range_low = bars
+        .iter()
+        .filter_map(|bar| bar.get("low").and_then(Value::as_f64))
+        .min_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let range_pct = match (range_high, range_low, oldest_open) {
+        (Some(high), Some(low), Some(open)) if open.abs() > f64::EPSILON => {
+            Some(round2((high - low) / open * 100.0))
+        }
+        _ => None,
+    };
+    let atr14_pct = match (atr14, latest_close) {
+        (Some(atr14), Some(close)) if close.abs() > f64::EPSILON => {
+            Some(round2(atr14 / close * 100.0))
+        }
+        _ => None,
+    };
+
+    json!({
+        "bars_count": bars.len(),
+        "oldest_open": oldest_open,
+        "latest_close": latest_close,
+        "atr14": atr14.map(round2),
+        "atr14_pct": atr14_pct,
+        "net_change_pct": pct_delta(latest_close, oldest_open).map(round2),
+        "range_high": range_high,
+        "range_low": range_low,
+        "range_pct": range_pct,
+    })
+}
+
+fn compact_bar_with_derived(bar: &Map<String, Value>) -> Value {
+    let open = bar.get("open").and_then(Value::as_f64);
+    let high = bar.get("high").and_then(Value::as_f64);
+    let low = bar.get("low").and_then(Value::as_f64);
+    let close = bar.get("close").and_then(Value::as_f64);
+    let bar_range = match (high, low) {
+        (Some(high), Some(low)) if (high - low).abs() > f64::EPSILON => Some(high - low),
+        _ => None,
+    };
+    let close_location_pct = match (close, low, bar_range) {
+        (Some(close), Some(low), Some(range)) => Some(round2((close - low) / range * 100.0)),
+        _ => None,
+    };
+    let upper_wick_pct_of_range = match (open, close, high, bar_range) {
+        (Some(open), Some(close), Some(high), Some(range)) => {
+            Some(round2((high - open.max(close)) / range * 100.0))
+        }
+        _ => None,
+    };
+    let lower_wick_pct_of_range = match (open, close, low, bar_range) {
+        (Some(open), Some(close), Some(low), Some(range)) => {
+            Some(round2((open.min(close) - low) / range * 100.0))
+        }
+        _ => None,
+    };
+    let range_pct = match (high, low, open) {
+        (Some(high), Some(low), Some(open)) if open.abs() > f64::EPSILON => {
+            Some(round2((high - low) / open * 100.0))
+        }
+        _ => None,
+    };
+
+    json!({
+        "ts": bar
+            .get("open_time")
+            .or_else(|| bar.get("ts"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "open": open,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume_base": bar.get("volume_base").and_then(Value::as_f64),
+        "is_closed": bar.get("is_closed").and_then(Value::as_bool),
+        "net_return_pct": pct_delta(close, open).map(round2),
+        "close_location_pct": close_location_pct,
+        "upper_wick_pct_of_range": upper_wick_pct_of_range,
+        "lower_wick_pct_of_range": lower_wick_pct_of_range,
+        "range_pct": range_pct,
+    })
+}
+
+fn extract_closed_futures_bars(source: &Map<String, Value>, tf: &str) -> Vec<Map<String, Value>> {
+    extract_futures_bars(source, tf)
+        .into_iter()
+        .filter(|bar| {
+            bar.get("is_closed")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+fn build_events_newest_to_oldest(
+    source: &Map<String, Value>,
+    current_price: Option<f64>,
+    current_ts: Option<&DateTime<Utc>>,
+) -> Value {
+    let mut events = Vec::new();
+
+    let mut specific_absorption = Vec::new();
+    specific_absorption.extend(collect_events_from_indicator(
+        source,
+        "bullish_absorption",
+        current_price,
+        current_ts,
+    ));
+    specific_absorption.extend(collect_events_from_indicator(
+        source,
+        "bearish_absorption",
+        current_price,
+        current_ts,
+    ));
+    if specific_absorption.is_empty() {
+        events.extend(collect_events_from_indicator(
+            source,
+            "absorption",
+            current_price,
+            current_ts,
+        ));
+    } else {
+        events.extend(specific_absorption);
+    }
+
+    let mut specific_initiation = Vec::new();
+    specific_initiation.extend(collect_events_from_indicator(
+        source,
+        "bullish_initiation",
+        current_price,
+        current_ts,
+    ));
+    specific_initiation.extend(collect_events_from_indicator(
+        source,
+        "bearish_initiation",
+        current_price,
+        current_ts,
+    ));
+    if specific_initiation.is_empty() {
+        events.extend(collect_events_from_indicator(
+            source,
+            "initiation",
+            current_price,
+            current_ts,
+        ));
+    } else {
+        events.extend(specific_initiation);
+    }
+
+    for code in ["buying_exhaustion", "selling_exhaustion", "divergence"] {
+        events.extend(collect_events_from_indicator(
+            source,
+            code,
+            current_price,
+            current_ts,
+        ));
+    }
+
+    events.sort_by(|left, right| {
+        normalized_event_confirm_dt(right)
+            .cmp(&normalized_event_confirm_dt(left))
+            .then_with(|| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+    let deduped = dedupe_normalized_events(events);
+
+    let mut latest_24h_detail = deduped
+        .iter()
+        .filter(|event| event.age_minutes.unwrap_or(i64::MAX) <= 24 * 60)
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_events_newest_to_oldest_by_display_time(&mut latest_24h_detail);
+
+    let mut latest_7d_major = deduped
+        .into_iter()
+        .filter(|event| {
+            let age = event.age_minutes.unwrap_or(i64::MAX);
+            age > 24 * 60 && age <= 7 * 24 * 60
+        })
+        .collect::<Vec<_>>();
+    sort_events_newest_to_oldest_by_display_time(&mut latest_7d_major);
+    latest_7d_major.truncate(EVENTS_7D_MAJOR_LIMIT);
+
+    json!({
+        "latest_24h_detail": latest_24h_detail
+            .into_iter()
+            .map(normalized_event_to_value)
+            .collect::<Vec<_>>(),
+        "latest_7d_major": latest_7d_major
+            .into_iter()
+            .map(|event| normalized_event_to_value(event))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn collect_events_from_indicator(
+    source: &Map<String, Value>,
+    indicator_code: &str,
+    current_price: Option<f64>,
+    current_ts: Option<&DateTime<Utc>>,
+) -> Vec<NormalizedEvent> {
+    let Some(indicator_node) = source.get(indicator_code).and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let Some(payload) = indicator_node.get("payload").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let events = payload
+        .get("recent_7d")
+        .and_then(Value::as_object)
+        .and_then(|recent_7d| recent_7d.get("events"))
+        .and_then(Value::as_array)
+        .or_else(|| payload.get("events").and_then(Value::as_array));
+    let Some(events) = events else {
+        return Vec::new();
+    };
+    let default_scope = indicator_node
+        .get("window_code")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| default_event_scope(indicator_code).map(ToString::to_string));
+    let one_minute_bars = extract_futures_bars(source, "1m");
+
+    events
+        .iter()
+        .filter_map(Value::as_object)
+        .map(|event| {
+            normalize_event(
+                indicator_code,
+                event,
+                current_price,
+                current_ts,
+                default_scope.as_deref(),
+                &one_minute_bars,
+            )
+        })
+        .collect()
+}
+
+fn default_event_scope(indicator_code: &str) -> Option<&'static str> {
+    match indicator_code {
+        "selling_exhaustion" | "buying_exhaustion" | "bullish_absorption"
+        | "bearish_absorption" | "bullish_initiation" | "bearish_initiation" | "divergence" => {
+            Some("1m")
+        }
+        _ => None,
+    }
+}
+
+fn normalize_event(
+    indicator_code: &str,
+    event: &Map<String, Value>,
+    current_price: Option<f64>,
+    current_ts: Option<&DateTime<Utc>>,
+    default_scope: Option<&str>,
+    one_minute_bars: &[Map<String, Value>],
+) -> NormalizedEvent {
+    let event_start_ts = event
+        .get("event_start_ts")
+        .or_else(|| event.get("start_ts"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let event_end_ts = event
+        .get("event_end_ts")
+        .or_else(|| event.get("end_ts"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let confirm_ts = event
+        .get("confirm_ts")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| event_end_ts.clone())
+        .or_else(|| event_start_ts.clone());
+    let pivot_price = event
+        .get("pivot_price")
+        .or_else(|| event.get("price"))
+        .or_else(|| event.get("event_price"))
+        .and_then(Value::as_f64);
+    let price_low = event
+        .get("price_low")
+        .or_else(|| event.get("lower"))
+        .or_else(|| event.get("fvg_bottom"))
+        .and_then(Value::as_f64)
+        .or(pivot_price);
+    let price_high = event
+        .get("price_high")
+        .or_else(|| event.get("upper"))
+        .or_else(|| event.get("fvg_top"))
+        .and_then(Value::as_f64)
+        .or(pivot_price);
+    let reference_ts = confirm_ts
+        .as_deref()
+        .or(event_end_ts.as_deref())
+        .or(event_start_ts.as_deref())
+        .and_then(parse_rfc3339_utc);
+    let age_minutes = match (reference_ts, current_ts) {
+        (Some(reference_ts), Some(now)) => {
+            Some(((now.to_owned() - reference_ts).num_seconds().max(0)) / 60)
+        }
+        _ => None,
+    };
+    let direction = infer_event_direction(indicator_code, event);
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or(indicator_code)
+        .to_string();
+    let scope = event
+        .get("scope")
+        .or_else(|| event.get("source_window"))
+        .or_else(|| event.get("window"))
+        .or_else(|| event.get("tf"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| default_scope.map(ToString::to_string));
+    let score = event
+        .get("score")
+        .or_else(|| event.get("strength_score_xmk"))
+        .and_then(Value::as_f64);
+    let spot_confirm = [
+        "spot_confirm",
+        "spot_confirm_at_birth",
+        "spot_flow_confirm",
+        "spot_confirmed",
+        "spot_exhaustion_confirm",
+        "spot_price_flow_confirm",
+        "spot_break_confirm",
+        "spot_whale_break_confirm",
+    ]
+    .iter()
+    .find_map(|key| event.get(*key).and_then(Value::as_bool));
+    let trigger_side = event
+        .get("trigger_side")
+        .or_else(|| event.get("pivot_side"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| derive_event_trigger_side(event));
+    let (pivot_price, price_low, price_high) = backfill_event_price_fields(
+        indicator_code,
+        event,
+        pivot_price,
+        price_low,
+        price_high,
+        one_minute_bars,
+    );
+    let distance_to_current_pct = match (pivot_price, current_price) {
+        (Some(pivot), Some(current)) => pct_delta(Some(pivot), Some(current)).map(round2),
+        _ => None,
+    };
+
+    NormalizedEvent {
+        indicator_code: indicator_code.to_string(),
+        event_type,
+        direction,
+        scope,
+        event_start_ts,
+        event_end_ts,
+        confirm_ts,
+        age_minutes,
+        pivot_price,
+        price_low,
+        price_high,
+        score,
+        spot_confirm,
+        trigger_side,
+        distance_to_current_pct,
+        event_count: 1,
+    }
+}
+
+fn derive_event_trigger_side(event: &Map<String, Value>) -> Option<String> {
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if event_type.contains("buying_exhaustion") || event_type.contains("bullish_initiation") {
+        return Some("buy".to_string());
+    }
+    if event_type.contains("selling_exhaustion") || event_type.contains("bearish_initiation") {
+        return Some("sell".to_string());
+    }
+    None
+}
+
+fn backfill_event_price_fields(
+    indicator_code: &str,
+    event: &Map<String, Value>,
+    pivot_price: Option<f64>,
+    price_low: Option<f64>,
+    price_high: Option<f64>,
+    one_minute_bars: &[Map<String, Value>],
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    if indicator_code != "divergence"
+        || (pivot_price.is_some() && price_low.is_some() && price_high.is_some())
+    {
+        return (pivot_price, price_low, price_high);
+    }
+
+    let Some(event_start) = event
+        .get("event_start_ts")
+        .or_else(|| event.get("start_ts"))
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339_utc)
+    else {
+        return (pivot_price, price_low, price_high);
+    };
+    let Some(event_end) = event
+        .get("event_end_ts")
+        .or_else(|| event.get("end_ts"))
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339_utc)
+    else {
+        return (pivot_price, price_low, price_high);
+    };
+
+    let relevant_bars = one_minute_bars
+        .iter()
+        .filter(|bar| {
+            bar.get("open_time")
+                .and_then(Value::as_str)
+                .and_then(parse_rfc3339_utc)
+                .map(|open_time| open_time >= event_start && open_time <= event_end)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    if relevant_bars.is_empty() {
+        return (pivot_price, price_low, price_high);
+    }
+
+    let derived_low = relevant_bars
+        .iter()
+        .filter_map(|bar| bar.get("low").and_then(Value::as_f64))
+        .min_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let derived_high = relevant_bars
+        .iter()
+        .filter_map(|bar| bar.get("high").and_then(Value::as_f64))
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let derived_pivot = match event.get("pivot_side").and_then(Value::as_str) {
+        Some("low") => derived_low,
+        Some("high") => derived_high,
+        _ => pivot_price.or(derived_low).or(derived_high),
+    };
+
+    (
+        pivot_price.or(derived_pivot),
+        price_low.or(derived_low),
+        price_high.or(derived_high),
+    )
+}
+
+fn infer_event_direction(indicator_code: &str, event: &Map<String, Value>) -> String {
+    if let Some(direction) = event.get("direction").and_then(Value::as_i64) {
+        return if direction > 0 {
+            "bullish".to_string()
+        } else if direction < 0 {
+            "bearish".to_string()
+        } else {
+            "neutral".to_string()
+        };
+    }
+
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or(indicator_code)
+        .to_ascii_lowercase();
+    if event_type.contains("bull") {
+        return "bullish".to_string();
+    }
+    if event_type.contains("bear") {
+        return "bearish".to_string();
+    }
+
+    if let Some(pivot_side) = event.get("pivot_side").and_then(Value::as_str) {
+        return match pivot_side {
+            "low" => "bullish".to_string(),
+            "high" => "bearish".to_string(),
+            _ => "neutral".to_string(),
+        };
+    }
+
+    "neutral".to_string()
+}
+
+fn dedupe_normalized_events(events: Vec<NormalizedEvent>) -> Vec<NormalizedEvent> {
+    let mut deduped = Vec::new();
+    for event in events {
+        if let Some(existing) = deduped
+            .iter_mut()
+            .find(|existing| should_merge_events(existing, &event))
+        {
+            merge_normalized_events(existing, event);
+        } else {
+            deduped.push(event);
+        }
+    }
+    deduped
+}
+
+fn should_merge_events(existing: &NormalizedEvent, incoming: &NormalizedEvent) -> bool {
+    if existing.indicator_code != incoming.indicator_code
+        || existing.direction != incoming.direction
+    {
+        return false;
+    }
+    let (Some(existing_ts), Some(incoming_ts)) = (
+        normalized_event_confirm_dt(existing),
+        normalized_event_confirm_dt(incoming),
+    ) else {
+        return false;
+    };
+    if (existing_ts - incoming_ts).num_minutes().abs() > EVENT_DEDUPE_WINDOW_MINUTES {
+        return false;
+    }
+
+    match (existing.pivot_price, incoming.pivot_price) {
+        (Some(existing_price), Some(incoming_price)) => {
+            let reference = existing_price.abs().max(1e-9);
+            ((existing_price - incoming_price).abs() / reference) * 100.0 <= EVENT_DEDUPE_PRICE_PCT
+        }
+        _ => false,
+    }
+}
+
+fn merge_normalized_events(existing: &mut NormalizedEvent, incoming: NormalizedEvent) {
+    existing.event_count += incoming.event_count;
+    existing.event_start_ts = min_ts(existing.event_start_ts.take(), incoming.event_start_ts);
+    existing.event_end_ts = max_ts(existing.event_end_ts.take(), incoming.event_end_ts);
+    existing.score = match (existing.score, incoming.score) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    };
+    existing.price_low = match (existing.price_low, incoming.price_low) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    };
+    existing.price_high = match (existing.price_high, incoming.price_high) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    };
+}
+
+fn min_ts(left: Option<String>, right: Option<String>) -> Option<String> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
+    }
+}
+
+fn max_ts(left: Option<String>, right: Option<String>) -> Option<String> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    }
+}
+
+fn normalized_event_confirm_dt(event: &NormalizedEvent) -> Option<DateTime<Utc>> {
+    event
+        .confirm_ts
+        .as_deref()
+        .or(event.event_end_ts.as_deref())
+        .or(event.event_start_ts.as_deref())
+        .and_then(parse_rfc3339_utc)
+}
+
+fn normalized_event_display_dt(event: &NormalizedEvent) -> Option<DateTime<Utc>> {
+    event
+        .event_start_ts
+        .as_deref()
+        .or(event.confirm_ts.as_deref())
+        .or(event.event_end_ts.as_deref())
+        .and_then(parse_rfc3339_utc)
+}
+
+fn sort_events_newest_to_oldest_by_display_time(events: &mut [NormalizedEvent]) {
+    events.sort_by(|left, right| {
+        normalized_event_display_dt(right)
+            .cmp(&normalized_event_display_dt(left))
+            .then_with(|| {
+                right
+                    .score
+                    .partial_cmp(&left.score)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .then_with(|| {
+                normalized_event_confirm_dt(right).cmp(&normalized_event_confirm_dt(left))
+            })
+    });
+}
+
+fn normalized_event_to_value(event: NormalizedEvent) -> Value {
+    json!({
+        "indicator_code": event.indicator_code,
+        "event_type": event.event_type,
+        "direction": event.direction,
+        "scope": event.scope,
+        "event_start_ts": event.event_start_ts,
+        "event_end_ts": event.event_end_ts,
+        "confirm_ts": event.confirm_ts,
+        "age_minutes": event.age_minutes,
+        "pivot_price": event.pivot_price.map(round2),
+        "price_low": event.price_low.map(round2),
+        "price_high": event.price_high.map(round2),
+        "score": event.score.map(round3),
+        "spot_confirm": event.spot_confirm,
+        "trigger_side": event.trigger_side,
+        "distance_to_current_pct": event.distance_to_current_pct,
+        "event_count": event.event_count,
+    })
+}
+
+fn build_supporting_context(source: &Map<String, Value>) -> Value {
+    let cvd_path_snapshot = extract_indicator_payload(source, "cvd_pack")
+        .map(|payload| filter_cvd_pack(&Value::Object(payload.clone())))
+        .unwrap_or(Value::Null);
+    let vpin = extract_indicator_payload(source, "vpin")
+        .map(|payload| filter_vpin(&Value::Object(payload.clone())))
+        .unwrap_or(Value::Null);
+    let funding_rate = extract_indicator_payload(source, "funding_rate")
+        .map(|payload| filter_funding_rate(&Value::Object(payload.clone())))
+        .unwrap_or(Value::Null);
+    let liquidation_density = extract_indicator_payload(source, "liquidation_density")
+        .map(|payload| filter_liquidation_density(&Value::Object(payload.clone())))
+        .unwrap_or(Value::Null);
+    let high_volume_pulse_full = extract_indicator_payload(source, "high_volume_pulse")
+        .map(|payload| filter_high_volume_pulse(&Value::Object(payload.clone())))
+        .unwrap_or(Value::Null);
+
+    json!({
+        "cvd_path_snapshot": cvd_path_snapshot,
+        "indicator_snapshots": {
+            "vpin": vpin,
+            "funding_rate": funding_rate,
+            "liquidation_density": liquidation_density,
+            "high_volume_pulse_full": high_volume_pulse_full,
+        }
+    })
+}
+
+fn build_price_structures(
+    source: &Map<String, Value>,
+    current_price: Option<f64>,
+    current_ts: Option<&DateTime<Utc>>,
+    kline_derived: &Value,
+) -> Vec<Value> {
+    let mut structures = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    if let Some(by_window) = extract_indicator_payload(source, "price_volume_structure")
+        .and_then(|payload| payload.get("by_window"))
+        .and_then(Value::as_object)
+    {
+        for window in collect_available_windows(by_window) {
+            let Some(window_value) = by_window.get(&window).and_then(Value::as_object) else {
+                continue;
+            };
+            push_band_structure(
+                &mut structures,
+                &mut seen,
+                format!("pvs_value_area_{window}"),
+                "pvs_value_area",
+                &window,
+                window_value.get("val").and_then(Value::as_f64),
+                window_value.get("vah").and_then(Value::as_f64),
+                current_price,
+                current_ts,
+                structure_extras(&[
+                    (
+                        "poc_price",
+                        window_value.get("poc_price").and_then(Value::as_f64),
+                    ),
+                    (
+                        "poc_volume",
+                        window_value.get("poc_volume").and_then(Value::as_f64),
+                    ),
+                    (
+                        "volume_base",
+                        window_value.get("bar_volume").and_then(Value::as_f64),
+                    ),
+                    (
+                        "volume_zscore",
+                        window_value.get("volume_zscore").and_then(Value::as_f64),
+                    ),
+                ]),
+            );
+
+            let level_candidates = window_value
+                .get("value_area_levels")
+                .and_then(Value::as_array)
+                .map(|levels| build_value_area_peak_clusters(levels))
+                .unwrap_or_default();
+            let selection = select_layered_clusters(
+                &level_candidates,
+                current_price,
+                PVS_CLUSTER_NEAR_PER_SIDE,
+                PVS_CLUSTER_STRONG_PER_SIDE,
+                PVS_CLUSTER_MID_PER_SIDE,
+                PVS_CLUSTER_DEEP_PER_SIDE,
+            );
+            for (idx, cluster) in flatten_cluster_selection(selection).into_iter().enumerate() {
+                push_band_structure(
+                    &mut structures,
+                    &mut seen,
+                    format!("pvs_value_cluster_{window}_{idx}"),
+                    "pvs_value_cluster",
+                    &window,
+                    Some(cluster.low),
+                    Some(cluster.high),
+                    current_price,
+                    current_ts,
+                    structure_extras(&[
+                        ("volume_base", Some(cluster.weight)),
+                        ("tick_count", Some(cluster.count as f64)),
+                    ]),
+                );
+            }
+        }
+    }
+
+    if let Some(by_session) = extract_indicator_payload(source, "tpo_market_profile")
+        .and_then(|payload| payload.get("by_session"))
+        .and_then(Value::as_object)
+    {
+        for window in collect_available_windows(by_session) {
+            let Some(session) = by_session.get(&window).and_then(Value::as_object) else {
+                continue;
+            };
+            push_band_structure(
+                &mut structures,
+                &mut seen,
+                format!("tpo_value_area_{window}"),
+                "tpo_value_area",
+                &window,
+                session.get("tpo_val").and_then(Value::as_f64),
+                session.get("tpo_vah").and_then(Value::as_f64),
+                current_price,
+                current_ts,
+                structure_extras(&[("poc_price", session.get("tpo_poc").and_then(Value::as_f64))]),
+            );
+            push_band_structure(
+                &mut structures,
+                &mut seen,
+                format!("initial_balance_{window}"),
+                "initial_balance",
+                &window,
+                session.get("initial_balance_low").and_then(Value::as_f64),
+                session.get("initial_balance_high").and_then(Value::as_f64),
+                current_price,
+                current_ts,
+                Map::new(),
+            );
+            if let Some(zones) = session
+                .get("tpo_single_print_zones")
+                .and_then(Value::as_array)
+            {
+                for (idx, zone) in zones
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .take(5)
+                    .enumerate()
+                {
+                    push_band_structure(
+                        &mut structures,
+                        &mut seen,
+                        format!("tpo_single_print_zone_{window}_{idx}"),
+                        "tpo_single_print_zone",
+                        &window,
+                        zone.get("low").and_then(Value::as_f64),
+                        zone.get("high").and_then(Value::as_f64),
+                        current_price,
+                        current_ts,
+                        structure_extras(&[("score", zone.get("score").and_then(Value::as_f64))]),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(tpo_payload) = extract_indicator_payload(source, "tpo_market_profile") {
+        push_band_structure(
+            &mut structures,
+            &mut seen,
+            "tpo_value_area_15m".to_string(),
+            "tpo_value_area",
+            "15m",
+            tpo_payload.get("tpo_val").and_then(Value::as_f64),
+            tpo_payload.get("tpo_vah").and_then(Value::as_f64),
+            current_price,
+            current_ts,
+            structure_extras(&[(
+                "poc_price",
+                tpo_payload.get("tpo_poc").and_then(Value::as_f64),
+            )]),
+        );
+        push_band_structure(
+            &mut structures,
+            &mut seen,
+            "initial_balance_15m".to_string(),
+            "initial_balance",
+            "15m",
+            tpo_payload
+                .get("initial_balance_low")
+                .and_then(Value::as_f64),
+            tpo_payload
+                .get("initial_balance_high")
+                .and_then(Value::as_f64),
+            current_price,
+            current_ts,
+            Map::new(),
+        );
+    }
+
+    if let Some(by_window) = kline_derived.as_object() {
+        for window in SCAN_WINDOWS {
+            let Some(window_value) = by_window.get(*window).and_then(Value::as_object) else {
+                continue;
+            };
+            push_band_structure(
+                &mut structures,
+                &mut seen,
+                format!("recent_swing_bracket_{window}"),
+                "recent_swing_bracket",
+                window,
+                window_value.get("swing_low").and_then(Value::as_f64),
+                window_value.get("swing_high").and_then(Value::as_f64),
+                current_price,
+                current_ts,
+                Map::new(),
+            );
+        }
+    }
+
+    if let Some(by_window) = extract_indicator_payload(source, "rvwap_sigma_bands")
+        .and_then(|payload| payload.get("by_window"))
+        .and_then(Value::as_object)
+    {
+        for window in collect_available_windows(by_window) {
+            let Some(window_value) = by_window.get(&window).and_then(Value::as_object) else {
+                continue;
+            };
+            push_band_structure(
+                &mut structures,
+                &mut seen,
+                format!("rvwap_sigma1_{window}"),
+                "rvwap_sigma1",
+                &window,
+                window_value
+                    .get("rvwap_band_minus_1")
+                    .and_then(Value::as_f64),
+                window_value
+                    .get("rvwap_band_plus_1")
+                    .and_then(Value::as_f64),
+                current_price,
+                current_ts,
+                structure_extras(&[(
+                    "rvwap_center",
+                    window_value.get("rvwap_w").and_then(Value::as_f64),
+                )]),
+            );
+            push_band_structure(
+                &mut structures,
+                &mut seen,
+                format!("rvwap_sigma2_{window}"),
+                "rvwap_sigma2",
+                &window,
+                window_value
+                    .get("rvwap_band_minus_2")
+                    .and_then(Value::as_f64),
+                window_value
+                    .get("rvwap_band_plus_2")
+                    .and_then(Value::as_f64),
+                current_price,
+                current_ts,
+                structure_extras(&[(
+                    "rvwap_center",
+                    window_value.get("rvwap_w").and_then(Value::as_f64),
+                )]),
+            );
+        }
+    }
+
+    if let Some(by_window) = extract_indicator_payload(source, "fvg")
+        .and_then(|payload| payload.get("by_window"))
+        .and_then(Value::as_object)
+    {
+        for window in collect_available_windows(by_window) {
+            let Some(window_value) = by_window.get(&window).and_then(Value::as_object) else {
+                continue;
+            };
+            for (field, side) in [("active_bull_fvgs", "bull"), ("active_bear_fvgs", "bear")] {
+                if let Some(items) = window_value.get(field).and_then(Value::as_array) {
+                    for (idx, fvg) in items
+                        .iter()
+                        .filter_map(Value::as_object)
+                        .take(5)
+                        .enumerate()
+                    {
+                        push_band_structure(
+                            &mut structures,
+                            &mut seen,
+                            format!("fvg_boundary_{window}_{field}_{idx}"),
+                            "fvg_boundary",
+                            &window,
+                            fvg.get("lower")
+                                .or_else(|| fvg.get("fvg_bottom"))
+                                .and_then(Value::as_f64),
+                            fvg.get("upper")
+                                .or_else(|| fvg.get("fvg_top"))
+                                .and_then(Value::as_f64),
+                            current_price,
+                            current_ts,
+                            structure_extras_with_text(
+                                &[
+                                    ("side", side),
+                                    (
+                                        "state",
+                                        fvg.get("state")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or_default(),
+                                    ),
+                                ],
+                                &[
+                                    (
+                                        "touch_count",
+                                        fvg.get("touch_count").and_then(Value::as_f64),
+                                    ),
+                                    ("age_bars", fvg.get("age_bars").and_then(Value::as_f64)),
+                                    ("fill_pct", fvg.get("fill_pct").and_then(Value::as_f64)),
+                                ],
+                            ),
+                        );
+                    }
+                }
+            }
+            for field in ["nearest_bull_fvg", "nearest_bear_fvg"] {
+                if let Some(fvg) = window_value.get(field).and_then(Value::as_object) {
+                    let side = fvg
+                        .get("side")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    push_band_structure(
+                        &mut structures,
+                        &mut seen,
+                        format!("fvg_boundary_{window}_{field}"),
+                        "fvg_boundary",
+                        &window,
+                        fvg.get("lower")
+                            .or_else(|| fvg.get("fvg_bottom"))
+                            .and_then(Value::as_f64),
+                        fvg.get("upper")
+                            .or_else(|| fvg.get("fvg_top"))
+                            .and_then(Value::as_f64),
+                        current_price,
+                        current_ts,
+                        structure_extras_with_text(
+                            &[
+                                ("side", side.as_str()),
+                                (
+                                    "state",
+                                    fvg.get("state").and_then(Value::as_str).unwrap_or_default(),
+                                ),
+                            ],
+                            &[
+                                (
+                                    "touch_count",
+                                    fvg.get("touch_count").and_then(Value::as_f64),
+                                ),
+                                ("age_bars", fvg.get("age_bars").and_then(Value::as_f64)),
+                                ("fill_pct", fvg.get("fill_pct").and_then(Value::as_f64)),
+                            ],
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    for event in collect_absorption_events(source, current_price, current_ts) {
+        let scope = event.scope.as_deref().unwrap_or("15m");
+        let reference_ts = event
+            .confirm_ts
+            .as_deref()
+            .or(event.event_end_ts.as_deref())
+            .or(event.event_start_ts.as_deref())
+            .and_then(parse_rfc3339_utc);
+        push_band_structure(
+            &mut structures,
+            &mut seen,
+            format!(
+                "absorption_zone_{}_{}_{}",
+                scope,
+                event.direction,
+                event
+                    .confirm_ts
+                    .as_deref()
+                    .or(event.event_start_ts.as_deref())
+                    .unwrap_or("na")
+            ),
+            "absorption_zone",
+            scope,
+            event.price_low.or(event.pivot_price),
+            event.price_high.or(event.pivot_price),
+            current_price,
+            reference_ts.as_ref().or(current_ts),
+            structure_extras_with_text(
+                &[
+                    ("direction", event.direction.as_str()),
+                    ("event_type", event.event_type.as_str()),
+                ],
+                &[
+                    ("score", event.score),
+                    ("age_minutes", event.age_minutes.map(|value| value as f64)),
+                    ("event_count", Some(event.event_count as f64)),
+                ],
+            ),
+        );
+    }
+
+    let footprint_filtered = source
+        .get("footprint")
+        .and_then(|indicator| indicator.get("payload"))
+        .map(|payload| filter_footprint_with_price(payload, current_price))
+        .unwrap_or(Value::Null);
+    if let Some(by_window) = footprint_filtered
+        .get("by_window")
+        .and_then(Value::as_object)
+    {
+        for window in collect_available_windows(by_window) {
+            let Some(window_value) = by_window.get(&window).and_then(Value::as_object) else {
+                continue;
+            };
+            for (cluster_field, kind) in [
+                ("buy_imb_clusters", "footprint_price_cluster"),
+                ("sell_imb_clusters", "footprint_price_cluster"),
+            ] {
+                if let Some(cluster_groups) =
+                    window_value.get(cluster_field).and_then(Value::as_object)
+                {
+                    for side in ["below", "above"] {
+                        if let Some(items) = cluster_groups.get(side).and_then(Value::as_array) {
+                            for (idx, item) in items.iter().filter_map(Value::as_object).enumerate()
+                            {
+                                let price_low = item
+                                    .get("price_low")
+                                    .or_else(|| item.get("p"))
+                                    .and_then(Value::as_f64);
+                                let price_high = item
+                                    .get("price_high")
+                                    .or_else(|| item.get("p"))
+                                    .and_then(Value::as_f64);
+                                if price_low.is_some() && price_high.is_some() {
+                                    push_band_structure(
+                                        &mut structures,
+                                        &mut seen,
+                                        format!("{kind}_{window}_{cluster_field}_{side}_{idx}"),
+                                        kind,
+                                        &window,
+                                        price_low,
+                                        price_high,
+                                        current_price,
+                                        current_ts,
+                                        structure_extras(&[(
+                                            "touch_count",
+                                            item.get("n").and_then(Value::as_f64),
+                                        )]),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let orderbook_filtered = filter_orderbook_depth(
+        source
+            .get("orderbook_depth")
+            .and_then(|indicator| indicator.get("payload"))
+            .unwrap_or(&Value::Null),
+        current_price,
+    );
+    if let Some(clusters) = orderbook_filtered
+        .get("level_clusters")
+        .and_then(Value::as_object)
+    {
+        for (field, side) in [("bid_clusters", "bid"), ("ask_clusters", "ask")] {
+            if let Some(items) = clusters.get(field).and_then(Value::as_array) {
+                for (idx, item) in items.iter().filter_map(Value::as_object).enumerate() {
+                    let price_low = item
+                        .get("price_low")
+                        .or_else(|| item.get("p"))
+                        .and_then(Value::as_f64);
+                    let price_high = item
+                        .get("price_high")
+                        .or_else(|| item.get("p"))
+                        .and_then(Value::as_f64);
+                    if price_low.is_some() && price_high.is_some() {
+                        push_band_structure(
+                            &mut structures,
+                            &mut seen,
+                            format!("orderbook_depth_cluster_{side}_{idx}"),
+                            "orderbook_depth_cluster",
+                            "15m",
+                            price_low,
+                            price_high,
+                            current_price,
+                            current_ts,
+                            structure_extras(&[
+                                (
+                                    "volume_quote",
+                                    item.get("volume_quote").and_then(Value::as_f64),
+                                ),
+                                ("order_count", item.get("n").and_then(Value::as_f64)),
+                            ]),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if let Some(walls) = orderbook_filtered
+        .get("liquidity_walls")
+        .and_then(Value::as_object)
+    {
+        for (field, kind) in [
+            ("bid_walls", "orderbook_wall_band"),
+            ("ask_walls", "orderbook_wall_band"),
+        ] {
+            if let Some(items) = walls.get(field).and_then(Value::as_array) {
+                for (idx, item) in items
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .take(5)
+                    .enumerate()
+                {
+                    if let Some(price) = item.get("price_level").and_then(Value::as_f64) {
+                        push_point_structure(
+                            &mut structures,
+                            &mut seen,
+                            format!("{kind}_{field}_{idx}"),
+                            kind,
+                            "15m",
+                            price,
+                            current_price,
+                            current_ts,
+                            structure_extras(&[
+                                (
+                                    "volume_quote",
+                                    item.get("total_liquidity").and_then(Value::as_f64),
+                                ),
+                                (
+                                    "distance_pct",
+                                    item.get("distance_pct").and_then(Value::as_f64),
+                                ),
+                            ]),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(by_window) = extract_indicator_payload(source, "liquidation_density")
+        .and_then(|payload| payload.get("by_window"))
+        .and_then(Value::as_object)
+    {
+        for window in collect_available_windows(by_window) {
+            let Some(window_value) = by_window.get(&window).and_then(Value::as_object) else {
+                continue;
+            };
+            if let Some(peaks) = window_value.get("peak_levels").and_then(Value::as_array) {
+                for (idx, peak) in peaks
+                    .iter()
+                    .filter_map(Value::as_object)
+                    .take(5)
+                    .enumerate()
+                {
+                    if let Some(price) = peak
+                        .get("price_level")
+                        .or_else(|| peak.get("price"))
+                        .and_then(Value::as_f64)
+                    {
+                        push_point_structure(
+                            &mut structures,
+                            &mut seen,
+                            format!("liquidation_density_zone_{window}_{idx}"),
+                            "liquidation_density_zone",
+                            &window,
+                            price,
+                            current_price,
+                            current_ts,
+                            structure_extras(&[
+                                ("long_density", peak.get("long_liq").and_then(Value::as_f64)),
+                                (
+                                    "short_density",
+                                    peak.get("short_liq").and_then(Value::as_f64),
+                                ),
+                                (
+                                    "volume_quote",
+                                    peak.get("total_liq").and_then(Value::as_f64),
+                                ),
+                            ]),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    structures.sort_by(|left, right| {
+        structure_distance_key(left)
+            .partial_cmp(&structure_distance_key(right))
+            .unwrap_or(Ordering::Equal)
+    });
+    structures
+}
+
+fn collect_available_windows(by_window: &Map<String, Value>) -> Vec<String> {
+    let mut ordered = Vec::new();
+    for window in SCAN_CONTEXT_WINDOWS {
+        if by_window.contains_key(*window) {
+            ordered.push((*window).to_string());
+        }
+    }
+    for key in by_window.keys() {
+        if !ordered.iter().any(|existing| existing == key) {
+            ordered.push(key.clone());
+        }
+    }
+    ordered
+}
+
+fn push_band_structure(
+    target: &mut Vec<Value>,
+    seen: &mut BTreeSet<String>,
+    structure_id: String,
+    source_kind: &str,
+    source_window: &str,
+    price_low: Option<f64>,
+    price_high: Option<f64>,
+    current_price: Option<f64>,
+    current_ts: Option<&DateTime<Utc>>,
+    extras: Map<String, Value>,
+) {
+    let (Some(price_low), Some(price_high)) = (price_low, price_high) else {
+        return;
+    };
+    if !price_low.is_finite() || !price_high.is_finite() {
+        return;
+    }
+    if !seen.insert(structure_id.clone()) {
+        return;
+    }
+    let low = price_low.min(price_high);
+    let high = price_low.max(price_high);
+    let mid = (low + high) / 2.0;
+    let mut value = Map::new();
+    value.insert("structure_id".to_string(), Value::String(structure_id));
+    value.insert(
+        "source_kind".to_string(),
+        Value::String(source_kind.to_string()),
+    );
+    value.insert(
+        "source_window".to_string(),
+        Value::String(source_window.to_string()),
+    );
+    value.insert("price_low".to_string(), Value::from(round2(low)));
+    value.insert("price_high".to_string(), Value::from(round2(high)));
+    value.insert("price_mid".to_string(), Value::from(round2(mid)));
+    if let Some(current_price) = current_price {
+        value.insert(
+            "distance_to_low".to_string(),
+            Value::from(round2(low - current_price)),
+        );
+        value.insert(
+            "distance_to_high".to_string(),
+            Value::from(round2(high - current_price)),
+        );
+        value.insert(
+            "distance_to_mid".to_string(),
+            Value::from(round2(mid - current_price)),
+        );
+    }
+    if let Some(current_ts) = current_ts {
+        value.insert(
+            "reference_ts".to_string(),
+            Value::String(current_ts.to_rfc3339()),
+        );
+    }
+    for (key, field) in extras {
+        value.insert(key, field);
+    }
+    target.push(Value::Object(value));
+}
+
+fn push_point_structure(
+    target: &mut Vec<Value>,
+    seen: &mut BTreeSet<String>,
+    structure_id: String,
+    source_kind: &str,
+    source_window: &str,
+    price: f64,
+    current_price: Option<f64>,
+    current_ts: Option<&DateTime<Utc>>,
+    extras: Map<String, Value>,
+) {
+    push_band_structure(
+        target,
+        seen,
+        structure_id,
+        source_kind,
+        source_window,
+        Some(price),
+        Some(price),
+        current_price,
+        current_ts,
+        extras,
+    );
+}
+
+fn structure_extras(fields: &[(&str, Option<f64>)]) -> Map<String, Value> {
+    let mut map = Map::new();
+    for (key, value) in fields {
+        if let Some(value) = value.filter(|value| value.is_finite()) {
+            map.insert((*key).to_string(), Value::from(round3_or_2(*key, value)));
+        }
+    }
+    map
+}
+
+fn structure_extras_with_text(
+    text_fields: &[(&str, &str)],
+    numeric_fields: &[(&str, Option<f64>)],
+) -> Map<String, Value> {
+    let mut map = structure_extras(numeric_fields);
+    for (key, value) in text_fields {
+        if !value.is_empty() {
+            map.insert((*key).to_string(), Value::String((*value).to_string()));
+        }
+    }
+    map
+}
+
+fn round3_or_2(key: &str, value: f64) -> f64 {
+    if key.contains("ratio")
+        || key.contains("pct")
+        || key.contains("zscore")
+        || key.contains("score")
+        || key.contains("share")
+        || key.contains("gap")
+    {
+        round3(value)
+    } else {
+        round2(value)
+    }
+}
+
+fn structure_distance_key(value: &Value) -> f64 {
+    value
+        .get("distance_to_mid")
+        .and_then(Value::as_f64)
+        .map(|value| value.abs())
+        .unwrap_or(f64::INFINITY)
+}
+
+fn build_raw_overflow_price_structures(
+    raw_price_structures: &[Value],
+    current_price: Option<f64>,
+) -> Vec<Value> {
+    let filtered = limit_absorption_structures_for_overflow(raw_price_structures);
+    let mut zones = aggregate_raw_structure_zones(&filtered, current_price);
+    zones = retain_raw_overflow_zones(zones, current_price);
+    zones
+        .into_iter()
+        .map(|zone| raw_structure_zone_to_value(zone, current_price))
+        .collect()
+}
+
+fn limit_absorption_structures_for_overflow(raw_price_structures: &[Value]) -> Vec<Value> {
+    let mut retained = Vec::new();
+    let mut absorption_by_bucket: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+
+    for structure in raw_price_structures {
+        let Some(object) = structure.as_object() else {
+            continue;
+        };
+        let kind = object
+            .get("source_kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if kind != "absorption_zone" {
+            retained.push(structure.clone());
+            continue;
+        }
+        let scope = object
+            .get("source_window")
+            .and_then(Value::as_str)
+            .unwrap_or("15m");
+        let direction = object
+            .get("direction")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        let key = format!("{scope}:{direction}");
+        absorption_by_bucket
+            .entry(key)
+            .or_default()
+            .push(structure.clone());
+    }
+
+    for (_, mut bucket) in absorption_by_bucket {
+        bucket.sort_by(compare_absorption_overflow_priority);
+        bucket.truncate(RAW_OVERFLOW_ABSORPTION_MAX_PER_SCOPE_DIRECTION);
+        retained.extend(bucket);
+    }
+
+    retained
+}
+
+fn compare_absorption_overflow_priority(left: &Value, right: &Value) -> Ordering {
+    let left_score = left
+        .get("score")
+        .and_then(Value::as_f64)
+        .unwrap_or_default();
+    let right_score = right
+        .get("score")
+        .and_then(Value::as_f64)
+        .unwrap_or_default();
+    right_score
+        .partial_cmp(&left_score)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| compare_value_timestamps_desc(left, right))
+}
+
+fn compare_value_timestamps_desc(left: &Value, right: &Value) -> Ordering {
+    let left_ts = left
+        .get("reference_ts")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339_utc);
+    let right_ts = right
+        .get("reference_ts")
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339_utc);
+    right_ts.cmp(&left_ts)
+}
+
+fn aggregate_raw_structure_zones(
+    raw_price_structures: &[Value],
+    current_price: Option<f64>,
+) -> Vec<RawStructureZone> {
+    let mut bucketed: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+
+    for structure in raw_price_structures {
+        let Some(object) = structure.as_object() else {
+            continue;
+        };
+        let Some(source_kind) = object.get("source_kind").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(source_window) = object.get("source_window").and_then(Value::as_str) else {
+            continue;
+        };
+        let direction = object
+            .get("direction")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let side = object
+            .get("side")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let state = object
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let event_type = object
+            .get("event_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let key = format!(
+            "{}|{}|{}|{}|{}|{}",
+            source_kind, source_window, direction, side, state, event_type
+        );
+        bucketed.entry(key).or_default().push(structure.clone());
+    }
+
+    let mut zones = Vec::new();
+    for (_, mut bucket) in bucketed {
+        bucket.sort_by(|left, right| {
+            raw_structure_mid(left)
+                .partial_cmp(&raw_structure_mid(right))
+                .unwrap_or(Ordering::Equal)
+        });
+
+        let threshold = raw_overflow_aggregation_threshold(current_price, &bucket);
+        let mut bucket_zones: Vec<RawStructureZone> = Vec::new();
+
+        for structure in bucket {
+            let Some(object) = structure.as_object() else {
+                continue;
+            };
+            let Some(price_low) = object.get("price_low").and_then(Value::as_f64) else {
+                continue;
+            };
+            let Some(price_high) = object.get("price_high").and_then(Value::as_f64) else {
+                continue;
+            };
+            let source_kind = object
+                .get("source_kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let source_window = object
+                .get("source_window")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let direction = object
+                .get("direction")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let side = object
+                .get("side")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let state = object
+                .get("state")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let event_type = object
+                .get("event_type")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let price_mid = raw_structure_mid(&structure);
+            let score = object
+                .get("score")
+                .and_then(Value::as_f64)
+                .unwrap_or_default();
+            let touch_count = object
+                .get("touch_count")
+                .and_then(Value::as_f64)
+                .or_else(|| object.get("event_count").and_then(Value::as_f64))
+                .unwrap_or_default();
+            let reference_ts = object
+                .get("reference_ts")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let representative_direction = infer_raw_structure_direction(object);
+
+            if let Some(last) = bucket_zones.last_mut() {
+                let within_threshold = price_mid
+                    .zip(Some(raw_structure_zone_mid(last)))
+                    .is_some_and(|(mid, zone_mid)| (mid - zone_mid).abs() <= threshold);
+                if within_threshold {
+                    last.count += 1;
+                    last.price_low = last.price_low.min(price_low);
+                    last.price_high = last.price_high.max(price_high);
+                    last.max_score = last.max_score.max(score);
+                    last.total_touch_count += touch_count;
+                    merge_option_timestamp_max(&mut last.reference_ts_latest, reference_ts);
+                    last.representative_direction = merge_representative_direction(
+                        &last.representative_direction,
+                        &representative_direction,
+                    );
+                    continue;
+                }
+            }
+
+            bucket_zones.push(RawStructureZone {
+                source_kind,
+                source_window,
+                direction,
+                side,
+                state,
+                event_type,
+                count: 1,
+                price_low,
+                price_high,
+                max_score: score,
+                total_touch_count: touch_count,
+                reference_ts_latest: reference_ts,
+                representative_direction,
+            });
+        }
+
+        zones.extend(bucket_zones);
+    }
+
+    zones
+}
+
+fn raw_overflow_aggregation_threshold(current_price: Option<f64>, bucket: &[Value]) -> f64 {
+    let reference = current_price
+        .or_else(|| bucket.iter().find_map(raw_structure_mid))
+        .unwrap_or(1.0)
+        .abs()
+        .max(1e-9);
+    reference * (RAW_OVERFLOW_AGGREGATION_PCT / 100.0)
+}
+
+fn raw_structure_mid(value: &Value) -> Option<f64> {
+    value.get("price_mid").and_then(Value::as_f64).or_else(|| {
+        match (
+            value.get("price_low").and_then(Value::as_f64),
+            value.get("price_high").and_then(Value::as_f64),
+        ) {
+            (Some(low), Some(high)) => Some((low + high) / 2.0),
+            _ => None,
+        }
+    })
+}
+
+fn raw_structure_zone_mid(zone: &RawStructureZone) -> f64 {
+    (zone.price_low + zone.price_high) / 2.0
+}
+
+fn infer_raw_structure_direction(object: &Map<String, Value>) -> String {
+    if let Some(direction) = object.get("direction").and_then(Value::as_str) {
+        return normalize_direction_label(direction);
+    }
+    if let Some(side) = object.get("side").and_then(Value::as_str) {
+        return normalize_direction_label(side);
+    }
+    "none".to_string()
+}
+
+fn normalize_direction_label(label: &str) -> String {
+    let normalized = label.to_ascii_lowercase();
+    if normalized.contains("bull") || normalized == "buy" || normalized == "bid" {
+        "bullish".to_string()
+    } else if normalized.contains("bear") || normalized == "sell" || normalized == "ask" {
+        "bearish".to_string()
+    } else {
+        "none".to_string()
+    }
+}
+
+fn merge_representative_direction(existing: &str, incoming: &str) -> String {
+    if existing == incoming {
+        return existing.to_string();
+    }
+    if existing == "none" {
+        return incoming.to_string();
+    }
+    if incoming == "none" {
+        return existing.to_string();
+    }
+    "mixed".to_string()
+}
+
+fn retain_raw_overflow_zones(
+    zones: Vec<RawStructureZone>,
+    current_price: Option<f64>,
+) -> Vec<RawStructureZone> {
+    let mut near = Vec::new();
+    let mut mid = Vec::new();
+    let mut far = Vec::new();
+
+    for zone in zones {
+        match classify_raw_overflow_distance_layer(&zone, current_price) {
+            RawOverflowDistanceLayer::Near => near.push(zone),
+            RawOverflowDistanceLayer::Mid => mid.push(zone),
+            RawOverflowDistanceLayer::Far => far.push(zone),
+        }
+    }
+
+    near.sort_by(|left, right| compare_near_zone_priority(left, right, current_price));
+    mid.sort_by(|left, right| compare_mid_zone_priority(left, right, current_price));
+    far = retain_far_zones(far, current_price);
+
+    near.truncate(RAW_OVERFLOW_NEAR_MAX_ZONES);
+    mid.truncate(RAW_OVERFLOW_MID_MAX_ZONES);
+
+    let mut retained = Vec::new();
+    retained.extend(near);
+    retained.extend(mid);
+    retained.extend(far);
+    retained
+}
+
+#[derive(Clone, Copy)]
+enum RawOverflowDistanceLayer {
+    Near,
+    Mid,
+    Far,
+}
+
+fn classify_raw_overflow_distance_layer(
+    zone: &RawStructureZone,
+    current_price: Option<f64>,
+) -> RawOverflowDistanceLayer {
+    let distance_pct = raw_structure_zone_distance_pct(zone, current_price)
+        .map(f64::abs)
+        .unwrap_or_default();
+    if distance_pct <= 0.30 {
+        RawOverflowDistanceLayer::Near
+    } else if distance_pct <= 1.00 {
+        RawOverflowDistanceLayer::Mid
+    } else {
+        RawOverflowDistanceLayer::Far
+    }
+}
+
+fn raw_structure_zone_distance_pct(
+    zone: &RawStructureZone,
+    current_price: Option<f64>,
+) -> Option<f64> {
+    pct_delta(Some(raw_structure_zone_mid(zone)), current_price).map(round2)
+}
+
+fn compare_near_zone_priority(
+    left: &RawStructureZone,
+    right: &RawStructureZone,
+    current_price: Option<f64>,
+) -> Ordering {
+    let left_dist = raw_structure_zone_distance_pct(left, current_price)
+        .map(f64::abs)
+        .unwrap_or(f64::INFINITY);
+    let right_dist = raw_structure_zone_distance_pct(right, current_price)
+        .map(f64::abs)
+        .unwrap_or(f64::INFINITY);
+    left_dist
+        .partial_cmp(&right_dist)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| {
+            right
+                .max_score
+                .partial_cmp(&left.max_score)
+                .unwrap_or(Ordering::Equal)
+        })
+        .then_with(|| {
+            right
+                .total_touch_count
+                .partial_cmp(&left.total_touch_count)
+                .unwrap_or(Ordering::Equal)
+        })
+        .then_with(|| right.count.cmp(&left.count))
+}
+
+fn compare_mid_zone_priority(
+    left: &RawStructureZone,
+    right: &RawStructureZone,
+    current_price: Option<f64>,
+) -> Ordering {
+    right
+        .max_score
+        .partial_cmp(&left.max_score)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| {
+            right
+                .total_touch_count
+                .partial_cmp(&left.total_touch_count)
+                .unwrap_or(Ordering::Equal)
+        })
+        .then_with(|| right.count.cmp(&left.count))
+        .then_with(|| {
+            let left_dist = raw_structure_zone_distance_pct(left, current_price)
+                .map(f64::abs)
+                .unwrap_or(f64::INFINITY);
+            let right_dist = raw_structure_zone_distance_pct(right, current_price)
+                .map(f64::abs)
+                .unwrap_or(f64::INFINITY);
+            left_dist
+                .partial_cmp(&right_dist)
+                .unwrap_or(Ordering::Equal)
+        })
+}
+
+fn retain_far_zones(
+    zones: Vec<RawStructureZone>,
+    current_price: Option<f64>,
+) -> Vec<RawStructureZone> {
+    let mut absorption = Vec::new();
+    let mut others = Vec::new();
+
+    for zone in zones
+        .into_iter()
+        .filter(|zone| raw_overflow_far_zone_allowed(zone))
+    {
+        if zone.source_kind == "absorption_zone" {
+            if zone.max_score >= RAW_OVERFLOW_FAR_ABSORPTION_SCORE_MIN {
+                absorption.push(zone);
+            }
+        } else {
+            others.push(zone);
+        }
+    }
+
+    absorption.sort_by(|left, right| {
+        right
+            .max_score
+            .partial_cmp(&left.max_score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| compare_age_minutes_for_zone(left, right))
+            .then_with(|| {
+                let left_dist = raw_structure_zone_distance_pct(left, current_price)
+                    .map(f64::abs)
+                    .unwrap_or(f64::INFINITY);
+                let right_dist = raw_structure_zone_distance_pct(right, current_price)
+                    .map(f64::abs)
+                    .unwrap_or(f64::INFINITY);
+                left_dist
+                    .partial_cmp(&right_dist)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+    absorption.truncate(RAW_OVERFLOW_FAR_ABSORPTION_MAX_ZONES);
+
+    others.sort_by(|left, right| compare_mid_zone_priority(left, right, current_price));
+
+    let remaining = RAW_OVERFLOW_FAR_MAX_ZONES.saturating_sub(absorption.len());
+    others.truncate(remaining);
+
+    let mut far = Vec::new();
+    far.extend(others);
+    far.extend(absorption);
+    far.sort_by(|left, right| compare_mid_zone_priority(left, right, current_price));
+    far
+}
+
+fn raw_overflow_far_zone_allowed(zone: &RawStructureZone) -> bool {
+    matches!(
+        zone.source_kind.as_str(),
+        "fvg_boundary"
+            | "recent_swing_bracket"
+            | "pvs_value_area"
+            | "tpo_value_area"
+            | "orderbook_wall_band"
+            | "liquidation_density_zone"
+            | "absorption_zone"
+    )
+}
+
+fn compare_age_minutes_for_zone(left: &RawStructureZone, right: &RawStructureZone) -> Ordering {
+    let left_age = left
+        .reference_ts_latest
+        .as_deref()
+        .and_then(parse_rfc3339_utc);
+    let right_age = right
+        .reference_ts_latest
+        .as_deref()
+        .and_then(parse_rfc3339_utc);
+    right_age.cmp(&left_age)
+}
+
+fn raw_structure_zone_to_value(zone: RawStructureZone, current_price: Option<f64>) -> Value {
+    let mut value = Map::new();
+    let price_mid = raw_structure_zone_mid(&zone);
+    value.insert("source_kind".to_string(), Value::String(zone.source_kind));
+    value.insert(
+        "source_window".to_string(),
+        Value::String(zone.source_window),
+    );
+    value.insert("count".to_string(), Value::from(zone.count as u64));
+    value.insert("price_low".to_string(), Value::from(round2(zone.price_low)));
+    value.insert(
+        "price_high".to_string(),
+        Value::from(round2(zone.price_high)),
+    );
+    value.insert("price_mid".to_string(), Value::from(round2(price_mid)));
+    if let Some(distance_to_mid_pct) = pct_delta(Some(price_mid), current_price).map(round2) {
+        value.insert(
+            "distance_to_mid_pct".to_string(),
+            Value::from(distance_to_mid_pct),
+        );
+    }
+    if let Some(reference_ts_latest) = zone.reference_ts_latest {
+        value.insert(
+            "reference_ts_latest".to_string(),
+            Value::String(reference_ts_latest),
+        );
+    }
+    if let Some(direction) = zone.direction.filter(|direction| !direction.is_empty()) {
+        value.insert("direction".to_string(), Value::String(direction));
+    }
+    if let Some(side) = zone.side.filter(|side| !side.is_empty()) {
+        value.insert("side".to_string(), Value::String(side));
+    }
+    if let Some(state) = zone.state.filter(|state| !state.is_empty()) {
+        value.insert("state".to_string(), Value::String(state));
+    }
+    if let Some(event_type) = zone.event_type.filter(|event_type| !event_type.is_empty()) {
+        value.insert("event_type".to_string(), Value::String(event_type));
+    }
+    value.insert("max_score".to_string(), Value::from(round3(zone.max_score)));
+    value.insert(
+        "total_touch_count".to_string(),
+        Value::from(round2(zone.total_touch_count)),
+    );
+    value.insert(
+        "representative_direction".to_string(),
+        Value::String(zone.representative_direction),
+    );
+    Value::Object(value)
+}
+
+fn build_price_levels(
+    source: &Map<String, Value>,
+    current_price: Option<f64>,
+    current_ts: Option<&DateTime<Utc>>,
+) -> Vec<Value> {
+    let mut levels = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    if let Some(by_window) = extract_indicator_payload(source, "price_volume_structure")
+        .and_then(|payload| payload.get("by_window"))
+        .and_then(Value::as_object)
+    {
+        for window in collect_available_windows(by_window) {
+            let Some(window_value) = by_window.get(&window).and_then(Value::as_object) else {
+                continue;
+            };
+            push_price_level(
+                &mut levels,
+                &mut seen,
+                window_value.get("poc_price").and_then(Value::as_f64),
+                current_price,
+                &[format!("pvs_poc_{window}")],
+                current_ts,
+                level_extras(&[(
+                    "poc_volume",
+                    window_value.get("poc_volume").and_then(Value::as_f64),
+                )]),
+            );
+        }
+    }
+
+    if let Some(by_session) = extract_indicator_payload(source, "tpo_market_profile")
+        .and_then(|payload| payload.get("by_session"))
+        .and_then(Value::as_object)
+    {
+        for window in collect_available_windows(by_session) {
+            let Some(session) = by_session.get(&window).and_then(Value::as_object) else {
+                continue;
+            };
+            push_price_level(
+                &mut levels,
+                &mut seen,
+                session.get("tpo_poc").and_then(Value::as_f64),
+                current_price,
+                &[format!("tpo_poc_{window}")],
+                current_ts,
+                Map::new(),
+            );
+        }
+    }
+
+    if let Some(tpo_payload) = extract_indicator_payload(source, "tpo_market_profile") {
+        push_price_level(
+            &mut levels,
+            &mut seen,
+            tpo_payload.get("tpo_poc").and_then(Value::as_f64),
+            current_price,
+            &[String::from("tpo_poc_15m")],
+            current_ts,
+            Map::new(),
+        );
+    }
+
+    if let Some(payload) = extract_indicator_payload(source, "ema_trend_regime") {
+        for field in ["ema_13", "ema_21", "ema_34"] {
+            push_price_level(
+                &mut levels,
+                &mut seen,
+                payload.get(field).and_then(Value::as_f64),
+                current_price,
+                &[field.to_string()],
+                current_ts,
+                Map::new(),
+            );
+        }
+        if let Some(ema_100_htf) = payload.get("ema_100_htf").and_then(Value::as_object) {
+            for window in ["4h", "1d"] {
+                push_price_level(
+                    &mut levels,
+                    &mut seen,
+                    ema_100_htf.get(window).and_then(Value::as_f64),
+                    current_price,
+                    &[format!("ema_100_htf_{window}")],
+                    current_ts,
+                    Map::new(),
+                );
+            }
+        }
+        if let Some(ema_200_htf) = payload.get("ema_200_htf").and_then(Value::as_object) {
+            for window in ["4h", "1d"] {
+                push_price_level(
+                    &mut levels,
+                    &mut seen,
+                    ema_200_htf.get(window).and_then(Value::as_f64),
+                    current_price,
+                    &[format!("ema_200_htf_{window}")],
+                    current_ts,
+                    Map::new(),
+                );
+            }
+        }
+    }
+
+    if let Some(payload) = extract_indicator_payload(source, "avwap") {
+        for field in ["avwap_fut", "avwap_spot"] {
+            push_price_level(
+                &mut levels,
+                &mut seen,
+                payload.get(field).and_then(Value::as_f64),
+                current_price,
+                &[field.to_string()],
+                current_ts,
+                Map::new(),
+            );
+        }
+        if let Some(series_by_window) = payload.get("series_by_window").and_then(Value::as_object) {
+            for window in ["15m", "4h", "1d"] {
+                if let Some(last) = series_by_window
+                    .get(window)
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.last())
+                    .and_then(Value::as_object)
+                {
+                    push_price_level(
+                        &mut levels,
+                        &mut seen,
+                        last.get("avwap_fut").and_then(Value::as_f64),
+                        current_price,
+                        &[format!("avwap_fut_{window}")],
+                        last.get("ts")
+                            .and_then(Value::as_str)
+                            .and_then(parse_rfc3339_utc)
+                            .as_ref(),
+                        Map::new(),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Some(payload) = extract_indicator_payload(source, "high_volume_pulse") {
+        if let Some(by_window) = payload
+            .get("intrabar_poc_max_by_window")
+            .and_then(Value::as_object)
+        {
+            for window in collect_available_windows(by_window) {
+                let Some(entry) = by_window.get(&window).and_then(Value::as_object) else {
+                    continue;
+                };
+                let ref_ts = entry
+                    .get("ts")
+                    .and_then(Value::as_str)
+                    .and_then(parse_rfc3339_utc);
+                push_price_level(
+                    &mut levels,
+                    &mut seen,
+                    entry.get("intrabar_poc_price").and_then(Value::as_f64),
+                    current_price,
+                    &[format!("intrabar_poc_{window}")],
+                    ref_ts.as_ref(),
+                    level_extras(&[(
+                        "poc_volume",
+                        entry.get("intrabar_poc_volume").and_then(Value::as_f64),
+                    )]),
+                );
+            }
+        }
+    }
+
+    if let Some(payload) = extract_indicator_payload(source, "orderbook_depth") {
+        if let Some(heatmap) = payload
+            .get("heatmap_summary_fut")
+            .and_then(Value::as_object)
+        {
+            for (field, source_name) in [
+                ("peak_bid", "heatmap_peak_bid"),
+                ("peak_ask", "heatmap_peak_ask"),
+                ("peak_total", "heatmap_peak_total"),
+            ] {
+                if let Some(peak) = heatmap.get(field).and_then(Value::as_object) {
+                    push_price_level(
+                        &mut levels,
+                        &mut seen,
+                        peak.get("price_level").and_then(Value::as_f64),
+                        current_price,
+                        &[source_name.to_string()],
+                        current_ts,
+                        level_extras(&[(
+                            "volume_quote",
+                            peak.get("total_liquidity")
+                                .or_else(|| peak.get("bid_liquidity"))
+                                .or_else(|| peak.get("ask_liquidity"))
+                                .and_then(Value::as_f64),
+                        )]),
+                    );
+                }
+            }
+        }
+    }
+
+    levels.sort_by(|left, right| {
+        left.get("distance_to_current")
+            .and_then(Value::as_f64)
+            .map(|value| value.abs())
+            .unwrap_or(f64::INFINITY)
+            .partial_cmp(
+                &right
+                    .get("distance_to_current")
+                    .and_then(Value::as_f64)
+                    .map(|value| value.abs())
+                    .unwrap_or(f64::INFINITY),
+            )
+            .unwrap_or(Ordering::Equal)
+    });
+    levels
+}
+
+fn push_price_level(
+    target: &mut Vec<Value>,
+    seen: &mut BTreeSet<String>,
+    price: Option<f64>,
+    current_price: Option<f64>,
+    sources: &[String],
+    current_ts: Option<&DateTime<Utc>>,
+    extras: Map<String, Value>,
+) {
+    let Some(price) = price.filter(|price| price.is_finite()) else {
+        return;
+    };
+    let dedupe_key = format!("{:.2}|{}", round2(price), sources.join("|"));
+    if !seen.insert(dedupe_key) {
+        return;
+    }
+    let mut value = Map::new();
+    value.insert("price".to_string(), Value::from(round2(price)));
+    if let Some(current_price) = current_price {
+        value.insert(
+            "distance_to_current".to_string(),
+            Value::from(round2(price - current_price)),
+        );
+    }
+    value.insert(
+        "source_count".to_string(),
+        Value::from(sources.len() as u64),
+    );
+    value.insert(
+        "sources".to_string(),
+        Value::Array(sources.iter().cloned().map(Value::String).collect()),
+    );
+    if let Some(current_ts) = current_ts {
+        value.insert(
+            "reference_ts".to_string(),
+            Value::String(current_ts.to_rfc3339()),
+        );
+    }
+    for (key, field) in extras {
+        value.insert(key, field);
+    }
+    target.push(Value::Object(value));
+}
+
+fn level_extras(fields: &[(&str, Option<f64>)]) -> Map<String, Value> {
+    structure_extras(fields)
+}
+
+fn object_subset_value(source: &Map<String, Value>, fields: &[&str]) -> Value {
+    let mut result = Map::new();
+    copy_fields(&mut result, source, fields);
+    result.retain(|_, value| !value.is_null());
+    if result.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(result)
+    }
 }
 
 fn parse_rfc3339_utc(ts: &str) -> Option<DateTime<Utc>> {
@@ -369,42 +3477,6 @@ fn round2(value: f64) -> f64 {
 
 fn round3(value: f64) -> f64 {
     round_to_decimals(value, 3)
-}
-
-fn sign_i8(value: f64) -> i8 {
-    match value.partial_cmp(&0.0).unwrap_or(Ordering::Equal) {
-        Ordering::Greater => 1,
-        Ordering::Less => -1,
-        Ordering::Equal => 0,
-    }
-}
-
-fn sign_from_option(value: Option<f64>) -> i8 {
-    value.map(sign_i8).unwrap_or(0)
-}
-
-fn bias_from_sign(sign: i8) -> &'static str {
-    match sign {
-        1 => "bullish",
-        -1 => "bearish",
-        _ => "neutral",
-    }
-}
-
-fn timeframe_duration(tf: &str) -> Duration {
-    match tf {
-        "15m" => Duration::hours(4),
-        "4h" => Duration::hours(24),
-        _ => Duration::days(7),
-    }
-}
-
-fn tf_window_limit(tf: &str) -> usize {
-    match tf {
-        "15m" => 30,
-        "4h" => 20,
-        _ => usize::MAX,
-    }
 }
 
 fn extract_indicator_payload<'a>(
@@ -568,2678 +3640,6 @@ fn pct_delta(current: Option<f64>, reference: Option<f64>) -> Option<f64> {
     Some((current - reference) / reference * 100.0)
 }
 
-fn build_cvd_summary(payload: Option<&Value>) -> Value {
-    let Some(payload) = payload.and_then(Value::as_object) else {
-        return empty_tf_object();
-    };
-    let mut result = Map::new();
-    result.insert(
-        "snapshot".to_string(),
-        json!({
-            "delta_fut": payload.get("delta_fut").and_then(Value::as_f64).map(round2),
-            "delta_spot": payload.get("delta_spot").and_then(Value::as_f64).map(round2),
-            "relative_delta_fut": payload.get("relative_delta_fut").and_then(Value::as_f64).map(round3),
-            "relative_delta_spot": payload.get("relative_delta_spot").and_then(Value::as_f64).map(round3),
-        }),
-    );
-
-    let mut by_window = Map::new();
-    let source_windows = payload.get("by_window").and_then(Value::as_object);
-    for tf in SCAN_WINDOWS {
-        let summary = source_windows
-            .and_then(|windows| windows.get(*tf))
-            .and_then(Value::as_object)
-            .map(|window| build_cvd_window_summary(window, tf_window_limit(tf)))
-            .unwrap_or_else(|| {
-                json!({
-                    "delta_sign": 0,
-                    "relative_delta": Value::Null,
-                    "slope_sign": 0,
-                    "lead": "balanced",
-                    "bias": "neutral",
-                    "last_ts": Value::Null,
-                })
-            });
-        by_window.insert((*tf).to_string(), summary);
-    }
-    result.insert("by_window".to_string(), Value::Object(by_window));
-    Value::Object(result)
-}
-
-fn build_cvd_window_summary(window: &Map<String, Value>, limit: usize) -> Value {
-    let series = window
-        .get("series")
-        .and_then(Value::as_array)
-        .map(|series| {
-            let tail = if series.len() <= limit {
-                series.to_vec()
-            } else {
-                series[series.len() - limit..].to_vec()
-            };
-            tail.into_iter()
-                .filter_map(|entry| entry.as_object().cloned())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let latest = series.last();
-    let oldest = series.first();
-    let delta_sign = latest
-        .and_then(|entry| entry.get("delta_fut"))
-        .and_then(Value::as_f64)
-        .map(sign_i8)
-        .unwrap_or(0);
-    let slope_sign = match (
-        latest
-            .and_then(|entry| entry.get("cvd_7d_fut"))
-            .and_then(Value::as_f64),
-        oldest
-            .and_then(|entry| entry.get("cvd_7d_fut"))
-            .and_then(Value::as_f64),
-    ) {
-        (Some(latest), Some(oldest)) => sign_i8(latest - oldest),
-        _ => 0,
-    };
-    let bias = if delta_sign != 0 && delta_sign == slope_sign {
-        bias_from_sign(delta_sign)
-    } else {
-        "neutral"
-    };
-
-    json!({
-        "delta_sign": delta_sign,
-        "relative_delta": latest
-            .and_then(|entry| entry.get("relative_delta_fut"))
-            .and_then(Value::as_f64)
-            .map(round3),
-        "slope_sign": slope_sign,
-        "lead": latest
-            .and_then(|entry| entry.get("spot_flow_dominance"))
-            .and_then(Value::as_str)
-            .unwrap_or("balanced"),
-        "bias": bias,
-        "last_ts": latest
-            .and_then(|entry| entry.get("ts"))
-            .cloned()
-            .unwrap_or(Value::Null),
-    })
-}
-
-fn event_direction_default(event: &Map<String, Value>) -> i8 {
-    event
-        .get("direction")
-        .and_then(Value::as_i64)
-        .map(|value| value.clamp(-1, 1) as i8)
-        .unwrap_or_else(|| {
-            let kind = event
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if kind.contains("bullish") {
-                1
-            } else if kind.contains("bearish") {
-                -1
-            } else {
-                0
-            }
-        })
-}
-
-fn event_direction_divergence(event: &Map<String, Value>) -> i8 {
-    let kind = event
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if kind.contains("bullish") {
-        1
-    } else if kind.contains("bearish") {
-        -1
-    } else {
-        sign_from_option(event.get("fut_divergence_sign").and_then(Value::as_f64))
-    }
-}
-
-fn build_event_summary(
-    payload: Option<&Value>,
-    current_ts: Option<DateTime<Utc>>,
-    current_price: Option<f64>,
-    atr14_by_tf: &Value,
-    direction_fn: fn(&Map<String, Value>) -> i8,
-) -> Value {
-    let events = payload
-        .and_then(Value::as_object)
-        .and_then(|payload| payload.get("recent_7d"))
-        .and_then(Value::as_object)
-        .and_then(|recent| recent.get("events"))
-        .and_then(Value::as_array)
-        .map(|events| {
-            events
-                .iter()
-                .filter_map(Value::as_object)
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    build_event_summary_from_events(
-        &events,
-        current_ts,
-        current_price,
-        atr14_by_tf,
-        direction_fn,
-    )
-}
-
-fn build_combined_initiation_summary(
-    bullish_payload: Option<&Value>,
-    bearish_payload: Option<&Value>,
-    current_ts: Option<DateTime<Utc>>,
-    current_price: Option<f64>,
-    atr14_by_tf: &Value,
-) -> Value {
-    let mut events = Vec::new();
-    for payload in [bullish_payload, bearish_payload] {
-        let mut selected = payload
-            .and_then(Value::as_object)
-            .and_then(|payload| payload.get("recent_7d"))
-            .and_then(Value::as_object)
-            .and_then(|recent| recent.get("events"))
-            .and_then(Value::as_array)
-            .map(|events| {
-                events
-                    .iter()
-                    .filter_map(Value::as_object)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        events.append(&mut selected);
-    }
-    build_event_summary_from_events(
-        &events,
-        current_ts,
-        current_price,
-        atr14_by_tf,
-        event_direction_default,
-    )
-}
-
-fn build_event_summary_from_events(
-    events: &[Map<String, Value>],
-    current_ts: Option<DateTime<Utc>>,
-    current_price: Option<f64>,
-    atr14_by_tf: &Value,
-    direction_fn: fn(&Map<String, Value>) -> i8,
-) -> Value {
-    let mut result = Map::new();
-    for tf in SCAN_WINDOWS {
-        let filtered = select_events_for_timeframe(events, current_ts, tf, direction_fn);
-        let atr14 = atr14_for_tf(atr14_by_tf, tf);
-        let bullish = filtered
-            .iter()
-            .filter(|event| direction_fn(event) > 0)
-            .cloned()
-            .collect::<Vec<_>>();
-        let bearish = filtered
-            .iter()
-            .filter(|event| direction_fn(event) < 0)
-            .cloned()
-            .collect::<Vec<_>>();
-        let bullish_score =
-            weighted_event_side_score(&bullish, current_ts.clone(), current_price, atr14, tf);
-        let bearish_score =
-            weighted_event_side_score(&bearish, current_ts.clone(), current_price, atr14, tf);
-        let net_score = round3(bullish_score - bearish_score);
-        let bias = weighted_event_bias(bullish_score, bearish_score);
-        let bullish_events =
-            pick_representative_events(&bullish, current_ts.clone(), current_price, atr14, tf);
-        let bearish_events =
-            pick_representative_events(&bearish, current_ts.clone(), current_price, atr14, tf);
-        result.insert(
-            (*tf).to_string(),
-            json!({
-                "bullish_count": bullish.len(),
-                "bearish_count": bearish.len(),
-                "bullish_score": round3(bullish_score),
-                "bearish_score": round3(bearish_score),
-                "net_score": net_score,
-                "bias": bias,
-                "bullish_events": bullish_events,
-                "bearish_events": bearish_events,
-            }),
-        );
-    }
-    Value::Object(result)
-}
-
-fn select_events_for_timeframe(
-    events: &[Map<String, Value>],
-    current_ts: Option<DateTime<Utc>>,
-    tf: &str,
-    direction_fn: fn(&Map<String, Value>) -> i8,
-) -> Vec<Map<String, Value>> {
-    let Some(current_ts) = current_ts else {
-        return events
-            .iter()
-            .filter(|event| direction_fn(event) != 0)
-            .cloned()
-            .collect();
-    };
-    let cutoff = current_ts - timeframe_duration(tf);
-    events
-        .iter()
-        .filter(|event| {
-            direction_fn(event) != 0
-                && event_reference_ts(event)
-                    .map(|event_ts| event_ts >= cutoff)
-                    .unwrap_or(false)
-        })
-        .cloned()
-        .collect()
-}
-
-fn event_reference_ts(event: &Map<String, Value>) -> Option<DateTime<Utc>> {
-    ["event_start_ts", "confirm_ts", "event_end_ts", "end_ts"]
-        .iter()
-        .find_map(|key| event.get(*key).and_then(Value::as_str))
-        .and_then(parse_rfc3339_utc)
-}
-
-fn atr14_for_tf(source: &Value, tf: &str) -> Option<f64> {
-    source
-        .get(tf)
-        .and_then(Value::as_object)
-        .and_then(|window| window.get("atr14"))
-        .and_then(Value::as_f64)
-        .filter(|value| *value > 0.0)
-}
-
-fn weighted_event_side_score(
-    events: &[Map<String, Value>],
-    current_ts: Option<DateTime<Utc>>,
-    current_price: Option<f64>,
-    atr14: Option<f64>,
-    tf: &str,
-) -> f64 {
-    events
-        .iter()
-        .map(|event| weighted_event_score(event, current_ts, current_price, atr14, tf))
-        .sum()
-}
-
-fn weighted_event_bias(bullish_score: f64, bearish_score: f64) -> &'static str {
-    let total = bullish_score + bearish_score;
-    if total <= 0.0 {
-        return "neutral";
-    }
-    let normalized = (bullish_score - bearish_score) / total;
-    if normalized > 0.15 {
-        "bullish"
-    } else if normalized < -0.15 {
-        "bearish"
-    } else {
-        "neutral"
-    }
-}
-
-fn weighted_event_score(
-    event: &Map<String, Value>,
-    current_ts: Option<DateTime<Utc>>,
-    current_price: Option<f64>,
-    atr14: Option<f64>,
-    tf: &str,
-) -> f64 {
-    let base_score = event_score(event).max(0.25);
-    let recency_weight = event_reference_ts(event)
-        .zip(current_ts)
-        .map(|(event_ts, now)| {
-            let age_hours = (now - event_ts).num_seconds().max(0) as f64 / 3600.0;
-            (-age_hours / timeframe_decay_hours(tf)).exp()
-        })
-        .unwrap_or(1.0);
-    let proximity_weight = match (event_pivot_price(event), current_price, atr14) {
-        (Some(pivot_price), Some(current_price), Some(atr14)) if atr14 > 0.0 => {
-            (-(pivot_price - current_price).abs() / (timeframe_distance_atr(tf) * atr14)).exp()
-        }
-        _ => 1.0,
-    };
-    base_score * recency_weight * proximity_weight
-}
-
-fn timeframe_decay_hours(tf: &str) -> f64 {
-    match tf {
-        "15m" => 5.0,
-        "4h" => 24.0,
-        _ => 60.0,
-    }
-}
-
-fn timeframe_distance_atr(tf: &str) -> f64 {
-    match tf {
-        "15m" => 1.0,
-        "4h" => 1.5,
-        _ => 2.0,
-    }
-}
-
-fn pick_representative_events(
-    events: &[Map<String, Value>],
-    current_ts: Option<DateTime<Utc>>,
-    current_price: Option<f64>,
-    atr14: Option<f64>,
-    tf: &str,
-) -> Vec<Value> {
-    let mut selected: Vec<WeightedEvent> = Vec::new();
-    if let Some(recent) = events
-        .iter()
-        .max_by(|left, right| event_reference_ts(left).cmp(&event_reference_ts(right)))
-    {
-        selected.push(WeightedEvent {
-            event: recent.clone(),
-            weighted_score: weighted_event_score(recent, current_ts, current_price, atr14, tf),
-        });
-    }
-    if let Some(strongest) = events.iter().max_by(|left, right| {
-        weighted_event_score(left, current_ts, current_price, atr14, tf)
-            .partial_cmp(&weighted_event_score(
-                right,
-                current_ts,
-                current_price,
-                atr14,
-                tf,
-            ))
-            .unwrap_or(Ordering::Equal)
-    }) {
-        selected.push(WeightedEvent {
-            event: strongest.clone(),
-            weighted_score: weighted_event_score(strongest, current_ts, current_price, atr14, tf),
-        });
-    }
-    if let Some(current_price) = current_price {
-        if let Some(nearest) = events
-            .iter()
-            .filter(|event| event_pivot_price(event).is_some())
-            .min_by(|left, right| {
-                let left_dist =
-                    (event_pivot_price(left).unwrap_or(current_price) - current_price).abs();
-                let right_dist =
-                    (event_pivot_price(right).unwrap_or(current_price) - current_price).abs();
-                left_dist
-                    .partial_cmp(&right_dist)
-                    .unwrap_or(Ordering::Equal)
-            })
-        {
-            selected.push(WeightedEvent {
-                event: nearest.clone(),
-                weighted_score: weighted_event_score(
-                    nearest,
-                    current_ts,
-                    Some(current_price),
-                    atr14,
-                    tf,
-                ),
-            });
-        }
-    }
-    selected.sort_by(|left, right| {
-        left.weighted_score
-            .partial_cmp(&right.weighted_score)
-            .unwrap_or(Ordering::Equal)
-            .reverse()
-            .then_with(|| event_reference_ts(&right.event).cmp(&event_reference_ts(&left.event)))
-    });
-    let mut deduped = Vec::new();
-    for event in selected {
-        let key = format!(
-            "{}|{}|{}",
-            event_time_string(&event.event),
-            event
-                .event
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-            event_pivot_price(&event.event)
-                .map(|price| round2(price).to_string())
-                .unwrap_or_default()
-        );
-        if deduped
-            .iter()
-            .all(|existing: &WeightedEvent| event_dedupe_key(&existing.event) != key)
-        {
-            deduped.push(event);
-        }
-    }
-    deduped
-        .into_iter()
-        .take(3)
-        .map(|event| compact_event(event.event, event.weighted_score))
-        .collect()
-}
-
-fn event_dedupe_key(event: &Map<String, Value>) -> String {
-    format!(
-        "{}|{}|{}",
-        event_time_string(event),
-        event
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
-        event_pivot_price(event)
-            .map(|price| round2(price).to_string())
-            .unwrap_or_default()
-    )
-}
-
-fn event_time_string(event: &Map<String, Value>) -> String {
-    ["confirm_ts", "event_start_ts", "event_end_ts", "end_ts"]
-        .iter()
-        .find_map(|key| event.get(*key).and_then(Value::as_str))
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn event_score(event: &Map<String, Value>) -> f64 {
-    event
-        .get("score")
-        .and_then(Value::as_f64)
-        .or_else(|| event.get("strength_score_xmk").and_then(Value::as_f64))
-        .unwrap_or(0.0)
-}
-
-fn event_pivot_price(event: &Map<String, Value>) -> Option<f64> {
-    event
-        .get("pivot_price")
-        .and_then(Value::as_f64)
-        .or_else(|| event.get("price_high").and_then(Value::as_f64))
-        .or_else(|| event.get("price_low").and_then(Value::as_f64))
-}
-
-fn compact_event(event: Map<String, Value>, weighted_score: f64) -> Value {
-    let mut compact = Map::new();
-    compact.insert(
-        "confirm_ts".to_string(),
-        Value::String(event_time_string(&event)),
-    );
-    if let Some(price) = event_pivot_price(&event) {
-        compact.insert("pivot_price".to_string(), Value::from(price));
-    }
-    compact.insert(
-        "score".to_string(),
-        Value::from(round3(event_score(&event))),
-    );
-    compact.insert(
-        "weighted_score".to_string(),
-        Value::from(round3(weighted_score)),
-    );
-    if let Some(kind) = event.get("type").and_then(Value::as_str) {
-        compact.insert("type".to_string(), Value::String(kind.to_string()));
-    }
-    if let Some(pivot_side) = event.get("pivot_side").and_then(Value::as_str) {
-        compact.insert(
-            "pivot_side".to_string(),
-            Value::String(pivot_side.to_string()),
-        );
-    }
-    if let Some(driver) = event.get("likely_driver").and_then(Value::as_str) {
-        compact.insert(
-            "likely_driver".to_string(),
-            Value::String(driver.to_string()),
-        );
-    }
-    Value::Object(compact)
-}
-
-fn build_level_book(
-    source: &Map<String, Value>,
-    current_price: f64,
-    kline_derived: &Value,
-) -> Value {
-    let mut by_window = Map::new();
-    for tf in SCAN_WINDOWS {
-        let atr14 = kline_derived
-            .get(*tf)
-            .and_then(Value::as_object)
-            .and_then(|window| window.get("atr14"))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let levels = collect_levels_for_tf(source, tf);
-        let clusters = cluster_levels(
-            levels,
-            bin_size_for_tf(tf, current_price, atr14),
-            current_price,
-        );
-        let support = clusters
-            .iter()
-            .filter(|cluster| cluster.price < current_price)
-            .take(2)
-            .map(level_cluster_to_value)
-            .collect::<Vec<_>>();
-        let resistance = clusters
-            .iter()
-            .filter(|cluster| cluster.price > current_price)
-            .take(2)
-            .map(level_cluster_to_value)
-            .collect::<Vec<_>>();
-        by_window.insert(
-            (*tf).to_string(),
-            json!({
-                "support": support,
-                "resistance": resistance,
-            }),
-        );
-    }
-    Value::Object(by_window)
-}
-
-fn bin_size_for_tf(tf: &str, current_price: f64, atr14: f64) -> f64 {
-    let base = match tf {
-        "15m" => current_price * 0.002,
-        "4h" => current_price * 0.004,
-        _ => current_price * 0.008,
-    };
-    let atr_component = if atr14 > 0.0 { atr14 * 0.3 } else { 0.0 };
-    base.max(atr_component).max(0.1)
-}
-
-fn collect_levels_for_tf(source: &Map<String, Value>, tf: &str) -> Vec<LevelMember> {
-    let mut levels = Vec::new();
-
-    if let Some(pvs_window) = extract_indicator_payload(source, "price_volume_structure")
-        .and_then(|payload| payload.get("by_window"))
-        .and_then(Value::as_object)
-        .and_then(|windows| windows.get(tf))
-        .and_then(Value::as_object)
-    {
-        extend_level(
-            &mut levels,
-            pvs_window.get("poc_price").and_then(Value::as_f64),
-            1.5,
-            "pvs_poc",
-        );
-        extend_level(
-            &mut levels,
-            pvs_window.get("vah").and_then(Value::as_f64),
-            1.2,
-            "pvs_vah",
-        );
-        extend_level(
-            &mut levels,
-            pvs_window.get("val").and_then(Value::as_f64),
-            1.2,
-            "pvs_val",
-        );
-        extend_level_list(&mut levels, pvs_window.get("hvn_levels"), 1.3, "pvs_hvn");
-    }
-
-    if let Some(tpo_payload) = extract_indicator_payload(source, "tpo_market_profile") {
-        if let Some(session) = tpo_payload
-            .get("by_session")
-            .and_then(Value::as_object)
-            .and_then(|sessions| sessions.get(tf))
-            .and_then(Value::as_object)
-        {
-            extend_level(
-                &mut levels,
-                session.get("tpo_poc").and_then(Value::as_f64),
-                1.5,
-                "tpo_poc",
-            );
-            extend_level(
-                &mut levels,
-                session.get("tpo_vah").and_then(Value::as_f64),
-                1.2,
-                "tpo_vah",
-            );
-            extend_level(
-                &mut levels,
-                session.get("tpo_val").and_then(Value::as_f64),
-                1.2,
-                "tpo_val",
-            );
-        } else {
-            extend_level(
-                &mut levels,
-                tpo_payload.get("tpo_poc").and_then(Value::as_f64),
-                1.5,
-                "tpo_poc",
-            );
-            extend_level(
-                &mut levels,
-                tpo_payload.get("tpo_vah").and_then(Value::as_f64),
-                1.2,
-                "tpo_vah",
-            );
-            extend_level(
-                &mut levels,
-                tpo_payload.get("tpo_val").and_then(Value::as_f64),
-                1.2,
-                "tpo_val",
-            );
-        }
-    }
-
-    if let Some(rvwap_window) = extract_indicator_payload(source, "rvwap_sigma_bands")
-        .and_then(|payload| payload.get("by_window"))
-        .and_then(Value::as_object)
-        .and_then(|windows| windows.get(tf))
-        .and_then(Value::as_object)
-    {
-        extend_level(
-            &mut levels,
-            rvwap_window
-                .get("rvwap_band_plus_1")
-                .and_then(Value::as_f64),
-            1.0,
-            "rvwap_plus1",
-        );
-        extend_level(
-            &mut levels,
-            rvwap_window
-                .get("rvwap_band_minus_1")
-                .and_then(Value::as_f64),
-            1.0,
-            "rvwap_minus1",
-        );
-        extend_level(
-            &mut levels,
-            rvwap_window
-                .get("rvwap_band_plus_2")
-                .and_then(Value::as_f64),
-            0.7,
-            "rvwap_plus2",
-        );
-        extend_level(
-            &mut levels,
-            rvwap_window
-                .get("rvwap_band_minus_2")
-                .and_then(Value::as_f64),
-            0.7,
-            "rvwap_minus2",
-        );
-    }
-
-    if let Some(fvg_window) = extract_indicator_payload(source, "fvg")
-        .and_then(|payload| payload.get("by_window"))
-        .and_then(Value::as_object)
-        .and_then(|windows| windows.get(tf))
-        .and_then(Value::as_object)
-    {
-        for label in ["nearest_bull_fvg", "nearest_bear_fvg"] {
-            if let Some(fvg) = fvg_window.get(label).and_then(Value::as_object) {
-                extend_level(
-                    &mut levels,
-                    fvg.get("upper")
-                        .or_else(|| fvg.get("fvg_top"))
-                        .and_then(Value::as_f64),
-                    0.9,
-                    "fvg_edge",
-                );
-                extend_level(
-                    &mut levels,
-                    fvg.get("lower")
-                        .or_else(|| fvg.get("fvg_bottom"))
-                        .and_then(Value::as_f64),
-                    0.9,
-                    "fvg_edge",
-                );
-            }
-        }
-    }
-
-    if let Some(orderbook_payload) = extract_indicator_payload(source, "orderbook_depth") {
-        let liquidity_walls = build_liquidity_walls(
-            orderbook_payload
-                .get("levels")
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-            orderbook_payload
-                .get("microprice_fut")
-                .and_then(Value::as_f64),
-        );
-        if let Some(walls) = liquidity_walls.as_object() {
-            extend_nearest_orderbook_walls(&mut levels, walls.get("bid_walls"), 0.8, "ob_bid_wall");
-            extend_nearest_orderbook_walls(&mut levels, walls.get("ask_walls"), 0.8, "ob_ask_wall");
-        }
-    }
-
-    levels
-}
-
-fn extend_level(
-    levels: &mut Vec<LevelMember>,
-    price: Option<f64>,
-    weight: f64,
-    source: &'static str,
-) {
-    if let Some(price) = price.filter(|price| price.is_finite()) {
-        levels.push(LevelMember {
-            price,
-            weight,
-            source,
-        });
-    }
-}
-
-fn extend_level_list(
-    levels: &mut Vec<LevelMember>,
-    values: Option<&Value>,
-    weight: f64,
-    source: &'static str,
-) {
-    let Some(values) = values else {
-        return;
-    };
-    match values {
-        Value::Array(items) => {
-            for item in items {
-                if let Some(price) = item.as_f64() {
-                    extend_level(levels, Some(price), weight, source);
-                } else if let Some(object) = item.as_object() {
-                    extend_level(
-                        levels,
-                        object
-                            .get("price_level")
-                            .or_else(|| object.get("price"))
-                            .and_then(Value::as_f64),
-                        weight,
-                        source,
-                    );
-                }
-            }
-        }
-        Value::Object(object) => {
-            extend_level(
-                levels,
-                object
-                    .get("price_level")
-                    .or_else(|| object.get("price"))
-                    .and_then(Value::as_f64),
-                weight,
-                source,
-            );
-        }
-        _ => {}
-    }
-}
-
-fn extend_nearest_orderbook_walls(
-    levels: &mut Vec<LevelMember>,
-    values: Option<&Value>,
-    weight: f64,
-    source: &'static str,
-) {
-    let Some(items) = values.and_then(Value::as_array) else {
-        return;
-    };
-    let mut ranked = items
-        .iter()
-        .filter_map(Value::as_object)
-        .map(|item| {
-            (
-                item.get("distance_pct")
-                    .and_then(Value::as_f64)
-                    .map(|distance| distance.abs())
-                    .unwrap_or(f64::INFINITY),
-                item,
-            )
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
-    for (_, item) in ranked.into_iter().take(2) {
-        extend_level(
-            levels,
-            item.get("price_level")
-                .or_else(|| item.get("price"))
-                .and_then(Value::as_f64),
-            weight,
-            source,
-        );
-    }
-}
-
-fn cluster_levels(
-    levels: Vec<LevelMember>,
-    bin_size: f64,
-    current_price: f64,
-) -> Vec<LevelCluster> {
-    let mut bins: BTreeMap<i64, Vec<LevelMember>> = BTreeMap::new();
-    for level in levels {
-        let index = (level.price / bin_size).floor() as i64;
-        bins.entry(index).or_default().push(level);
-    }
-    let mut clusters = bins
-        .into_values()
-        .filter_map(|members| {
-            let representative = members.iter().min_by(|left, right| {
-                (left.price - current_price)
-                    .abs()
-                    .partial_cmp(&(right.price - current_price).abs())
-                    .unwrap_or(Ordering::Equal)
-            })?;
-            let mut sources = members
-                .iter()
-                .map(|member| member.source)
-                .collect::<Vec<_>>();
-            sources.sort_unstable();
-            sources.dedup();
-            Some(LevelCluster {
-                price: representative.price,
-                strength: round2(members.iter().map(|member| member.weight).sum()),
-                sources,
-            })
-        })
-        .collect::<Vec<_>>();
-    clusters.sort_by(|left, right| {
-        (left.price - current_price)
-            .abs()
-            .partial_cmp(&(right.price - current_price).abs())
-            .unwrap_or(Ordering::Equal)
-    });
-    clusters
-}
-
-fn level_cluster_to_value(cluster: &LevelCluster) -> Value {
-    json!({
-        "price": cluster.price,
-        "strength": cluster.strength,
-        "sources": cluster.sources,
-    })
-}
-
-fn extract_level_anchor(
-    structure_range: &Map<String, Value>,
-    side: &str,
-    index: usize,
-) -> Option<LevelAnchor> {
-    structure_range
-        .get(side)
-        .and_then(Value::as_array)
-        .and_then(|items| items.get(index))
-        .and_then(Value::as_object)
-        .and_then(level_anchor_from_value)
-}
-
-fn level_anchor_from_value(value: &Map<String, Value>) -> Option<LevelAnchor> {
-    Some(LevelAnchor {
-        price: value.get("price").and_then(Value::as_f64)?,
-        strength: value.get("strength").and_then(Value::as_f64).unwrap_or(0.0),
-        source_count: value
-            .get("sources")
-            .and_then(Value::as_array)
-            .map(Vec::len)
-            .unwrap_or(0),
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_display_range(
-    tf: &str,
-    current_price: Option<f64>,
-    atr14: f64,
-    primary_support: Option<f64>,
-    primary_resistance: Option<f64>,
-    primary_support_anchor: Option<&LevelAnchor>,
-    secondary_support_anchor: Option<&LevelAnchor>,
-    primary_resistance_anchor: Option<&LevelAnchor>,
-    secondary_resistance_anchor: Option<&LevelAnchor>,
-    breakout_above: Option<f64>,
-    breakdown_below: Option<f64>,
-    evidence: BiasEvidence,
-) -> (Option<f64>, Option<f64>, &'static str) {
-    let mut display_support = primary_support;
-    let mut display_resistance = primary_resistance;
-    let mut mode = "primary";
-
-    let Some(current_price) = current_price else {
-        return (display_support, display_resistance, mode);
-    };
-    if atr14 <= 0.0 {
-        return (display_support, display_resistance, mode);
-    }
-    let Some(primary_support_price) = primary_support else {
-        return (display_support, display_resistance, mode);
-    };
-    let Some(primary_resistance_price) = primary_resistance else {
-        return (display_support, display_resistance, mode);
-    };
-
-    if (primary_resistance_price - primary_support_price)
-        >= narrow_display_range_threshold(tf) * atr14
-    {
-        return (display_support, display_resistance, mode);
-    }
-
-    let bullish_context =
-        evidence.evidence_balance_score > 0.15 && evidence.compression_score < 0.75;
-    let bearish_context =
-        evidence.evidence_balance_score < -0.15 && evidence.compression_score < 0.75;
-
-    if bullish_context {
-        if let (Some(primary_anchor), Some(candidate_anchor)) =
-            (primary_resistance_anchor, secondary_resistance_anchor)
-        {
-            if qualifies_expanded_anchor(
-                current_price,
-                atr14,
-                primary_anchor,
-                candidate_anchor,
-                breakout_above,
-            ) {
-                display_resistance = Some(candidate_anchor.price);
-                mode = "expanded_resistance";
-            }
-        }
-    }
-
-    if bearish_context {
-        if let (Some(primary_anchor), Some(candidate_anchor)) =
-            (primary_support_anchor, secondary_support_anchor)
-        {
-            if qualifies_expanded_anchor(
-                current_price,
-                atr14,
-                primary_anchor,
-                candidate_anchor,
-                breakdown_below,
-            ) {
-                display_support = Some(candidate_anchor.price);
-                mode = "expanded_support";
-            }
-        }
-    }
-
-    if mode == "primary"
-        && (primary_resistance_price - primary_support_price)
-            < ultra_narrow_display_range_threshold() * atr14
-    {
-        let current_span = primary_resistance_price - primary_support_price;
-        let mut best_span = current_span;
-
-        if let (Some(primary_anchor), Some(candidate_anchor)) =
-            (primary_resistance_anchor, secondary_resistance_anchor)
-        {
-            if qualifies_structural_fallback_anchor(
-                current_price,
-                atr14,
-                primary_anchor,
-                candidate_anchor,
-            ) {
-                let candidate_span = candidate_anchor.price - primary_support_price;
-                if candidate_span > best_span {
-                    display_resistance = Some(candidate_anchor.price);
-                    mode = "expanded_resistance";
-                    best_span = candidate_span;
-                }
-            }
-        }
-
-        if let (Some(primary_anchor), Some(candidate_anchor)) =
-            (primary_support_anchor, secondary_support_anchor)
-        {
-            if qualifies_structural_fallback_anchor(
-                current_price,
-                atr14,
-                primary_anchor,
-                candidate_anchor,
-            ) {
-                let candidate_span = primary_resistance_price - candidate_anchor.price;
-                if candidate_span > best_span {
-                    display_support = Some(candidate_anchor.price);
-                    mode = "expanded_support";
-                }
-            }
-        }
-    }
-
-    (display_support, display_resistance, mode)
-}
-
-fn narrow_display_range_threshold(tf: &str) -> f64 {
-    match tf {
-        "15m" => 0.5,
-        "4h" => 0.4,
-        "1d" => 0.3,
-        _ => 0.4,
-    }
-}
-
-fn ultra_narrow_display_range_threshold() -> f64 {
-    0.25
-}
-
-fn qualifies_expanded_anchor(
-    current_price: f64,
-    atr14: f64,
-    primary_anchor: &LevelAnchor,
-    candidate_anchor: &LevelAnchor,
-    directional_target: Option<f64>,
-) -> bool {
-    if (candidate_anchor.price - current_price).abs() > atr14 {
-        return false;
-    }
-    if candidate_anchor.strength >= primary_anchor.strength {
-        return true;
-    }
-    if candidate_anchor.source_count > primary_anchor.source_count {
-        return true;
-    }
-    directional_target
-        .map(|target| (candidate_anchor.price - target).abs() <= 0.25)
-        .unwrap_or(false)
-}
-
-fn qualifies_structural_fallback_anchor(
-    current_price: f64,
-    atr14: f64,
-    primary_anchor: &LevelAnchor,
-    candidate_anchor: &LevelAnchor,
-) -> bool {
-    qualifies_expanded_anchor(current_price, atr14, primary_anchor, candidate_anchor, None)
-}
-
-fn resolve_selected_anchor(
-    selected_price: Option<f64>,
-    primary_anchor: Option<&LevelAnchor>,
-    secondary_anchor: Option<&LevelAnchor>,
-) -> Option<LevelAnchor> {
-    let selected_price = selected_price?;
-    for anchor in [primary_anchor, secondary_anchor].into_iter().flatten() {
-        if (anchor.price - selected_price).abs() <= 1e-6 {
-            return Some(anchor.clone());
-        }
-    }
-    None
-}
-
-fn build_display_range_value(
-    support: Option<f64>,
-    resistance: Option<f64>,
-    mode: &str,
-    range_role: &str,
-    current_price: Option<f64>,
-    atr14: f64,
-    support_anchor: Option<&LevelAnchor>,
-    resistance_anchor: Option<&LevelAnchor>,
-) -> Value {
-    let width_atr = match (support, resistance, atr14 > 0.0) {
-        (Some(support), Some(resistance), true) if resistance > support => {
-            Some(round3((resistance - support) / atr14))
-        }
-        _ => None,
-    };
-    let position_in_range_pct = match (current_price, support, resistance) {
-        (Some(current_price), Some(support), Some(resistance)) if resistance > support => Some(
-            round3(((current_price - support) / (resistance - support)).clamp(0.0, 1.0)),
-        ),
-        _ => None,
-    };
-    let quality = classify_display_range_quality(width_atr, support_anchor, resistance_anchor);
-    let current_price_location = range_current_price_location(current_price, support, resistance);
-    json!({
-        "support": support,
-        "resistance": resistance,
-        "mode": mode,
-        "range_role": range_role,
-        "range_width_atr": width_atr,
-        "position_in_range_pct": position_in_range_pct,
-        "current_price_location": current_price_location,
-        "quality": quality,
-        "support_strength": support_anchor.map(|anchor| round2(anchor.strength)),
-        "support_source_count": support_anchor.map(|anchor| anchor.source_count),
-        "resistance_strength": resistance_anchor.map(|anchor| round2(anchor.strength)),
-        "resistance_source_count": resistance_anchor.map(|anchor| anchor.source_count),
-    })
-}
-
-fn build_session_value_area_range_value(
-    support: Option<f64>,
-    resistance: Option<f64>,
-    current_price: Option<f64>,
-    atr14: f64,
-    source_window: Option<&str>,
-    source_kind: Option<&str>,
-) -> Value {
-    let width_atr = match (support, resistance, atr14 > 0.0) {
-        (Some(support), Some(resistance), true) if resistance > support => {
-            Some(round3((resistance - support) / atr14))
-        }
-        _ => None,
-    };
-    let position_in_range_pct = match (current_price, support, resistance) {
-        (Some(current_price), Some(support), Some(resistance)) if resistance > support => Some(
-            round3(((current_price - support) / (resistance - support)).clamp(0.0, 1.0)),
-        ),
-        _ => None,
-    };
-    let quality = match width_atr {
-        Some(width) if width < 0.15 => "compressed",
-        Some(_) => "clean",
-        None => "fragile",
-    };
-    let current_price_location = range_current_price_location(current_price, support, resistance);
-    json!({
-        "support": support,
-        "resistance": resistance,
-        "mode": "session_value_area",
-        "range_role": "context",
-        "range_width_atr": width_atr,
-        "position_in_range_pct": position_in_range_pct,
-        "current_price_location": current_price_location,
-        "quality": quality,
-        "source_window": source_window,
-        "source_kind": source_kind,
-    })
-}
-
-fn range_current_price_location(
-    current_price: Option<f64>,
-    support: Option<f64>,
-    resistance: Option<f64>,
-) -> Value {
-    match (current_price, support, resistance) {
-        (Some(current_price), Some(support), Some(resistance)) if resistance > support => {
-            if current_price < support {
-                Value::String("below".to_string())
-            } else if current_price > resistance {
-                Value::String("above".to_string())
-            } else {
-                Value::String("inside".to_string())
-            }
-        }
-        _ => Value::Null,
-    }
-}
-
-fn classify_display_range_quality(
-    width_atr: Option<f64>,
-    support_anchor: Option<&LevelAnchor>,
-    resistance_anchor: Option<&LevelAnchor>,
-) -> &'static str {
-    let Some(width_atr) = width_atr else {
-        return "fragile";
-    };
-    if width_atr < 0.25 {
-        return "compressed";
-    }
-    if support_anchor
-        .map(|anchor| anchor.source_count <= 1 || anchor.strength < 1.0)
-        .unwrap_or(true)
-        || resistance_anchor
-            .map(|anchor| anchor.source_count <= 1 || anchor.strength < 1.0)
-            .unwrap_or(true)
-    {
-        return "fragile";
-    }
-    "clean"
-}
-
-fn weighted_average_scores(values: &[(f64, f64)]) -> f64 {
-    let mut weighted_sum = 0.0;
-    let mut total_weight = 0.0;
-    for (value, weight) in values {
-        if value.is_finite() && *weight > 0.0 {
-            weighted_sum += value * weight;
-            total_weight += weight;
-        }
-    }
-    if total_weight > 0.0 {
-        weighted_sum / total_weight
-    } else {
-        0.0
-    }
-}
-
-fn directional_string_score(value: &str) -> f64 {
-    match value {
-        "bull" | "bullish" | "Bullish" | "above_vah" => 1.0,
-        "bear" | "bearish" | "Bearish" | "below_val" => -1.0,
-        _ => 0.0,
-    }
-}
-
-fn normalized_metric_score(value: Option<f64>, scale: f64) -> f64 {
-    value
-        .map(|value| (value / scale).clamp(-1.0, 1.0))
-        .unwrap_or(0.0)
-}
-
-fn normalized_event_score(summary: Option<&Map<String, Value>>, tf: &str) -> f64 {
-    let net_score = summary
-        .and_then(|summary| summary.get("net_score"))
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    (net_score / event_score_scale(tf)).clamp(-1.0, 1.0)
-}
-
-fn event_score_scale(tf: &str) -> f64 {
-    match tf {
-        "15m" => 1.0,
-        "4h" => 1.5,
-        _ => 2.5,
-    }
-}
-
-fn range_position_score(
-    current_price: Option<f64>,
-    support: Option<f64>,
-    resistance: Option<f64>,
-) -> f64 {
-    match (current_price, support, resistance) {
-        (Some(current_price), Some(support), Some(resistance)) if resistance > support => {
-            (((current_price - support) / (resistance - support)).clamp(0.0, 1.0) - 0.5) * 2.0
-        }
-        _ => 0.0,
-    }
-}
-
-fn anchor_strength_balance(
-    support_anchor: Option<&LevelAnchor>,
-    resistance_anchor: Option<&LevelAnchor>,
-) -> f64 {
-    match (support_anchor, resistance_anchor) {
-        (Some(support_anchor), Some(resistance_anchor)) => {
-            let total = support_anchor.strength + resistance_anchor.strength;
-            if total > 0.0 {
-                ((support_anchor.strength - resistance_anchor.strength) / total).clamp(-1.0, 1.0)
-            } else {
-                0.0
-            }
-        }
-        _ => 0.0,
-    }
-}
-
-fn timeframe_component_weights(tf: &str) -> (f64, f64, f64) {
-    match tf {
-        "15m" => (0.2, 0.45, 0.35),
-        "4h" => (0.35, 0.30, 0.35),
-        _ => (0.45, 0.25, 0.30),
-    }
-}
-
-fn score_from_position(value: Option<&Value>) -> f64 {
-    value
-        .and_then(Value::as_str)
-        .map(directional_string_score)
-        .unwrap_or(0.0)
-}
-
-fn compute_bias_evidence(
-    tf: &str,
-    sideways_votes: usize,
-    trend: &Map<String, Value>,
-    flow: &Map<String, Value>,
-    current_price: Option<f64>,
-    display_support: Option<f64>,
-    display_resistance: Option<f64>,
-    display_support_anchor: Option<&LevelAnchor>,
-    display_resistance_anchor: Option<&LevelAnchor>,
-) -> BiasEvidence {
-    let trend_component = weighted_average_scores(&[
-        (
-            directional_string_score(
-                trend
-                    .get("ema_regime")
-                    .and_then(Value::as_str)
-                    .unwrap_or("neutral"),
-            ),
-            0.4,
-        ),
-        (
-            normalized_metric_score(
-                trend
-                    .get("close_vs_ema21_pct")
-                    .and_then(Value::as_f64)
-                    .or_else(|| trend.get("close_vs_ema100_htf_pct").and_then(Value::as_f64)),
-                2.0,
-            ),
-            0.3,
-        ),
-        (score_from_position(trend.get("value_area_position")), 0.2),
-        (
-            normalized_metric_score(trend.get("close_vs_vah_pct").and_then(Value::as_f64), 1.5),
-            0.1,
-        ),
-    ]);
-
-    let flow_component = weighted_average_scores(&[
-        (
-            weighted_average_scores(&[
-                (
-                    directional_string_score(
-                        flow.get("cvd")
-                            .and_then(Value::as_object)
-                            .and_then(|value| value.get("bias"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("neutral"),
-                    ),
-                    0.5,
-                ),
-                (
-                    flow.get("cvd")
-                        .and_then(Value::as_object)
-                        .and_then(|value| value.get("delta_sign"))
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0) as f64,
-                    0.25,
-                ),
-                (
-                    flow.get("cvd")
-                        .and_then(Value::as_object)
-                        .and_then(|value| value.get("slope_sign"))
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0) as f64,
-                    0.15,
-                ),
-                (
-                    normalized_metric_score(
-                        flow.get("cvd")
-                            .and_then(Value::as_object)
-                            .and_then(|value| value.get("relative_delta"))
-                            .and_then(Value::as_f64),
-                        0.15,
-                    ),
-                    0.10,
-                ),
-            ]),
-            0.30,
-        ),
-        (
-            normalized_event_score(flow.get("absorption").and_then(Value::as_object), tf),
-            0.15,
-        ),
-        (
-            normalized_event_score(flow.get("initiation").and_then(Value::as_object), tf),
-            0.10,
-        ),
-        (
-            normalized_event_score(flow.get("buying_exhaustion").and_then(Value::as_object), tf),
-            0.10,
-        ),
-        (
-            normalized_event_score(
-                flow.get("selling_exhaustion").and_then(Value::as_object),
-                tf,
-            ),
-            0.10,
-        ),
-        (
-            normalized_event_score(flow.get("divergence").and_then(Value::as_object), tf),
-            0.10,
-        ),
-        (
-            directional_string_score(
-                flow.get("whale")
-                    .and_then(Value::as_object)
-                    .and_then(|value| value.get("bias"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("neutral"),
-            ),
-            0.10,
-        ),
-        (
-            weighted_average_scores(&[
-                (
-                    flow.get("funding")
-                        .and_then(Value::as_object)
-                        .and_then(|value| value.get("rate_sign"))
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0) as f64,
-                    0.6,
-                ),
-                (
-                    flow.get("funding")
-                        .and_then(Value::as_object)
-                        .and_then(|value| value.get("trend_sign"))
-                        .and_then(Value::as_i64)
-                        .unwrap_or(0) as f64,
-                    0.4,
-                ),
-            ]),
-            0.05,
-        ),
-    ]);
-
-    let structure_component = weighted_average_scores(&[
-        (
-            range_position_score(current_price, display_support, display_resistance),
-            0.65,
-        ),
-        (
-            anchor_strength_balance(display_support_anchor, display_resistance_anchor),
-            0.35,
-        ),
-    ]);
-
-    let (trend_weight, flow_weight, structure_weight) = timeframe_component_weights(tf);
-    let evidence_balance = weighted_average_scores(&[
-        (trend_component, trend_weight),
-        (flow_component, flow_weight),
-        (structure_component, structure_weight),
-    ]);
-    let conflict_score = round2(compute_conflict_score(
-        trend_component,
-        flow_component,
-        structure_component,
-    ));
-    let compression_score = round2((sideways_votes as f64 / 4.0).clamp(0.0, 1.0));
-
-    BiasEvidence {
-        trend_balance_score: round3(trend_component),
-        flow_balance_score: round3(flow_component),
-        structure_balance_score: round3(structure_component),
-        evidence_balance_score: round3(evidence_balance),
-        conflict_score,
-        compression_score,
-    }
-}
-
-fn compute_conflict_score(
-    trend_component: f64,
-    flow_component: f64,
-    structure_component: f64,
-) -> f64 {
-    let components = [trend_component, flow_component, structure_component];
-    let max_component = components.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let min_component = components.iter().copied().fold(f64::INFINITY, f64::min);
-    let positive = components.iter().filter(|value| **value > 0.15).count();
-    let negative = components.iter().filter(|value| **value < -0.15).count();
-    let disagreement = if positive > 0 && negative > 0 {
-        1.0
-    } else if positive + negative <= 1 {
-        0.25
-    } else {
-        0.0
-    };
-    let spread = ((max_component - min_component) / 2.0).clamp(0.0, 1.0);
-    (spread * 0.6 + disagreement * 0.4).clamp(0.0, 1.0)
-}
-
-fn upside_pressure(
-    current_price: Option<f64>,
-    nearest_resistance: Option<f64>,
-    atr14: f64,
-    evidence: BiasEvidence,
-) -> f64 {
-    let proximity = current_price
-        .zip(nearest_resistance)
-        .filter(|(_, resistance)| atr14 > 0.0 && *resistance >= current_price.unwrap_or_default())
-        .map(|(price, resistance)| {
-            let distance = (resistance - price) / atr14;
-            (1.0 - (distance / 1.5)).clamp(0.0, 1.0)
-        })
-        .unwrap_or(0.0);
-    round2(weighted_average_scores(&[
-        (
-            ((evidence.evidence_balance_score).clamp(-1.0, 1.0) + 1.0) / 2.0,
-            0.45,
-        ),
-        (
-            ((evidence.flow_balance_score).clamp(-1.0, 1.0) + 1.0) / 2.0,
-            0.25,
-        ),
-        (proximity, 0.20),
-        (evidence.compression_score * 0.25, 0.10),
-    ]))
-}
-
-fn downside_pressure(
-    current_price: Option<f64>,
-    nearest_support: Option<f64>,
-    atr14: f64,
-    evidence: BiasEvidence,
-) -> f64 {
-    let proximity = current_price
-        .zip(nearest_support)
-        .filter(|(_, support)| atr14 > 0.0 && *support <= current_price.unwrap_or_default())
-        .map(|(price, support)| {
-            let distance = (price - support) / atr14;
-            (1.0 - (distance / 1.5)).clamp(0.0, 1.0)
-        })
-        .unwrap_or(0.0);
-    round2(weighted_average_scores(&[
-        (
-            ((-evidence.evidence_balance_score).clamp(-1.0, 1.0) + 1.0) / 2.0,
-            0.45,
-        ),
-        (
-            ((-evidence.flow_balance_score).clamp(-1.0, 1.0) + 1.0) / 2.0,
-            0.25,
-        ),
-        (proximity, 0.20),
-        (evidence.compression_score * 0.25, 0.10),
-    ]))
-}
-
-fn evidence_bucket(score: f64) -> &'static str {
-    if score > 0.2 {
-        "bullish"
-    } else if score < -0.2 {
-        "bearish"
-    } else {
-        "neutral"
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_by_timeframe(
-    source: &Map<String, Value>,
-    kline_derived: &Value,
-    level_book: &Value,
-    cvd_summary: &Value,
-    absorption_summary: &Value,
-    buying_exhaustion_summary: &Value,
-    selling_exhaustion_summary: &Value,
-    divergence_summary: &Value,
-    initiation_summary: &Value,
-) -> Map<String, Value> {
-    let mut result = Map::new();
-    let ema_payload = extract_indicator_payload(source, "ema_trend_regime");
-    let whale_windows = extract_indicator_payload(source, "whale_trades")
-        .and_then(|payload| payload.get("by_window"))
-        .and_then(Value::as_object);
-    let vpin_windows = extract_indicator_payload(source, "vpin")
-        .and_then(|payload| payload.get("by_window"))
-        .and_then(Value::as_object);
-    let funding_windows = extract_indicator_payload(source, "funding_rate")
-        .and_then(|payload| payload.get("by_window"))
-        .and_then(Value::as_object);
-
-    for tf in SCAN_WINDOWS {
-        let kline = kline_derived
-            .get(*tf)
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let mut trend = Map::new();
-        trend.insert(
-            "ema_regime".to_string(),
-            extract_ema_regime_current(ema_payload, tf),
-        );
-        if let Some(value) = kline.get("close_vs_ema21_pct").cloned() {
-            if !value.is_null() {
-                trend.insert("close_vs_ema21_pct".to_string(), value);
-            }
-        }
-        if let Some(value) = kline.get("close_vs_ema100_htf_pct").cloned() {
-            if !value.is_null() {
-                trend.insert("close_vs_ema100_htf_pct".to_string(), value);
-            }
-        }
-        if let Some(value) = kline.get("close_vs_vah_pct").cloned() {
-            if !value.is_null() {
-                trend.insert("close_vs_vah_pct".to_string(), value);
-            }
-        }
-        if let Some(value) = kline.get("value_area_position").cloned() {
-            if !value.is_null() {
-                trend.insert("value_area_position".to_string(), value);
-            }
-        }
-        let flow = json!({
-            "cvd": cvd_summary
-                .get("by_window")
-                .and_then(Value::as_object)
-                .and_then(|by_window| by_window.get(*tf))
-                .cloned()
-                .unwrap_or(Value::Null),
-            "absorption": absorption_summary.get(*tf).cloned().unwrap_or(Value::Null),
-            "buying_exhaustion": buying_exhaustion_summary.get(*tf).cloned().unwrap_or(Value::Null),
-            "selling_exhaustion": selling_exhaustion_summary.get(*tf).cloned().unwrap_or(Value::Null),
-            "divergence": divergence_summary.get(*tf).cloned().unwrap_or(Value::Null),
-            "initiation": initiation_summary.get(*tf).cloned().unwrap_or(Value::Null),
-            "whale": build_whale_summary(whale_windows.and_then(|windows| windows.get(*tf)).and_then(Value::as_object)),
-            "vpin": build_vpin_summary(vpin_windows.and_then(|windows| windows.get(*tf)).and_then(Value::as_object)),
-            "funding": build_funding_window_summary(
-                funding_windows
-                    .and_then(|windows| windows.get(*tf))
-                    .and_then(Value::as_object)
-            ),
-        });
-        result.insert(
-            (*tf).to_string(),
-            json!({
-                "structure": {
-                    "swing_high": kline.get("swing_high").cloned().unwrap_or(Value::Null),
-                    "swing_low": kline.get("swing_low").cloned().unwrap_or(Value::Null),
-                    "level_book": level_book.get(*tf).cloned().unwrap_or_else(|| json!({"support": [], "resistance": []})),
-                    "session_value_area": build_session_value_area(source, tf),
-                },
-                "trend": Value::Object(trend),
-                "flow": flow,
-                "volatility": {
-                    "atr14": kline.get("atr14").cloned().unwrap_or(Value::Null),
-                    "atr14_pct": kline.get("atr14_pct").cloned().unwrap_or(Value::Null),
-                }
-            }),
-        );
-    }
-
-    result
-}
-
-fn build_session_value_area(source: &Map<String, Value>, tf: &str) -> Value {
-    if let Some((support, resistance, source_window, source_kind)) =
-        extract_session_value_area(source, tf)
-    {
-        return json!({
-            "support": support,
-            "resistance": resistance,
-            "source_window": source_window,
-            "source_kind": source_kind,
-        });
-    }
-    Value::Null
-}
-
-fn extract_session_value_area(
-    source: &Map<String, Value>,
-    tf: &str,
-) -> Option<(f64, f64, String, &'static str)> {
-    if let Some(tpo_payload) = extract_indicator_payload(source, "tpo_market_profile") {
-        if let Some((support, resistance, source_window)) = tpo_value_area_bounds(tpo_payload, tf) {
-            return Some((support, resistance, source_window, "tpo_value_area"));
-        }
-    }
-    extract_indicator_payload(source, "price_volume_structure")
-        .and_then(|payload| payload.get("by_window"))
-        .and_then(Value::as_object)
-        .and_then(|windows| windows.get(tf))
-        .and_then(Value::as_object)
-        .and_then(|window| {
-            Some((
-                window.get("val").and_then(Value::as_f64)?,
-                window.get("vah").and_then(Value::as_f64)?,
-                tf.to_string(),
-                "pvs_value_area",
-            ))
-        })
-}
-
-fn tpo_value_area_bounds(payload: &Map<String, Value>, tf: &str) -> Option<(f64, f64, String)> {
-    let top_level_bounds = payload
-        .get("tpo_val")
-        .and_then(Value::as_f64)
-        .zip(payload.get("tpo_vah").and_then(Value::as_f64));
-    let top_level_window = payload
-        .get("session_window")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let by_session = payload.get("by_session").and_then(Value::as_object);
-    let session_bounds = |session_tf: &str| {
-        by_session
-            .and_then(|sessions| sessions.get(session_tf))
-            .and_then(Value::as_object)
-            .and_then(|session| {
-                Some((
-                    session.get("tpo_val").and_then(Value::as_f64)?,
-                    session.get("tpo_vah").and_then(Value::as_f64)?,
-                    session_tf.to_string(),
-                ))
-            })
-    };
-
-    match tf {
-        "15m" => top_level_bounds
-            .map(|(support, resistance)| {
-                (
-                    support,
-                    resistance,
-                    top_level_window.unwrap_or_else(|| "active".to_string()),
-                )
-            })
-            .or_else(|| session_bounds("4h")),
-        "4h" | "1d" => session_bounds(tf).or_else(|| {
-            if top_level_window.as_deref() == Some(tf) {
-                top_level_bounds.map(|(support, resistance)| (support, resistance, tf.to_string()))
-            } else {
-                None
-            }
-        }),
-        _ => None,
-    }
-}
-
-fn extract_ema_regime_current(payload: Option<&Map<String, Value>>, tf: &str) -> Value {
-    let series = payload
-        .and_then(|payload| payload.get("ffill_series_by_output_window"))
-        .and_then(Value::as_object)
-        .and_then(|series| series.get("15m"))
-        .and_then(Value::as_array);
-    let normalized = series
-        .map(|series| take_last_n(series, 20))
-        .unwrap_or_default();
-    let Some(latest) = normalized.first().and_then(Value::as_object) else {
-        return Value::Null;
-    };
-    match tf {
-        "15m" => latest.get("trend_regime").cloned().unwrap_or(Value::Null),
-        "4h" | "1d" => latest
-            .get("by_tf")
-            .and_then(Value::as_object)
-            .and_then(|by_tf| by_tf.get(tf))
-            .and_then(Value::as_object)
-            .and_then(|value| value.get("trend_regime"))
-            .cloned()
-            .unwrap_or(Value::Null),
-        _ => Value::Null,
-    }
-}
-
-fn build_whale_summary(window: Option<&Map<String, Value>>) -> Value {
-    let net_delta_notional = window
-        .and_then(|window| window.get("fut_whale_delta_notional"))
-        .and_then(Value::as_f64);
-    json!({
-        "net_delta_notional": net_delta_notional.map(round2),
-        "spot_fut_gap": window
-            .and_then(|window| window.get("xmk_whale_delta_notional_gap_s_minus_f"))
-            .and_then(Value::as_f64)
-            .map(round2),
-        "bias": bias_from_sign(sign_from_option(net_delta_notional)),
-    })
-}
-
-fn build_vpin_summary(window: Option<&Map<String, Value>>) -> Value {
-    let vpin = window
-        .and_then(|window| window.get("vpin_fut"))
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            window
-                .and_then(|window| window.get("vpin_spot"))
-                .and_then(Value::as_f64)
-        });
-    json!({
-        "vpin": vpin.map(round3),
-        "elevated": vpin.map(|value| value > 0.5).unwrap_or(false),
-    })
-}
-
-fn build_funding_window_summary(window: Option<&Map<String, Value>>) -> Value {
-    let current_rate = window
-        .and_then(|window| window.get("funding_current"))
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            window
-                .and_then(|window| window.get("funding_twa"))
-                .and_then(Value::as_f64)
-        });
-    let trend_sign = window
-        .and_then(|window| window.get("changes"))
-        .and_then(Value::as_array)
-        .and_then(|changes| {
-            let latest = changes.last()?.as_object()?;
-            let value = latest
-                .get("funding_delta")
-                .and_then(Value::as_f64)
-                .or_else(|| {
-                    let new = latest.get("funding_new").and_then(Value::as_f64)?;
-                    let prev = latest.get("funding_prev").and_then(Value::as_f64)?;
-                    Some(new - prev)
-                })?;
-            Some(sign_i8(value))
-        })
-        .unwrap_or(0);
-    json!({
-        "current_rate": current_rate.map(round6),
-        "rate_sign": sign_from_option(current_rate),
-        "trend_sign": trend_sign,
-    })
-}
-
-fn round6(value: f64) -> f64 {
-    round_to_decimals(value, 6)
-}
-
-fn build_balance_scores_value(evidence: BiasEvidence) -> Value {
-    json!({
-        "trend_balance_score": evidence.trend_balance_score,
-        "flow_balance_score": evidence.flow_balance_score,
-        "structure_balance_score": evidence.structure_balance_score,
-        "evidence_balance_score": evidence.evidence_balance_score,
-        "conflict_score": evidence.conflict_score,
-        "compression_score": evidence.compression_score,
-    })
-}
-
-fn build_timeframe_evidence(
-    _symbol: &str,
-    _ts_bucket: &str,
-    current_price: Option<f64>,
-    by_timeframe: &Map<String, Value>,
-    history: &BTreeMap<String, Vec<EvidenceSnapshot>>,
-) -> Map<String, Value> {
-    let mut result = Map::new();
-    for tf in SCAN_WINDOWS {
-        let tf_data = by_timeframe
-            .get(*tf)
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let trend = tf_data
-            .get("trend")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let flow = tf_data
-            .get("flow")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let structure = tf_data
-            .get("structure")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let volatility = tf_data
-            .get("volatility")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-
-        let ema_regime = trend
-            .get("ema_regime")
-            .and_then(Value::as_str)
-            .unwrap_or("ranging")
-            .to_string();
-        let cvd_bias = flow
-            .get("cvd")
-            .and_then(Value::as_object)
-            .and_then(|value| value.get("bias"))
-            .and_then(Value::as_str)
-            .unwrap_or("neutral")
-            .to_string();
-        let absorption_bias = flow
-            .get("absorption")
-            .and_then(Value::as_object)
-            .and_then(|value| value.get("bias"))
-            .and_then(Value::as_str)
-            .unwrap_or("neutral")
-            .to_string();
-        let whale_bias = flow
-            .get("whale")
-            .and_then(Value::as_object)
-            .and_then(|value| value.get("bias"))
-            .and_then(Value::as_str)
-            .unwrap_or("neutral")
-            .to_string();
-        let value_area_position = trend
-            .get("value_area_position")
-            .and_then(Value::as_str)
-            .unwrap_or("inside_va")
-            .to_string();
-        let structure_range = structure
-            .get("level_book")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let session_value_area = structure
-            .get("session_value_area")
-            .and_then(Value::as_object)
-            .cloned();
-        let primary_support_anchor = extract_level_anchor(&structure_range, "support", 0);
-        let secondary_support_anchor = extract_level_anchor(&structure_range, "support", 1);
-        let primary_resistance_anchor = extract_level_anchor(&structure_range, "resistance", 0);
-        let secondary_resistance_anchor = extract_level_anchor(&structure_range, "resistance", 1);
-        let primary_support = primary_support_anchor
-            .as_ref()
-            .map(|anchor| anchor.price)
-            .or_else(|| structure.get("swing_low").and_then(Value::as_f64));
-        let primary_resistance = primary_resistance_anchor
-            .as_ref()
-            .map(|anchor| anchor.price)
-            .or_else(|| structure.get("swing_high").and_then(Value::as_f64));
-        let atr14 = volatility
-            .get("atr14")
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let sideways_votes = [
-            (ema_regime == "ranging") as usize,
-            (value_area_position == "inside_va") as usize,
-            (cvd_bias == "neutral") as usize,
-            match (primary_support, primary_resistance) {
-                (Some(support), Some(resistance)) if atr14 > 0.0 => {
-                    ((resistance - support) < 2.0 * atr14) as usize
-                }
-                _ => 0,
-            },
-        ]
-        .iter()
-        .sum::<usize>();
-        let breakout_above = structure.get("swing_high").and_then(Value::as_f64);
-        let breakdown_below = structure.get("swing_low").and_then(Value::as_f64);
-        let preliminary_evidence = compute_bias_evidence(
-            tf,
-            sideways_votes,
-            &trend,
-            &flow,
-            current_price,
-            primary_support,
-            primary_resistance,
-            primary_support_anchor.as_ref(),
-            primary_resistance_anchor.as_ref(),
-        );
-        let (display_support, display_resistance, display_range_mode) = build_display_range(
-            tf,
-            current_price,
-            atr14,
-            primary_support,
-            primary_resistance,
-            primary_support_anchor.as_ref(),
-            secondary_support_anchor.as_ref(),
-            primary_resistance_anchor.as_ref(),
-            secondary_resistance_anchor.as_ref(),
-            breakout_above,
-            breakdown_below,
-            preliminary_evidence,
-        );
-        let display_support_anchor = resolve_selected_anchor(
-            display_support,
-            primary_support_anchor.as_ref(),
-            secondary_support_anchor.as_ref(),
-        );
-        let display_resistance_anchor = resolve_selected_anchor(
-            display_resistance,
-            primary_resistance_anchor.as_ref(),
-            secondary_resistance_anchor.as_ref(),
-        );
-        let display_range = build_display_range_value(
-            display_support,
-            display_resistance,
-            display_range_mode,
-            "default_bracket",
-            current_price,
-            atr14,
-            display_support_anchor.as_ref(),
-            display_resistance_anchor.as_ref(),
-        );
-        let micro_range = build_display_range_value(
-            primary_support,
-            primary_resistance,
-            "micro_bracket",
-            "compression",
-            current_price,
-            atr14,
-            primary_support_anchor.as_ref(),
-            primary_resistance_anchor.as_ref(),
-        );
-        let session_value_area_range = build_session_value_area_range_value(
-            session_value_area
-                .as_ref()
-                .and_then(|range| range.get("support"))
-                .and_then(Value::as_f64),
-            session_value_area
-                .as_ref()
-                .and_then(|range| range.get("resistance"))
-                .and_then(Value::as_f64),
-            current_price,
-            atr14,
-            session_value_area
-                .as_ref()
-                .and_then(|range| range.get("source_window"))
-                .and_then(Value::as_str),
-            session_value_area
-                .as_ref()
-                .and_then(|range| range.get("source_kind"))
-                .and_then(Value::as_str),
-        );
-        let evidence = compute_bias_evidence(
-            tf,
-            sideways_votes,
-            &trend,
-            &flow,
-            current_price,
-            display_support,
-            display_resistance,
-            display_support_anchor.as_ref(),
-            display_resistance_anchor.as_ref(),
-        );
-        let mut evidence_entry = Map::new();
-        evidence_entry.insert(
-            "primary_support".to_string(),
-            primary_support.map(Value::from).unwrap_or(Value::Null),
-        );
-        evidence_entry.insert(
-            "primary_resistance".to_string(),
-            primary_resistance.map(Value::from).unwrap_or(Value::Null),
-        );
-        evidence_entry.insert("display_range".to_string(), display_range.clone());
-        evidence_entry.insert(
-            "ranges".to_string(),
-            json!({
-                "micro_range": micro_range,
-                "local_structure_range": display_range,
-                "session_value_area_range": session_value_area_range,
-            }),
-        );
-        evidence_entry.insert(
-            "breakout_above".to_string(),
-            breakout_above.map(Value::from).unwrap_or(Value::Null),
-        );
-        evidence_entry.insert(
-            "breakdown_below".to_string(),
-            breakdown_below.map(Value::from).unwrap_or(Value::Null),
-        );
-        evidence_entry.insert(
-            "balance_scores".to_string(),
-            build_balance_scores_value(evidence),
-        );
-        evidence_entry.insert(
-            "risk_opportunity".to_string(),
-            json!({
-                "upside_opportunity_score": upside_pressure(current_price, display_resistance, atr14, evidence),
-                "downside_risk_score": downside_pressure(current_price, display_support, atr14, evidence),
-            }),
-        );
-        evidence_entry.insert(
-            "clearance_atr".to_string(),
-            json!({
-                "to_support": current_price
-                    .zip(display_support)
-                    .filter(|(price, support)| atr14 > 0.0 && *support <= *price)
-                    .map(|(price, support)| round2((price - support) / atr14))
-                    .map(Value::from)
-                    .unwrap_or(Value::Null),
-                "to_resistance": current_price
-                    .zip(display_resistance)
-                    .filter(|(price, resistance)| atr14 > 0.0 && *resistance >= *price)
-                    .map(|(price, resistance)| round2((resistance - price) / atr14))
-                    .map(Value::from)
-                    .unwrap_or(Value::Null),
-                "to_breakdown": current_price
-                    .zip(breakdown_below)
-                    .filter(|(price, level)| atr14 > 0.0 && *level <= *price)
-                    .map(|(price, level)| round2((price - level) / atr14))
-                    .map(Value::from)
-                    .unwrap_or(Value::Null),
-                "to_breakout": current_price
-                    .zip(breakout_above)
-                    .filter(|(price, level)| atr14 > 0.0 && *level >= *price)
-                    .map(|(price, level)| round2((level - price) / atr14))
-                    .map(Value::from)
-                    .unwrap_or(Value::Null),
-            }),
-        );
-        evidence_entry.insert(
-            "signal_snapshot".to_string(),
-            json!({
-                "ema_regime": ema_regime,
-                "cvd_bias": cvd_bias,
-                "absorption_bias": absorption_bias,
-                "initiation_bias": flow
-                    .get("initiation")
-                    .and_then(Value::as_object)
-                    .and_then(|value| value.get("bias"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("neutral"),
-                "whale_bias": whale_bias,
-                "value_area_position": value_area_position,
-                "funding_rate_sign": flow
-                    .get("funding")
-                    .and_then(Value::as_object)
-                    .and_then(|value| value.get("rate_sign"))
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0),
-                "vpin_elevated": flow
-                    .get("vpin")
-                    .and_then(Value::as_object)
-                    .and_then(|value| value.get("elevated"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            }),
-        );
-        if let Some(stability) = build_temporal_stability(
-            history.get(*tf).map(Vec::as_slice).unwrap_or(&[]),
-            evidence,
-            primary_support,
-            primary_resistance,
-            atr14,
-        ) {
-            evidence_entry.insert("temporal_stability".to_string(), stability);
-        }
-        result.insert((*tf).to_string(), Value::Object(evidence_entry));
-    }
-    result
-}
-
-fn build_multi_timeframe_evidence(
-    current_price: Option<f64>,
-    timeframe_evidence: &Map<String, Value>,
-) -> Value {
-    let tf15 = timeframe_evidence.get("15m").and_then(Value::as_object);
-    let tf4h = timeframe_evidence.get("4h").and_then(Value::as_object);
-    let tf1d = timeframe_evidence.get("1d").and_then(Value::as_object);
-
-    let score15 = tf15
-        .and_then(|value| value.get("balance_scores"))
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("evidence_balance_score"))
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    let score4h = tf4h
-        .and_then(|value| value.get("balance_scores"))
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("evidence_balance_score"))
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    let score1d = tf1d
-        .and_then(|value| value.get("balance_scores"))
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("evidence_balance_score"))
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-
-    json!({
-        "macro_tf": "1d",
-        "setup_tf": "4h",
-        "trigger_tf": "15m",
-        "balance_scores": {
-            "15m": round3(score15),
-            "4h": round3(score4h),
-            "1d": round3(score1d),
-        },
-        "pair_coherence": {
-            "1d_4h": round3((score1d * score4h).clamp(-1.0, 1.0)),
-            "4h_15m": round3((score4h * score15).clamp(-1.0, 1.0)),
-        },
-        "range_nesting": {
-            "15m_inside_4h": ranges_nested(tf15, tf4h),
-            "4h_inside_1d": ranges_nested(tf4h, tf1d),
-        },
-        "current_price": current_price,
-    })
-}
-
-fn ranges_nested(inner: Option<&Map<String, Value>>, outer: Option<&Map<String, Value>>) -> Value {
-    let inner_support = inner
-        .and_then(|value| value.get("display_range"))
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("support"))
-        .and_then(Value::as_f64);
-    let inner_resistance = inner
-        .and_then(|value| value.get("display_range"))
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("resistance"))
-        .and_then(Value::as_f64);
-    let outer_support = outer
-        .and_then(|value| value.get("display_range"))
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("support"))
-        .and_then(Value::as_f64);
-    let outer_resistance = outer
-        .and_then(|value| value.get("display_range"))
-        .and_then(Value::as_object)
-        .and_then(|value| value.get("resistance"))
-        .and_then(Value::as_f64);
-
-    match (
-        inner_support,
-        inner_resistance,
-        outer_support,
-        outer_resistance,
-    ) {
-        (
-            Some(inner_support),
-            Some(inner_resistance),
-            Some(outer_support),
-            Some(outer_resistance),
-        ) => Value::Bool(inner_support >= outer_support && inner_resistance <= outer_resistance),
-        _ => Value::Null,
-    }
-}
-
-fn build_temporal_stability(
-    history: &[EvidenceSnapshot],
-    evidence: BiasEvidence,
-    primary_support: Option<f64>,
-    primary_resistance: Option<f64>,
-    atr14: f64,
-) -> Option<Value> {
-    if history.is_empty() {
-        return None;
-    }
-    let mut samples = history.to_vec();
-    samples.sort_by(|left, right| left.ts_bucket.cmp(&right.ts_bucket));
-    let mut trend_balance_labels = samples
-        .iter()
-        .map(|snapshot| evidence_bucket(snapshot.trend_balance_score))
-        .collect::<Vec<_>>();
-    trend_balance_labels.push(evidence_bucket(evidence.trend_balance_score));
-    let mut flow_balance_labels = samples
-        .iter()
-        .map(|snapshot| evidence_bucket(snapshot.flow_balance_score))
-        .collect::<Vec<_>>();
-    flow_balance_labels.push(evidence_bucket(evidence.flow_balance_score));
-    let mut evidence_balance_labels = samples
-        .iter()
-        .map(|snapshot| evidence_bucket(snapshot.evidence_balance_score))
-        .collect::<Vec<_>>();
-    evidence_balance_labels.push(evidence_bucket(evidence.evidence_balance_score));
-    let oldest = samples.first()?;
-    let support_drift_atr = match (primary_support, atr14 > 0.0) {
-        (Some(primary_support), true) => {
-            round2((primary_support - oldest.primary_support).abs() / atr14)
-        }
-        _ => 0.0,
-    };
-    let resistance_drift_atr = match (primary_resistance, atr14 > 0.0) {
-        (Some(primary_resistance), true) => {
-            round2((primary_resistance - oldest.primary_resistance).abs() / atr14)
-        }
-        _ => 0.0,
-    };
-    let balance_flip_count = evidence_balance_labels
-        .windows(2)
-        .filter(|pair| pair[0] != pair[1])
-        .count();
-    let evidence_balance_drift =
-        round2((evidence.evidence_balance_score - oldest.evidence_balance_score).abs());
-    Some(json!({
-        "samples_used": samples.len() + 1,
-        "trend_balance_consensus": consensus_label(&trend_balance_labels),
-        "flow_balance_consensus": consensus_label(&flow_balance_labels),
-        "evidence_balance_consensus": consensus_label(&evidence_balance_labels),
-        "range_stability": range_stability_label(support_drift_atr, resistance_drift_atr),
-        "balance_flip_count": balance_flip_count,
-        "support_drift_atr": support_drift_atr,
-        "resistance_drift_atr": resistance_drift_atr,
-        "evidence_balance_drift": evidence_balance_drift,
-    }))
-}
-
-fn consensus_label(values: &[&str]) -> &'static str {
-    if values.len() == 2 {
-        return if values[0] == values[1] {
-            "stable"
-        } else {
-            "unstable"
-        };
-    }
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for value in values {
-        *counts.entry(*value).or_default() += 1;
-    }
-    let best = counts.values().copied().max().unwrap_or_default();
-    match best {
-        3 => "stable",
-        2 => "mixed",
-        _ => "unstable",
-    }
-}
-
-fn range_stability_label(support_drift_atr: f64, resistance_drift_atr: f64) -> &'static str {
-    let max_drift = support_drift_atr.max(resistance_drift_atr);
-    if max_drift < 0.5 {
-        "stable"
-    } else if max_drift < 1.5 {
-        "shifting"
-    } else {
-        "unstable"
-    }
-}
-
-fn load_recent_scan_evidence(
-    symbol: &str,
-    current_ts_bucket: &str,
-) -> BTreeMap<String, Vec<EvidenceSnapshot>> {
-    let mut per_tf: BTreeMap<String, Vec<EvidenceSnapshot>> = SCAN_WINDOWS
-        .iter()
-        .map(|tf| ((*tf).to_string(), Vec::new()))
-        .collect();
-
-    let Ok(entries) = fs::read_dir("/data/systems/llm/temp_model_input") else {
-        return per_tf;
-    };
-    let mut paths = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .map(|name| name.contains(&format!("_{symbol}_scan_")) && name.ends_with(".json"))
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-    paths.sort();
-    for path in paths.into_iter().rev().take(12) {
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(root) = serde_json::from_str::<Value>(&raw) else {
-            continue;
-        };
-        let file_symbol = root
-            .get("symbol")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let file_ts_bucket = root
-            .get("ts_bucket")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if file_symbol != symbol || file_ts_bucket == current_ts_bucket {
-            continue;
-        }
-        for tf in SCAN_WINDOWS {
-            let snapshot = root
-                .get("timeframe_evidence")
-                .and_then(Value::as_object)
-                .and_then(|evidence| evidence.get(*tf))
-                .and_then(Value::as_object)
-                .map(|evidence| EvidenceSnapshot {
-                    ts_bucket: file_ts_bucket.to_string(),
-                    trend_balance_score: evidence
-                        .get("balance_scores")
-                        .and_then(Value::as_object)
-                        .and_then(|value| value.get("trend_balance_score"))
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0),
-                    flow_balance_score: evidence
-                        .get("balance_scores")
-                        .and_then(Value::as_object)
-                        .and_then(|value| value.get("flow_balance_score"))
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0),
-                    evidence_balance_score: evidence
-                        .get("balance_scores")
-                        .and_then(Value::as_object)
-                        .and_then(|value| value.get("evidence_balance_score"))
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0),
-                    primary_support: evidence
-                        .get("primary_support")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0),
-                    primary_resistance: evidence
-                        .get("primary_resistance")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0),
-                })
-                .or_else(|| {
-                    root.get("timeframe_decision")
-                        .and_then(Value::as_object)
-                        .and_then(|decisions| decisions.get(*tf))
-                        .and_then(Value::as_object)
-                        .map(|decision| {
-                            let trend_balance_score = decision
-                                .get("signals")
-                                .and_then(Value::as_object)
-                                .and_then(|value| value.get("ema_regime"))
-                                .and_then(Value::as_str)
-                                .map(directional_string_score)
-                                .unwrap_or(0.0);
-                            let flow_balance_score = weighted_average_scores(&[
-                                (
-                                    decision
-                                        .get("signals")
-                                        .and_then(Value::as_object)
-                                        .and_then(|value| value.get("cvd_bias"))
-                                        .and_then(Value::as_str)
-                                        .map(directional_string_score)
-                                        .unwrap_or(0.0),
-                                    0.4,
-                                ),
-                                (
-                                    decision
-                                        .get("signals")
-                                        .and_then(Value::as_object)
-                                        .and_then(|value| value.get("absorption_bias"))
-                                        .and_then(Value::as_str)
-                                        .map(directional_string_score)
-                                        .unwrap_or(0.0),
-                                    0.3,
-                                ),
-                                (
-                                    decision
-                                        .get("signals")
-                                        .and_then(Value::as_object)
-                                        .and_then(|value| value.get("whale_bias"))
-                                        .and_then(Value::as_str)
-                                        .map(directional_string_score)
-                                        .unwrap_or(0.0),
-                                    0.3,
-                                ),
-                            ]);
-                            let evidence_balance_score = decision
-                                .get("direction")
-                                .and_then(Value::as_str)
-                                .map(directional_string_score)
-                                .unwrap_or(0.0);
-                            EvidenceSnapshot {
-                                ts_bucket: file_ts_bucket.to_string(),
-                                trend_balance_score: round3(trend_balance_score),
-                                flow_balance_score: round3(flow_balance_score),
-                                evidence_balance_score: round3(evidence_balance_score),
-                                primary_support: decision
-                                    .get("primary_support")
-                                    .and_then(Value::as_f64)
-                                    .unwrap_or(0.0),
-                                primary_resistance: decision
-                                    .get("primary_resistance")
-                                    .and_then(Value::as_f64)
-                                    .unwrap_or(0.0),
-                            }
-                        })
-                });
-            let Some(snapshot) = snapshot else {
-                continue;
-            };
-            let items = per_tf.entry((*tf).to_string()).or_default();
-            items.push(snapshot);
-            items.sort_by(|left, right| left.ts_bucket.cmp(&right.ts_bucket));
-            if items.len() > 2 {
-                let drain = items.len() - 2;
-                items.drain(0..drain);
-            }
-        }
-    }
-    per_tf
-}
-
-fn rebuild_indicator(indicator: &Value, payload: Value) -> Value {
-    let mut rebuilt = indicator
-        .as_object()
-        .map(|map| {
-            map.iter()
-                .filter(|(key, _)| key.as_str() == "payload")
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect::<Map<String, Value>>()
-        })
-        .unwrap_or_default();
-    rebuilt.insert("payload".to_string(), payload);
-    Value::Object(rebuilt)
-}
-
-fn filter_price_volume_structure(payload: &Value) -> Value {
-    let Some(payload) = payload.as_object() else {
-        return Value::Null;
-    };
-    let mut result = Map::new();
-    copy_fields(
-        &mut result,
-        payload,
-        &[
-            "poc_price",
-            "poc_volume",
-            "vah",
-            "val",
-            "bar_volume",
-            "hvn_levels",
-            "lvn_levels",
-        ],
-    );
-
-    if let Some(by_window) = payload.get("by_window").and_then(Value::as_object) {
-        let mut filtered_windows = Map::new();
-        for window in SCAN_WINDOWS {
-            let Some(window_value) = by_window.get(*window).and_then(Value::as_object) else {
-                continue;
-            };
-            let mut filtered_window = Map::new();
-            copy_fields(
-                &mut filtered_window,
-                window_value,
-                &[
-                    "poc_price",
-                    "poc_volume",
-                    "vah",
-                    "val",
-                    "bar_volume",
-                    "hvn_levels",
-                    "lvn_levels",
-                    "window_bars_used",
-                    "volume_zscore",
-                    "volume_dryup",
-                ],
-            );
-            filtered_window.insert(
-                "va_top_levels".to_string(),
-                Value::Array(build_va_top_levels(
-                    window_value
-                        .get("value_area_levels")
-                        .and_then(Value::as_array),
-                    SCAN_VA_TOP_LEVELS,
-                )),
-            );
-            filtered_windows.insert((*window).to_string(), Value::Object(filtered_window));
-        }
-        result.insert("by_window".to_string(), Value::Object(filtered_windows));
-    }
-
-    Value::Object(result)
-}
-
-fn filter_tpo_market_profile(payload: &Value) -> Value {
-    let mut payload = payload.clone();
-    // Keep the full TPO payload, but normalize dev_series ordering to newest-first
-    // so every retained scan timeseries follows the same prompt-facing convention.
-    if let Some(dev_series) = payload.get_mut("dev_series").and_then(Value::as_object_mut) {
-        for series in dev_series.values_mut() {
-            if let Some(items) = series.as_array_mut() {
-                items.reverse();
-                items.truncate(5);
-            }
-        }
-    }
-    if let Some(by_session) = payload.get_mut("by_session").and_then(Value::as_object_mut) {
-        for session in by_session.values_mut() {
-            if let Some(dev_series) = session.get_mut("dev_series").and_then(Value::as_object_mut) {
-                for series in dev_series.values_mut() {
-                    if let Some(items) = series.as_array_mut() {
-                        items.reverse();
-                        items.truncate(5);
-                    }
-                }
-            }
-        }
-    }
-    payload
-}
-
-fn filter_fvg(payload: &Value) -> Value {
-    let Some(payload) = payload.as_object() else {
-        return Value::Null;
-    };
-    let mut result = Map::new();
-    copy_fields(
-        &mut result,
-        payload,
-        &["base_detection_uses_spot", "source_market"],
-    );
-
-    if let Some(by_window) = payload.get("by_window").and_then(Value::as_object) {
-        let mut filtered_windows = Map::new();
-        for window in SCAN_WINDOWS {
-            let Some(window_value) = by_window.get(*window).and_then(Value::as_object) else {
-                continue;
-            };
-            let mut filtered_window = Map::new();
-            copy_fields(
-                &mut filtered_window,
-                window_value,
-                &[
-                    "active_bull_fvgs",
-                    "active_bear_fvgs",
-                    "is_ready",
-                    "coverage_ratio",
-                ],
-            );
-            if let Some(value) = window_value.get("nearest_bull_fvg") {
-                let sanitized = sanitize_fvg_value(value);
-                if !sanitized.is_null() {
-                    filtered_window.insert("nearest_bull_fvg".to_string(), sanitized);
-                }
-            }
-            if let Some(value) = window_value.get("nearest_bear_fvg") {
-                let sanitized = sanitize_fvg_value(value);
-                if !sanitized.is_null() {
-                    filtered_window.insert("nearest_bear_fvg".to_string(), sanitized);
-                }
-            }
-            sanitize_fvg_array_field(&mut filtered_window, "active_bull_fvgs");
-            sanitize_fvg_array_field(&mut filtered_window, "active_bear_fvgs");
-            filtered_windows.insert((*window).to_string(), Value::Object(filtered_window));
-        }
-        result.insert("by_window".to_string(), Value::Object(filtered_windows));
-    }
-
-    Value::Object(result)
-}
-
-fn filter_kline_history(payload: &Value) -> Value {
-    let Some(payload) = payload.as_object() else {
-        return Value::Null;
-    };
-    let mut result = Map::new();
-    copy_fields(&mut result, payload, &["as_of_ts"]);
-
-    let Some(intervals) = payload.get("intervals").and_then(Value::as_object) else {
-        return Value::Object(result);
-    };
-
-    let mut filtered_intervals = Map::new();
-    for (interval, limit) in [("15m", 30usize), ("4h", 20usize), ("1d", 14usize)] {
-        let Some(interval_obj) = intervals.get(interval).and_then(Value::as_object) else {
-            continue;
-        };
-        let Some(markets) = interval_obj.get("markets").and_then(Value::as_object) else {
-            continue;
-        };
-        let Some(futures_bars) = markets
-            .get("futures")
-            .and_then(Value::as_object)
-            .and_then(|futures| futures.get("bars"))
-            .and_then(Value::as_array)
-        else {
-            continue;
-        };
-
-        let bars = take_last_n(futures_bars, limit)
-            .into_iter()
-            .filter_map(|bar| bar.as_object().cloned())
-            .map(|bar| {
-                json!({
-                    "o": bar.get("open").cloned().unwrap_or(Value::Null),
-                    "h": bar.get("high").cloned().unwrap_or(Value::Null),
-                    "l": bar.get("low").cloned().unwrap_or(Value::Null),
-                    "c": bar.get("close").cloned().unwrap_or(Value::Null),
-                    "v": bar.get("volume_base").cloned().unwrap_or(Value::Null),
-                    "t": bar.get("open_time").cloned().unwrap_or(Value::Null),
-                    "closed": bar.get("is_closed").cloned().unwrap_or(Value::Null),
-                })
-            })
-            .collect::<Vec<_>>();
-
-        filtered_intervals.insert(
-            interval.to_string(),
-            json!({
-                "markets": {
-                    "futures": bars
-                }
-            }),
-        );
-    }
-    result.insert("intervals".to_string(), Value::Object(filtered_intervals));
-    Value::Object(result)
-}
-
 fn filter_cvd_pack(payload: &Value) -> Value {
     let Some(payload) = payload.as_object() else {
         return Value::Null;
@@ -3261,10 +3661,11 @@ fn filter_cvd_pack(payload: &Value) -> Value {
             "cvd_slope_spot",
         ],
     );
+    result.retain(|_, value| !value.is_null());
 
     if let Some(by_window) = payload.get("by_window").and_then(Value::as_object) {
         let mut filtered_windows = Map::new();
-        for (window, limit) in [("15m", 30usize), ("4h", 20usize), ("1d", usize::MAX)] {
+        for (window, limit) in [("15m", 12usize), ("4h", 8usize), ("1d", 5usize)] {
             let Some(window_value) = by_window.get(window).and_then(Value::as_object) else {
                 continue;
             };
@@ -3294,6 +3695,7 @@ fn filter_cvd_pack(payload: &Value) -> Value {
                             "xmk_delta_gap_s_minus_f",
                         ],
                     );
+                    filtered_entry.retain(|_, value| !value.is_null());
                     Value::Object(filtered_entry)
                 })
                 .collect::<Vec<_>>();
@@ -3305,140 +3707,148 @@ fn filter_cvd_pack(payload: &Value) -> Value {
     Value::Object(result)
 }
 
-fn filter_avwap(payload: &Value) -> Value {
+fn filter_whale_trades(payload: &Value) -> Value {
     let Some(payload) = payload.as_object() else {
         return Value::Null;
     };
-    let mut result =
-        clone_object_without_keys(payload, &["series_by_window", "indicator", "window"]);
-
-    if let Some(series_by_window) = payload.get("series_by_window").and_then(Value::as_object) {
-        let mut filtered_windows = Map::new();
-        for (window, limit) in [("15m", 3usize), ("4h", 3usize), ("1d", 3usize)] {
-            let Some(series) = series_by_window.get(window).and_then(Value::as_array) else {
-                continue;
-            };
-            let filtered_series = take_last_n(series, limit)
-                .into_iter()
-                .filter_map(|entry| entry.as_object().cloned())
-                .map(|entry| {
-                    let mut filtered_entry = Map::new();
-                    copy_fields(
-                        &mut filtered_entry,
-                        &entry,
-                        &["ts", "avwap_fut", "avwap_spot", "xmk_avwap_gap_f_minus_s"],
-                    );
-                    Value::Object(filtered_entry)
-                })
-                .collect::<Vec<_>>();
-            filtered_windows.insert(window.to_string(), Value::Array(filtered_series));
-        }
-        result.insert(
-            "series_by_window".to_string(),
-            Value::Object(filtered_windows),
-        );
-    }
-
-    Value::Object(result)
-}
-
-fn filter_rvwap_sigma_bands(payload: &Value) -> Value {
-    let Some(payload) = payload.as_object() else {
-        return Value::Null;
-    };
-    let mut result = clone_object_without_keys(
-        payload,
-        &[
-            "by_window",
-            "series_by_output_window",
-            "indicator",
-            "window",
-        ],
-    );
-
+    let mut result = Map::new();
+    copy_fields(&mut result, payload, &["threshold_usdt"]);
     if let Some(by_window) = payload.get("by_window").and_then(Value::as_object) {
         let mut filtered_windows = Map::new();
-        for window in SCAN_WINDOWS {
-            if let Some(window_value) = by_window.get(*window) {
-                filtered_windows.insert((*window).to_string(), window_value.clone());
-            }
+        for window in collect_available_windows(by_window) {
+            let Some(window_value) = by_window.get(&window).and_then(Value::as_object) else {
+                continue;
+            };
+            filtered_windows.insert(
+                window,
+                object_subset_value(
+                    window_value,
+                    &[
+                        "window",
+                        "fut_whale_delta_notional",
+                        "spot_whale_delta_notional",
+                        "xmk_whale_delta_notional_gap_s_minus_f",
+                        "fut_notional_sum_usd",
+                        "spot_notional_sum_usd",
+                        "fut_buy_count",
+                        "fut_sell_count",
+                        "spot_buy_count",
+                        "spot_sell_count",
+                    ],
+                ),
+            );
         }
         result.insert("by_window".to_string(), Value::Object(filtered_windows));
     }
-
-    let z_series = payload
-        .get("series_by_output_window")
-        .and_then(Value::as_object)
-        .and_then(|series_by_output| series_by_output.get("15m"))
-        .and_then(Value::as_array)
-        .map(|series| take_last_n(series, 20))
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|entry| entry.as_object().cloned())
-        .map(|entry| {
-            let mut z = Map::new();
-            if let Some(by_window) = entry.get("by_window").and_then(Value::as_object) {
-                for window in SCAN_WINDOWS {
-                    if let Some(z_value) = by_window
-                        .get(*window)
-                        .and_then(Value::as_object)
-                        .and_then(|window_obj| window_obj.get("z_price_minus_rvwap"))
-                    {
-                        z.insert((*window).to_string(), z_value.clone());
-                    }
-                }
-            }
-            json!({
-                "ts": entry.get("ts").cloned().unwrap_or(Value::Null),
-                "z": z
-            })
-        })
-        .collect::<Vec<_>>();
-    result.insert("z_series_15m".to_string(), Value::Array(z_series));
-
     Value::Object(result)
 }
 
-fn filter_ema_trend_regime(payload: &Value) -> Value {
+fn filter_vpin(payload: &Value) -> Value {
     let Some(payload) = payload.as_object() else {
         return Value::Null;
     };
-    let mut result = clone_object_without_keys(
+    let mut result = Map::new();
+    copy_fields(
+        &mut result,
         payload,
-        &["ffill_series_by_output_window", "indicator", "window"],
+        &[
+            "vpin_bucket_size_eth",
+            "vpin_model",
+            "vpin_unit",
+            "vpin_rolling_bucket_count",
+        ],
     );
+    if let Some(by_window) = payload.get("by_window").and_then(Value::as_object) {
+        let mut filtered_windows = Map::new();
+        for window in collect_available_windows(by_window) {
+            let Some(window_value) = by_window.get(&window).and_then(Value::as_object) else {
+                continue;
+            };
+            filtered_windows.insert(
+                window,
+                object_subset_value(
+                    window_value,
+                    &[
+                        "window",
+                        "vpin_fut",
+                        "vpin_spot",
+                        "vpin_ratio_s_over_f",
+                        "xmk_vpin_gap_s_minus_f",
+                        "z_vpin_fut",
+                        "z_vpin_spot",
+                        "z_vpin_gap_s_minus_f",
+                    ],
+                ),
+            );
+        }
+        result.insert("by_window".to_string(), Value::Object(filtered_windows));
+    }
+    Value::Object(result)
+}
 
-    let regime_series = payload
-        .get("ffill_series_by_output_window")
+fn filter_high_volume_pulse(payload: &Value) -> Value {
+    let Some(payload) = payload.as_object() else {
+        return Value::Null;
+    };
+    let mut result = Map::new();
+    copy_fields(
+        &mut result,
+        payload,
+        &[
+            "as_of_ts",
+            "intrabar_poc_price",
+            "intrabar_poc_volume",
+            "window",
+        ],
+    );
+    if let Some(by_window) = payload.get("by_z_window").and_then(Value::as_object) {
+        let mut filtered = Map::new();
+        for window in collect_available_windows(by_window) {
+            let Some(entry) = by_window.get(&window).and_then(Value::as_object) else {
+                continue;
+            };
+            filtered.insert(
+                window,
+                object_subset_value(
+                    entry,
+                    &[
+                        "window_minutes",
+                        "lookback_samples",
+                        "rolling_volume_w",
+                        "volume_spike_z_w",
+                    ],
+                ),
+            );
+        }
+        result.insert("by_z_window".to_string(), Value::Object(filtered));
+    }
+    if let Some(by_window) = payload
+        .get("intrabar_poc_max_by_window")
         .and_then(Value::as_object)
-        .and_then(|series_by_output| series_by_output.get("15m"))
-        .and_then(Value::as_array)
-        .map(|series| take_last_n(series, 20))
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|entry| entry.as_object().cloned())
-        .map(|entry| {
-            let by_tf = entry.get("by_tf").and_then(Value::as_object);
-            json!({
-                "ts": entry.get("ts").cloned().unwrap_or(Value::Null),
-                "trend_regime": entry.get("trend_regime").cloned().unwrap_or(Value::Null),
-                "trend_regime_4h": by_tf
-                    .and_then(|value| value.get("4h"))
-                    .and_then(Value::as_object)
-                    .and_then(|value| value.get("trend_regime"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                "trend_regime_1d": by_tf
-                    .and_then(|value| value.get("1d"))
-                    .and_then(Value::as_object)
-                    .and_then(|value| value.get("trend_regime"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            })
-        })
-        .collect::<Vec<_>>();
-    result.insert("regime_series_15m".to_string(), Value::Array(regime_series));
-
+    {
+        let mut filtered = Map::new();
+        for window in collect_available_windows(by_window) {
+            let Some(entry) = by_window.get(&window).and_then(Value::as_object) else {
+                continue;
+            };
+            filtered.insert(
+                window,
+                object_subset_value(
+                    entry,
+                    &[
+                        "intrabar_poc_price",
+                        "intrabar_poc_volume",
+                        "ts",
+                        "window_minutes",
+                    ],
+                ),
+            );
+        }
+        result.insert(
+            "intrabar_poc_max_by_window".to_string(),
+            Value::Object(filtered),
+        );
+    }
     Value::Object(result)
 }
 
@@ -3534,10 +3944,6 @@ fn filter_liquidation_density(payload: &Value) -> Value {
     Value::Object(result)
 }
 
-fn filter_footprint(payload: &Value) -> Value {
-    filter_footprint_with_price(payload, None)
-}
-
 fn filter_footprint_with_price(payload: &Value, current_price: Option<f64>) -> Value {
     let Some(payload) = payload.as_object() else {
         return Value::Null;
@@ -3548,8 +3954,11 @@ fn filter_footprint_with_price(payload: &Value, current_price: Option<f64>) -> V
     };
 
     let mut filtered_windows = Map::new();
-    for (window, bin_size) in [("15m", 0.1_f64), ("4h", 0.5_f64), ("1d", 1.0_f64)] {
-        let Some(window_value) = by_window.get(window).and_then(Value::as_object) else {
+    for window in collect_available_windows(by_window) {
+        if !matches!(window.as_str(), "15m" | "4h" | "1d" | "3d") {
+            continue;
+        }
+        let Some(window_value) = by_window.get(&window).and_then(Value::as_object) else {
             continue;
         };
         let mut filtered_window = Map::new();
@@ -3566,6 +3975,26 @@ fn filter_footprint_with_price(payload: &Value, current_price: Option<f64>) -> V
                 "stacked_sell",
             ],
         );
+        if let Some(max_buy_stack_len) = window_value
+            .get("max_buy_stack_len")
+            .and_then(Value::as_u64)
+            .or_else(|| max_stack_len(window_value.get("buy_stacks").and_then(Value::as_array)))
+        {
+            filtered_window.insert(
+                "max_buy_stack_len".to_string(),
+                Value::from(max_buy_stack_len),
+            );
+        }
+        if let Some(max_sell_stack_len) = window_value
+            .get("max_sell_stack_len")
+            .and_then(Value::as_u64)
+            .or_else(|| max_stack_len(window_value.get("sell_stacks").and_then(Value::as_array)))
+        {
+            filtered_window.insert(
+                "max_sell_stack_len".to_string(),
+                Value::from(max_sell_stack_len),
+            );
+        }
         let selected_price = current_price
             .or_else(|| window_value.get("ua_top").and_then(Value::as_f64))
             .or_else(|| window_value.get("ua_bottom").and_then(Value::as_f64))
@@ -3583,24 +4012,52 @@ fn filter_footprint_with_price(payload: &Value, current_price: Option<f64>) -> V
         let buy_clusters = window_value
             .get("buy_imbalance_prices")
             .and_then(Value::as_array)
-            .map(|prices| aggregate_price_clusters(prices, bin_size))
-            .map(|items| footprint_nearest_clusters(&items, selected_price, 2))
+            .map(|prices| build_price_clusters(&collect_numeric_price_entries(prices)))
+            .map(|items| {
+                footprint_nearest_clusters(
+                    &items,
+                    selected_price,
+                    FOOTPRINT_CLUSTER_NEAR_PER_SIDE,
+                    FOOTPRINT_CLUSTER_STRONG_PER_SIDE,
+                    FOOTPRINT_CLUSTER_MID_PER_SIDE,
+                    FOOTPRINT_CLUSTER_DEEP_PER_SIDE,
+                )
+            })
             .unwrap_or_else(|| json!({"above": [], "below": []}));
         let sell_clusters = window_value
             .get("sell_imbalance_prices")
             .and_then(Value::as_array)
-            .map(|prices| aggregate_price_clusters(prices, bin_size))
-            .map(|items| footprint_nearest_clusters(&items, selected_price, 2))
+            .map(|prices| build_price_clusters(&collect_numeric_price_entries(prices)))
+            .map(|items| {
+                footprint_nearest_clusters(
+                    &items,
+                    selected_price,
+                    FOOTPRINT_CLUSTER_NEAR_PER_SIDE,
+                    FOOTPRINT_CLUSTER_STRONG_PER_SIDE,
+                    FOOTPRINT_CLUSTER_MID_PER_SIDE,
+                    FOOTPRINT_CLUSTER_DEEP_PER_SIDE,
+                )
+            })
             .unwrap_or_else(|| json!({"above": [], "below": []}));
         filtered_window.insert("buy_stacks".to_string(), buy_stacks);
         filtered_window.insert("sell_stacks".to_string(), sell_stacks);
         filtered_window.insert("buy_imb_clusters".to_string(), buy_clusters);
         filtered_window.insert("sell_imb_clusters".to_string(), sell_clusters);
-        filtered_windows.insert(window.to_string(), Value::Object(filtered_window));
+        filtered_windows.insert(window, Value::Object(filtered_window));
     }
     result.insert("by_window".to_string(), Value::Object(filtered_windows));
 
     Value::Object(result)
+}
+
+fn max_stack_len(items: Option<&Vec<Value>>) -> Option<u64> {
+    items.and_then(|items| {
+        items
+            .iter()
+            .filter_map(Value::as_object)
+            .filter_map(|item| item.get("length").and_then(Value::as_u64))
+            .max()
+    })
 }
 
 fn footprint_nearest_stacks(items: &[Value], current_price: f64, limit: usize) -> Value {
@@ -3683,79 +4140,50 @@ fn footprint_nearest_stacks(items: &[Value], current_price: f64, limit: usize) -
     })
 }
 
-fn footprint_nearest_clusters(items: &[Value], current_price: f64, limit: usize) -> Value {
-    let to_compact = |item: &Value| -> Value {
+fn footprint_nearest_clusters(
+    items: &[PriceClusterCandidate],
+    current_price: f64,
+    near_limit: usize,
+    strong_limit: usize,
+    mid_limit: usize,
+    deep_limit: usize,
+) -> Value {
+    let to_compact = |item: &PriceClusterCandidate| -> Value {
         let mut compact = Map::new();
-        if let Some(object) = item.as_object() {
-            copy_fields(&mut compact, object, &["p", "n"]);
-            if let Some(price) = object.get("p").and_then(Value::as_f64) {
-                compact.insert(
-                    "dist".to_string(),
-                    Value::from(round2((price - current_price).abs())),
-                );
-            }
-        }
+        compact.insert("p".to_string(), Value::from(round2(item.mid)));
+        compact.insert("price_low".to_string(), Value::from(round2(item.low)));
+        compact.insert("price_high".to_string(), Value::from(round2(item.high)));
+        compact.insert("n".to_string(), Value::from(item.count as u64));
+        compact.insert(
+            "dist".to_string(),
+            Value::from(round2(cluster_distance_to_price(item, current_price))),
+        );
         Value::Object(compact)
     };
-    let mut above = items
-        .iter()
-        .filter(|item| {
-            item.get("p")
-                .and_then(Value::as_f64)
-                .map(|price| price > current_price)
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-    let mut below = items
-        .iter()
-        .filter(|item| {
-            item.get("p")
-                .and_then(Value::as_f64)
-                .map(|price| price < current_price)
-                .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
-    above.sort_by(|left, right| {
-        let left_dist = left
-            .get("p")
-            .and_then(Value::as_f64)
-            .map(|price| (price - current_price).abs())
-            .unwrap_or(f64::INFINITY);
-        let right_dist = right
-            .get("p")
-            .and_then(Value::as_f64)
-            .map(|price| (price - current_price).abs())
-            .unwrap_or(f64::INFINITY);
-        left_dist
-            .partial_cmp(&right_dist)
-            .unwrap_or(Ordering::Equal)
-    });
-    below.sort_by(|left, right| {
-        let left_dist = left
-            .get("p")
-            .and_then(Value::as_f64)
-            .map(|price| (price - current_price).abs())
-            .unwrap_or(f64::INFINITY);
-        let right_dist = right
-            .get("p")
-            .and_then(Value::as_f64)
-            .map(|price| (price - current_price).abs())
-            .unwrap_or(f64::INFINITY);
-        left_dist
-            .partial_cmp(&right_dist)
-            .unwrap_or(Ordering::Equal)
-    });
+    let selection = select_layered_clusters(
+        items,
+        Some(current_price),
+        near_limit,
+        strong_limit,
+        mid_limit,
+        deep_limit,
+    );
     json!({
-        "above": above.into_iter().take(limit).map(to_compact).collect::<Vec<_>>(),
-        "below": below.into_iter().take(limit).map(to_compact).collect::<Vec<_>>(),
+        "above": selection.above.iter().map(to_compact).collect::<Vec<_>>(),
+        "below": selection.below.iter().map(to_compact).collect::<Vec<_>>(),
+        "cross": selection.cross.iter().map(to_compact).collect::<Vec<_>>(),
     })
 }
 
-fn filter_orderbook_depth(payload: &Value) -> Value {
+fn filter_orderbook_depth(payload: &Value, current_price: Option<f64>) -> Value {
     let Some(payload) = payload.as_object() else {
         return Value::Null;
     };
     let mut result = clone_object_without_keys(payload, &["levels", "by_window"]);
+    let mid_price = payload
+        .get("microprice_fut")
+        .and_then(Value::as_f64)
+        .or(current_price);
 
     result.insert(
         "liquidity_walls".to_string(),
@@ -3765,108 +4193,20 @@ fn filter_orderbook_depth(payload: &Value) -> Value {
                 .and_then(Value::as_array)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
-            payload.get("microprice_fut").and_then(Value::as_f64),
+            mid_price,
         ),
     );
-
-    if let Some(by_window) = payload.get("by_window").and_then(Value::as_object) {
-        let mut filtered_windows = Map::new();
-        if let Some(window_value) = by_window.get("15m").and_then(Value::as_object) {
-            filtered_windows.insert(
-                "15m".to_string(),
-                Value::Object(clone_object_without_keys(window_value, &[])),
-            );
-        }
-        result.insert("by_window".to_string(), Value::Object(filtered_windows));
-    }
-
-    Value::Object(result)
-}
-
-fn filter_event_indicator(payload: &Value, code: &str, keep_last: usize) -> Value {
-    let Some(payload) = payload.as_object() else {
-        return Value::Null;
-    };
-    let mut result = Map::new();
-    let Some(recent_7d) = payload.get("recent_7d").and_then(Value::as_object) else {
-        return Value::Object(result);
-    };
-    let mut filtered_recent = Map::new();
-    copy_fields(
-        &mut filtered_recent,
-        recent_7d,
-        &[
-            "event_count",
-            "history_source",
-            "lookback_coverage_ratio",
-            "lookback_covered_minutes",
-            "lookback_missing_minutes",
-            "lookback_requested_minutes",
-        ],
-    );
-    let events = recent_7d
-        .get("events")
-        .and_then(Value::as_array)
-        .map(|events| take_last_n(events, keep_last))
-        .unwrap_or_default();
-    filtered_recent.insert(
-        "events".to_string(),
-        Value::Array(
-            events
-                .into_iter()
-                .map(|event| prune_event_fields(&event, code))
-                .collect(),
+    result.insert(
+        "level_clusters".to_string(),
+        build_orderbook_level_clusters(
+            payload
+                .get("levels")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            mid_price,
         ),
     );
-    result.insert("recent_7d".to_string(), Value::Object(filtered_recent));
-    Value::Object(result)
-}
-
-fn filter_divergence(payload: &Value) -> Value {
-    let Some(payload) = payload.as_object() else {
-        return Value::Null;
-    };
-    let mut result = Map::new();
-    copy_fields(
-        &mut result,
-        payload,
-        &[
-            "signal",
-            "signals",
-            "event_count",
-            "divergence_type",
-            "likely_driver",
-            "spot_lead_score",
-            "pivot_side",
-            "reason",
-        ],
-    );
-    if let Some(latest) = payload.get("latest_7d") {
-        result.insert(
-            "latest_7d".to_string(),
-            prune_object_fields(latest, DIVERGENCE_EVENT_DROP_FIELDS),
-        );
-    }
-
-    if let Some(recent_7d) = payload.get("recent_7d").and_then(Value::as_object) {
-        let mut filtered_recent = Map::new();
-        copy_fields(&mut filtered_recent, recent_7d, &["event_count"]);
-        let events = recent_7d
-            .get("events")
-            .and_then(Value::as_array)
-            .map(|events| take_last_n(events, 20))
-            .unwrap_or_default();
-        filtered_recent.insert(
-            "events".to_string(),
-            Value::Array(
-                events
-                    .into_iter()
-                    .map(|event| prune_object_fields(&event, DIVERGENCE_EVENT_DROP_FIELDS))
-                    .collect(),
-            ),
-        );
-        result.insert("recent_7d".to_string(), Value::Object(filtered_recent));
-    }
 
     Value::Object(result)
 }
@@ -3887,24 +4227,6 @@ fn clone_object_without_keys(source: &Map<String, Value>, skipped: &[&str]) -> M
         .collect()
 }
 
-fn prune_object_fields(value: &Value, skipped: &[&str]) -> Value {
-    let Some(source) = value.as_object() else {
-        return value.clone();
-    };
-    Value::Object(clone_object_without_keys(source, skipped))
-}
-
-fn prune_event_fields(value: &Value, code: &str) -> Value {
-    let mut pruned = prune_object_fields(value, EVENT_DROP_FIELDS);
-    if matches!(
-        code,
-        "initiation" | "bullish_initiation" | "bearish_initiation"
-    ) {
-        pruned = prune_object_fields(&pruned, INITIATION_EVENT_DROP_FIELDS);
-    }
-    pruned
-}
-
 fn take_last_n(values: &[Value], n: usize) -> Vec<Value> {
     let mut result = if n == usize::MAX || values.len() <= n {
         values.to_vec()
@@ -3918,42 +4240,6 @@ fn take_last_n(values: &[Value], n: usize) -> Vec<Value> {
 
 fn hour_bucket_key(ts: &str) -> String {
     ts.chars().take(13).collect()
-}
-
-fn sanitize_fvg_array_field(target: &mut Map<String, Value>, field: &str) {
-    if let Some(items) = target.get(field).and_then(Value::as_array).cloned() {
-        target.insert(
-            field.to_string(),
-            Value::Array(
-                items
-                    .into_iter()
-                    .map(|item| sanitize_fvg_value(&item))
-                    .collect(),
-            ),
-        );
-    }
-}
-
-fn sanitize_fvg_value(value: &Value) -> Value {
-    let Some(entry) = value.as_object() else {
-        return if value.is_null() {
-            Value::Null
-        } else {
-            value.clone()
-        };
-    };
-    let mut filtered = entry.clone();
-    for field in FVG_DROP_FIELDS {
-        filtered.remove(*field);
-    }
-    if let Some(upper) = filtered.get("upper").cloned() {
-        filtered.insert("fvg_top".to_string(), upper);
-    }
-    if let Some(lower) = filtered.get("lower").cloned() {
-        filtered.insert("fvg_bottom".to_string(), lower);
-    }
-    filtered.retain(|_, value| !value.is_null());
-    Value::Object(filtered)
 }
 
 fn build_funding_summary(recent_events: Option<&Vec<Value>>) -> Value {
@@ -4100,35 +4386,422 @@ fn build_liq_summary(recent_events: Option<&Vec<Value>>) -> Value {
     })
 }
 
-fn aggregate_price_clusters(prices: &[Value], bin_size: f64) -> Vec<Value> {
-    let mut bins: BTreeMap<i64, usize> = BTreeMap::new();
-    for price in prices.iter().filter_map(Value::as_f64) {
-        let index = (price / bin_size).round() as i64;
-        *bins.entry(index).or_default() += 1;
-    }
+fn round_to_decimals(value: f64, decimals: usize) -> f64 {
+    let factor = 10_f64.powi(decimals as i32);
+    (value * factor).round() / factor
+}
 
-    bins.into_iter()
-        .map(|(index, count)| {
-            json!({
-                "p": bucket_index_to_price(index, bin_size),
-                "n": count
-            })
+fn collect_numeric_price_entries(values: &[Value]) -> Vec<(f64, f64)> {
+    values
+        .iter()
+        .filter_map(Value::as_f64)
+        .filter(|price| price.is_finite())
+        .map(|price| (price, 1.0))
+        .collect()
+}
+
+fn collect_weighted_price_entries(
+    values: &[Value],
+    price_keys: &[&str],
+    weight_key: Option<&str>,
+) -> Vec<(f64, f64)> {
+    values
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(|entry| {
+            let price = price_keys
+                .iter()
+                .find_map(|key| entry.get(*key).and_then(Value::as_f64))?;
+            let weight = weight_key
+                .and_then(|key| entry.get(key).and_then(Value::as_f64))
+                .unwrap_or(1.0);
+            Some((price, weight))
         })
         .collect()
 }
 
-fn bucket_index_to_price(index: i64, bin_size: f64) -> f64 {
-    let decimals = if (bin_size - 1.0).abs() < f64::EPSILON {
-        0
-    } else {
-        1
-    };
-    round_to_decimals(index as f64 * bin_size, decimals)
+fn percentile_threshold(values: &[f64], percentile: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let clamped = percentile.clamp(0.0, 1.0);
+    let index = ((sorted.len() - 1) as f64 * clamped).round() as usize;
+    sorted.get(index).copied()
 }
 
-fn round_to_decimals(value: f64, decimals: usize) -> f64 {
-    let factor = 10_f64.powi(decimals as i32);
-    (value * factor).round() / factor
+fn infer_price_tick(entries: &[(f64, f64)]) -> Option<f64> {
+    let mut prices = entries
+        .iter()
+        .map(|(price, _)| *price)
+        .filter(|price| price.is_finite())
+        .collect::<Vec<_>>();
+    prices.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    prices.dedup_by(|left, right| (*left - *right).abs() < 1e-9);
+    prices
+        .windows(2)
+        .filter_map(|pair| {
+            let diff = pair[1] - pair[0];
+            (diff > 1e-9).then_some(diff)
+        })
+        .min_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal))
+}
+
+fn build_value_area_peak_clusters(levels: &[Value]) -> Vec<PriceClusterCandidate> {
+    let entries = collect_weighted_price_entries(levels, &["price_level", "price"], Some("volume"));
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = entries
+        .iter()
+        .copied()
+        .filter(|(price, weight)| price.is_finite() && weight.is_finite())
+        .collect::<Vec<_>>();
+    if sorted.is_empty() {
+        return Vec::new();
+    }
+    sorted.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
+    let tick = infer_price_tick(&sorted).unwrap_or(0.01);
+    let max_gap = (tick * CLUSTER_MERGE_TICK_MULTIPLIER).max(1e-9);
+    let weights = sorted.iter().map(|(_, weight)| *weight).collect::<Vec<_>>();
+    let min_peak_weight =
+        percentile_threshold(&weights, PVS_PEAK_MIN_PERCENTILE).unwrap_or_default();
+    let mut kept_indices = BTreeSet::new();
+
+    for idx in 0..sorted.len() {
+        let weight = sorted[idx].1.max(0.0);
+        let prev_weight = if idx > 0 {
+            sorted[idx - 1].1.max(0.0)
+        } else {
+            f64::NEG_INFINITY
+        };
+        let next_weight = if idx + 1 < sorted.len() {
+            sorted[idx + 1].1.max(0.0)
+        } else {
+            f64::NEG_INFINITY
+        };
+        let is_local_peak = weight + 1e-9 >= prev_weight && weight + 1e-9 >= next_weight;
+        if !is_local_peak || weight + 1e-9 < min_peak_weight {
+            continue;
+        }
+
+        kept_indices.insert(idx);
+
+        let mut left = idx;
+        for _ in 0..PVS_PEAK_NEIGHBOR_STEPS {
+            if left == 0 {
+                break;
+            }
+            if sorted[left].0 - sorted[left - 1].0 <= max_gap + 1e-9 {
+                left -= 1;
+                kept_indices.insert(left);
+            } else {
+                break;
+            }
+        }
+
+        let mut right = idx;
+        for _ in 0..PVS_PEAK_NEIGHBOR_STEPS {
+            if right + 1 >= sorted.len() {
+                break;
+            }
+            if sorted[right + 1].0 - sorted[right].0 <= max_gap + 1e-9 {
+                right += 1;
+                kept_indices.insert(right);
+            } else {
+                break;
+            }
+        }
+    }
+
+    if kept_indices.is_empty() {
+        if let Some((peak_idx, _)) = sorted.iter().enumerate().max_by(|(_, left), (_, right)| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal))
+        }) {
+            kept_indices.insert(peak_idx);
+        }
+    }
+
+    let filtered = kept_indices
+        .into_iter()
+        .filter_map(|idx| sorted.get(idx).copied())
+        .collect::<Vec<_>>();
+    build_price_clusters(&filtered)
+}
+
+fn build_price_clusters(entries: &[(f64, f64)]) -> Vec<PriceClusterCandidate> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = entries
+        .iter()
+        .copied()
+        .filter(|(price, _)| price.is_finite())
+        .collect::<Vec<_>>();
+    sorted.sort_by(|left, right| left.0.partial_cmp(&right.0).unwrap_or(Ordering::Equal));
+    let tick = infer_price_tick(&sorted).unwrap_or(0.01);
+    let max_gap = (tick * CLUSTER_MERGE_TICK_MULTIPLIER).max(1e-9);
+
+    let mut clusters = Vec::new();
+    let mut low = sorted[0].0;
+    let mut high = sorted[0].0;
+    let mut weighted_sum = sorted[0].0 * sorted[0].1.max(1.0);
+    let mut weight_total = sorted[0].1.max(0.0);
+    let mut effective_weight_total = sorted[0].1.max(1.0);
+    let mut count = 1_usize;
+
+    for (price, weight) in sorted.into_iter().skip(1) {
+        let effective_weight = weight.max(1.0);
+        if price - high <= max_gap + 1e-9 {
+            high = price;
+            weight_total += weight.max(0.0);
+            effective_weight_total += effective_weight;
+            weighted_sum += price * effective_weight;
+            count += 1;
+        } else {
+            let mid = if effective_weight_total > f64::EPSILON {
+                weighted_sum / effective_weight_total
+            } else {
+                (low + high) / 2.0
+            };
+            clusters.push(PriceClusterCandidate {
+                low,
+                high,
+                mid,
+                count,
+                weight: weight_total,
+            });
+            low = price;
+            high = price;
+            weighted_sum = price * effective_weight;
+            weight_total = weight.max(0.0);
+            effective_weight_total = effective_weight;
+            count = 1;
+        }
+    }
+
+    let mid = if effective_weight_total > f64::EPSILON {
+        weighted_sum / effective_weight_total
+    } else {
+        (low + high) / 2.0
+    };
+    clusters.push(PriceClusterCandidate {
+        low,
+        high,
+        mid,
+        count,
+        weight: weight_total,
+    });
+    clusters
+}
+
+fn cluster_distance_to_price(cluster: &PriceClusterCandidate, current_price: f64) -> f64 {
+    if cluster.low <= current_price && current_price <= cluster.high {
+        0.0
+    } else if cluster.high < current_price {
+        current_price - cluster.high
+    } else {
+        cluster.low - current_price
+    }
+}
+
+fn cluster_key(cluster: &PriceClusterCandidate) -> String {
+    format!("{:.8}:{:.8}", cluster.low, cluster.high)
+}
+
+fn select_cluster_side(
+    candidates: &[PriceClusterCandidate],
+    current_price: f64,
+    near_limit: usize,
+    strong_limit: usize,
+    mid_limit: usize,
+    deep_limit: usize,
+) -> Vec<PriceClusterCandidate> {
+    let mut selected = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    let mut nearest = candidates.to_vec();
+    nearest.sort_by(|left, right| {
+        cluster_distance_to_price(left, current_price)
+            .partial_cmp(&cluster_distance_to_price(right, current_price))
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                right
+                    .weight
+                    .partial_cmp(&left.weight)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+    for cluster in nearest.into_iter().take(near_limit) {
+        if seen.insert(cluster_key(&cluster)) {
+            selected.push(cluster);
+        }
+    }
+
+    let mut strongest = candidates
+        .iter()
+        .filter(|cluster| !seen.contains(&cluster_key(cluster)))
+        .cloned()
+        .collect::<Vec<_>>();
+    strongest.sort_by(|left, right| {
+        right
+            .weight
+            .partial_cmp(&left.weight)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| right.count.cmp(&left.count))
+            .then_with(|| {
+                cluster_distance_to_price(left, current_price)
+                    .partial_cmp(&cluster_distance_to_price(right, current_price))
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+    for cluster in strongest.into_iter().take(strong_limit) {
+        if seen.insert(cluster_key(&cluster)) {
+            selected.push(cluster);
+        }
+    }
+
+    let mut middle = candidates
+        .iter()
+        .filter(|cluster| !seen.contains(&cluster_key(cluster)))
+        .cloned()
+        .collect::<Vec<_>>();
+    middle.sort_by(|left, right| {
+        cluster_distance_to_price(left, current_price)
+            .partial_cmp(&cluster_distance_to_price(right, current_price))
+            .unwrap_or(Ordering::Equal)
+    });
+    if !middle.is_empty() && mid_limit > 0 {
+        let start = middle.len() / 3;
+        let end = ((middle.len() * 2) / 3).max(start + 1).min(middle.len());
+        let mut middle_band = middle[start..end].to_vec();
+        middle_band.sort_by(|left, right| {
+            right
+                .weight
+                .partial_cmp(&left.weight)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| right.count.cmp(&left.count))
+                .then_with(|| {
+                    cluster_distance_to_price(left, current_price)
+                        .partial_cmp(&cluster_distance_to_price(right, current_price))
+                        .unwrap_or(Ordering::Equal)
+                })
+        });
+        for cluster in middle_band.into_iter().take(mid_limit) {
+            if seen.insert(cluster_key(&cluster)) {
+                selected.push(cluster);
+            }
+        }
+    }
+
+    let mut deepest = candidates
+        .iter()
+        .filter(|cluster| !seen.contains(&cluster_key(cluster)))
+        .cloned()
+        .collect::<Vec<_>>();
+    deepest.sort_by(|left, right| {
+        cluster_distance_to_price(right, current_price)
+            .partial_cmp(&cluster_distance_to_price(left, current_price))
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                right
+                    .weight
+                    .partial_cmp(&left.weight)
+                    .unwrap_or(Ordering::Equal)
+            })
+    });
+    for cluster in deepest.into_iter().take(deep_limit) {
+        if seen.insert(cluster_key(&cluster)) {
+            selected.push(cluster);
+        }
+    }
+
+    selected.sort_by(|left, right| {
+        cluster_distance_to_price(left, current_price)
+            .partial_cmp(&cluster_distance_to_price(right, current_price))
+            .unwrap_or(Ordering::Equal)
+    });
+    selected
+}
+
+fn select_layered_clusters(
+    candidates: &[PriceClusterCandidate],
+    current_price: Option<f64>,
+    near_limit: usize,
+    strong_limit: usize,
+    mid_limit: usize,
+    deep_limit: usize,
+) -> ClusterSelection {
+    let Some(current_price) = current_price else {
+        let mut ranked = candidates.to_vec();
+        ranked.sort_by(|left, right| {
+            right
+                .weight
+                .partial_cmp(&left.weight)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| right.count.cmp(&left.count))
+        });
+        ranked.truncate(near_limit + strong_limit + mid_limit + deep_limit);
+        return ClusterSelection {
+            cross: ranked,
+            ..ClusterSelection::default()
+        };
+    };
+
+    let cross = candidates
+        .iter()
+        .filter(|cluster| cluster.low <= current_price && current_price <= cluster.high)
+        .cloned()
+        .collect::<Vec<_>>();
+    let below = candidates
+        .iter()
+        .filter(|cluster| cluster.high < current_price)
+        .cloned()
+        .collect::<Vec<_>>();
+    let above = candidates
+        .iter()
+        .filter(|cluster| cluster.low > current_price)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    ClusterSelection {
+        above: select_cluster_side(
+            &above,
+            current_price,
+            near_limit,
+            strong_limit,
+            mid_limit,
+            deep_limit,
+        ),
+        below: select_cluster_side(
+            &below,
+            current_price,
+            near_limit,
+            strong_limit,
+            mid_limit,
+            deep_limit,
+        ),
+        cross,
+    }
+}
+
+fn flatten_cluster_selection(selection: ClusterSelection) -> Vec<PriceClusterCandidate> {
+    let mut combined = Vec::new();
+    combined.extend(selection.cross);
+    combined.extend(selection.below);
+    combined.extend(selection.above);
+    combined
 }
 
 fn build_liquidity_walls(levels: &[Value], mid_price: Option<f64>) -> Value {
@@ -4266,66 +4939,79 @@ fn build_liquidity_walls(levels: &[Value], mid_price: Option<f64>) -> Value {
     })
 }
 
-fn build_va_top_levels(levels: Option<&Vec<Value>>, limit: usize) -> Vec<Value> {
-    let Some(levels) = levels else {
-        return Vec::new();
-    };
-
-    let mut ranked = levels
+fn build_orderbook_level_clusters(levels: &[Value], current_price: Option<f64>) -> Value {
+    let bid_entries = levels
         .iter()
-        .filter_map(|entry| {
-            if let Some(object) = entry.as_object() {
-                let price = object
-                    .get("price_level")
-                    .or_else(|| object.get("price"))
-                    .and_then(Value::as_f64)?;
-                let volume = object
-                    .get("volume")
+        .filter_map(Value::as_object)
+        .filter_map(|level| {
+            Some((
+                level.get("price_level").and_then(Value::as_f64)?,
+                level
+                    .get("bid_liquidity")
                     .and_then(Value::as_f64)
-                    .unwrap_or_default();
-                Some((price, volume))
-            } else {
-                entry.as_f64().map(|price| (price, 0.0))
-            }
+                    .unwrap_or_default(),
+            ))
         })
+        .filter(|(_, liquidity)| *liquidity > f64::EPSILON)
         .collect::<Vec<_>>();
-    let total_volume = ranked
+    let ask_entries = levels
         .iter()
-        .map(|(_, volume)| volume.max(0.0))
-        .sum::<f64>();
-    ranked.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(Ordering::Equal)
-            .then_with(|| right.0.partial_cmp(&left.0).unwrap_or(Ordering::Equal))
-    });
-
-    let mut top_levels = ranked
-        .into_iter()
-        .take(limit)
-        .map(|(price, volume)| {
-            json!({
-                "price": price,
-                "volume": volume,
-                "vol_pct": if total_volume > f64::EPSILON { volume / total_volume } else { 0.0 },
-            })
+        .filter_map(Value::as_object)
+        .filter_map(|level| {
+            Some((
+                level.get("price_level").and_then(Value::as_f64)?,
+                level
+                    .get("ask_liquidity")
+                    .and_then(Value::as_f64)
+                    .unwrap_or_default(),
+            ))
         })
+        .filter(|(_, liquidity)| *liquidity > f64::EPSILON)
         .collect::<Vec<_>>();
-    top_levels.sort_by(|left, right| {
-        let left_price = left
-            .get("price")
-            .and_then(Value::as_f64)
-            .unwrap_or_default();
-        let right_price = right
-            .get("price")
-            .and_then(Value::as_f64)
-            .unwrap_or_default();
-        right_price
-            .partial_cmp(&left_price)
-            .unwrap_or(Ordering::Equal)
-    });
-    top_levels
+
+    let bid_clusters = flatten_cluster_selection(select_layered_clusters(
+        &build_price_clusters(&bid_entries),
+        current_price,
+        ORDERBOOK_CLUSTER_NEAR_PER_SIDE,
+        ORDERBOOK_CLUSTER_STRONG_PER_SIDE,
+        ORDERBOOK_CLUSTER_MID_PER_SIDE,
+        ORDERBOOK_CLUSTER_DEEP_PER_SIDE,
+    ));
+    let ask_clusters = flatten_cluster_selection(select_layered_clusters(
+        &build_price_clusters(&ask_entries),
+        current_price,
+        ORDERBOOK_CLUSTER_NEAR_PER_SIDE,
+        ORDERBOOK_CLUSTER_STRONG_PER_SIDE,
+        ORDERBOOK_CLUSTER_MID_PER_SIDE,
+        ORDERBOOK_CLUSTER_DEEP_PER_SIDE,
+    ));
+
+    json!({
+        "bid_clusters": bid_clusters
+            .into_iter()
+            .map(|cluster| {
+                json!({
+                    "p": round2(cluster.mid),
+                    "price_low": round2(cluster.low),
+                    "price_high": round2(cluster.high),
+                    "n": cluster.count,
+                    "volume_quote": round2(cluster.weight),
+                })
+            })
+            .collect::<Vec<_>>(),
+        "ask_clusters": ask_clusters
+            .into_iter()
+            .map(|cluster| {
+                json!({
+                    "p": round2(cluster.mid),
+                    "price_low": round2(cluster.low),
+                    "price_high": round2(cluster.high),
+                    "n": cluster.count,
+                    "volume_quote": round2(cluster.weight),
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn take_tail(values: &[f64], limit: usize) -> Vec<f64> {
@@ -4429,11 +5115,7 @@ fn depth_imbalance(levels: &[Value], mid_price: f64, pct: f64) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_display_range, build_event_summary_from_events, compute_atr14,
-        extract_ema_regime_current, filter_fvg, weighted_event_score, BiasEvidence, LevelAnchor,
-        ScanFilter,
-    };
+    use super::{compute_atr14, filter_cvd_pack, filter_high_volume_pulse, ScanFilter};
     use crate::llm::provider::ModelInvocationInput;
     use chrono::{DateTime, Utc};
     use serde_json::{json, Value};
@@ -4585,17 +5267,20 @@ mod tests {
                         "15m": {"markets": {"futures": {"bars": [
                             {"open": 2100.0, "high": 2102.0, "low": 2099.0, "close": 2101.0, "volume_base": 100.0, "open_time": "2026-03-14T07:15:00Z", "is_closed": true},
                             {"open": 2101.0, "high": 2104.0, "low": 2100.0, "close": 2103.5, "volume_base": 110.0, "open_time": "2026-03-14T07:30:00Z", "is_closed": true},
-                            {"open": 2103.5, "high": 2105.5, "low": 2102.0, "close": 2104.0, "volume_base": 120.0, "open_time": "2026-03-14T07:45:00Z", "is_closed": true}
+                            {"open": 2103.5, "high": 2105.5, "low": 2102.0, "close": 2104.0, "volume_base": 120.0, "open_time": "2026-03-14T07:45:00Z", "is_closed": true},
+                            {"open": 2104.0, "high": 2106.0, "low": 2103.2, "close": 2105.2, "volume_base": 80.0, "open_time": "2026-03-14T08:00:00Z", "is_closed": false}
                         ]}}},
                         "4h": {"markets": {"futures": {"bars": [
                             {"open": 2088.0, "high": 2098.0, "low": 2085.0, "close": 2095.0, "volume_base": 200.0, "open_time": "2026-03-13T20:00:00Z", "is_closed": true},
                             {"open": 2095.0, "high": 2106.0, "low": 2090.0, "close": 2102.0, "volume_base": 220.0, "open_time": "2026-03-14T00:00:00Z", "is_closed": true},
-                            {"open": 2102.0, "high": 2108.0, "low": 2098.0, "close": 2104.0, "volume_base": 240.0, "open_time": "2026-03-14T04:00:00Z", "is_closed": true}
+                            {"open": 2102.0, "high": 2108.0, "low": 2098.0, "close": 2104.0, "volume_base": 240.0, "open_time": "2026-03-14T04:00:00Z", "is_closed": true},
+                            {"open": 2104.0, "high": 2110.0, "low": 2101.0, "close": 2106.5, "volume_base": 160.0, "open_time": "2026-03-14T08:00:00Z", "is_closed": false}
                         ]}}},
                         "1d": {"markets": {"futures": {"bars": [
                             {"open": 2060.0, "high": 2088.0, "low": 2055.0, "close": 2075.0, "volume_base": 300.0, "open_time": "2026-03-11T00:00:00Z", "is_closed": true},
                             {"open": 2075.0, "high": 2100.0, "low": 2070.0, "close": 2092.0, "volume_base": 320.0, "open_time": "2026-03-12T00:00:00Z", "is_closed": true},
-                            {"open": 2092.0, "high": 2108.0, "low": 2088.0, "close": 2104.0, "volume_base": 340.0, "open_time": "2026-03-13T00:00:00Z", "is_closed": true}
+                            {"open": 2092.0, "high": 2108.0, "low": 2088.0, "close": 2104.0, "volume_base": 340.0, "open_time": "2026-03-13T00:00:00Z", "is_closed": true},
+                            {"open": 2104.0, "high": 2112.0, "low": 2100.0, "close": 2107.0, "volume_base": 180.0, "open_time": "2026-03-14T00:00:00Z", "is_closed": false}
                         ]}}}
                     }
                 }
@@ -4829,226 +5514,531 @@ mod tests {
     }
 
     #[test]
-    fn build_value_applies_v4_scan_schema() {
+    fn build_value_applies_v6_scan_schema() {
         let ts_bucket = DateTime::parse_from_rfc3339("2026-03-14T08:00:00Z")
             .expect("parse ts bucket")
             .with_timezone(&Utc);
         let input = sample_input(fixture_indicators(), ts_bucket);
         let value = ScanFilter::build_value(&input).expect("build scan value");
 
+        assert_eq!(
+            value.pointer("/version").and_then(Value::as_str),
+            Some("scan_v6_1")
+        );
         assert_eq!(
             value.pointer("/current_price").and_then(Value::as_f64),
             Some(2104.0)
         );
+        assert!(value.pointer("/now/price_anchor").is_some());
+        assert!(value.pointer("/now/value_state_board/0").is_some());
+        assert!(value.pointer("/now/bracket_board/current_inside").is_some());
         assert!(value
-            .pointer("/by_timeframe/15m/structure/level_book/support")
-            .is_some());
-        assert!(value.pointer("/by_timeframe/4h/trend/ema_regime").is_some());
-        assert!(value.pointer("/by_timeframe/15m/flow/cvd/bias").is_some());
-        assert!(value
-            .pointer("/by_timeframe/15m/flow/initiation/bias")
+            .pointer("/path_newest_to_oldest/latest_15m_detail/bars_newest_to_oldest/0")
             .is_some());
         assert!(value
-            .pointer("/timeframe_evidence/15m/primary_support")
+            .pointer("/events_newest_to_oldest/latest_24h_detail/0")
             .is_some());
         assert!(value
-            .pointer("/timeframe_evidence/15m/ranges/micro_range/support")
+            .pointer("/supporting_context/cvd_path_snapshot/by_window/15m/series/0")
             .is_some());
-        assert_eq!(
-            value
-                .pointer("/timeframe_evidence/15m/ranges/micro_range/range_role")
-                .and_then(Value::as_str),
-            Some("compression")
-        );
+        assert!(value.pointer("/raw_overflow/price_structures/0").is_some());
+        assert!(value.pointer("/raw_overflow/price_levels/0").is_some());
+        assert!(value.pointer("/by_timeframe").is_none());
+        assert!(value.pointer("/timeframe_evidence").is_none());
+        assert!(value.pointer("/multi_timeframe_evidence").is_none());
+        assert!(value.pointer("/indicators").is_none());
+        assert!(value.pointer("/now/location_snapshot/vs_value").is_none());
+        assert!(value.pointer("/now/acceptance_board").is_none());
         assert!(value
-            .pointer("/timeframe_evidence/15m/ranges/local_structure_range/support")
-            .is_some());
-        assert_eq!(
-            value
-                .pointer("/timeframe_evidence/15m/ranges/local_structure_range/range_role")
-                .and_then(Value::as_str),
-            Some("default_bracket")
-        );
-        assert!(value
-            .pointer("/timeframe_evidence/15m/ranges/session_value_area_range/source_window")
-            .is_some());
-        assert_eq!(
-            value
-                .pointer("/timeframe_evidence/15m/ranges/session_value_area_range/range_role")
-                .and_then(Value::as_str),
-            Some("context")
-        );
-        assert!(value
-            .pointer(
-                "/timeframe_evidence/15m/ranges/session_value_area_range/current_price_location"
-            )
+            .pointer("/now/current_volume_nodes/high_volume_pulse")
             .is_some());
         assert!(value
-            .pointer("/timeframe_evidence/15m/display_range/support")
+            .pointer("/supporting_context/indicator_snapshots/high_volume_pulse_full")
             .is_some());
-        assert!(value
-            .pointer("/timeframe_evidence/15m/display_range/range_width_atr")
-            .is_some());
-        assert!(value
-            .pointer("/timeframe_evidence/15m/balance_scores/evidence_balance_score")
-            .is_some());
-        assert!(value
-            .pointer("/timeframe_evidence/15m/signal_snapshot/ema_regime")
-            .is_some());
-        assert!(value
-            .pointer("/timeframe_evidence/15m/risk_opportunity/upside_opportunity_score")
-            .is_some());
-        assert!(value.pointer("/multi_timeframe_evidence").is_some());
-
-        assert!(value.pointer("/indicators/kline_history").is_none());
-        assert!(value.pointer("/indicators/cvd_pack").is_none());
-        assert!(value.pointer("/indicators/absorption").is_none());
-        assert!(value.pointer("/indicators/whale_trades").is_none());
-        assert!(value.pointer("/indicators/vpin").is_none());
-        assert!(value.pointer("/indicators/funding_rate").is_none());
-
-        assert_eq!(
-            value
-                .pointer("/indicators/avwap/payload/series_by_window/15m")
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            Some(3)
-        );
-        assert!(value
-            .pointer("/indicators/tpo_market_profile/payload/dev_series/15m")
-            .and_then(Value::as_array)
-            .map(|series| series.len() <= 5)
-            .unwrap_or(false));
-        assert!(value
-            .pointer("/indicators/footprint/payload/by_window/15m/buy_stacks/above")
-            .is_some());
-        assert!(value
-            .pointer("/indicators/footprint/payload/by_window/15m/buy_imb_clusters/below")
-            .is_some());
-        assert!(value
-            .pointer("/indicators/orderbook_depth/payload/liquidity_walls/bid_walls")
-            .is_some());
-        assert!(value
-            .pointer("/by_timeframe/4h/flow/absorption/net_score")
-            .is_some());
-        assert_eq!(
-            value
-                .pointer("/by_timeframe/15m/structure/session_value_area/source_kind")
-                .and_then(Value::as_str),
-            Some("tpo_value_area")
-        );
-        assert_eq!(
-            value
-                .pointer("/timeframe_evidence/15m/ranges/local_structure_range/support")
-                .and_then(Value::as_f64),
-            value
-                .pointer("/timeframe_evidence/15m/display_range/support")
-                .and_then(Value::as_f64)
-        );
     }
 
     #[test]
-    fn build_value_omits_non_applicable_trend_fields() {
+    fn build_value_preserves_documented_v6_key_order() {
         let ts_bucket = DateTime::parse_from_rfc3339("2026-03-14T08:00:00Z")
             .expect("parse ts bucket")
             .with_timezone(&Utc);
         let input = sample_input(fixture_indicators(), ts_bucket);
         let value = ScanFilter::build_value(&input).expect("build scan value");
 
-        assert!(value
-            .pointer("/by_timeframe/15m/trend/close_vs_ema21_pct")
-            .is_some());
-        assert!(value
-            .pointer("/by_timeframe/15m/trend/close_vs_ema100_htf_pct")
-            .is_none());
-        assert!(value
-            .pointer("/by_timeframe/4h/trend/close_vs_ema21_pct")
-            .is_none());
-        assert!(value
-            .pointer("/by_timeframe/4h/trend/close_vs_ema100_htf_pct")
-            .is_some());
-        assert!(value
-            .pointer("/by_timeframe/1d/trend/close_vs_ema21_pct")
-            .is_none());
-        assert!(value
-            .pointer("/by_timeframe/1d/trend/close_vs_ema100_htf_pct")
-            .is_some());
+        let top_level_keys = value
+            .as_object()
+            .expect("top-level object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            top_level_keys,
+            vec![
+                "version",
+                "symbol",
+                "ts_bucket",
+                "current_price",
+                "now",
+                "path_newest_to_oldest",
+                "events_newest_to_oldest",
+                "supporting_context",
+                "raw_overflow",
+            ]
+        );
+
+        let path_keys = value
+            .pointer("/path_newest_to_oldest")
+            .and_then(Value::as_object)
+            .expect("path object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            path_keys,
+            vec![
+                "latest_15m_detail",
+                "latest_4h_context",
+                "latest_1d_background",
+            ]
+        );
+
+        let serialized = serde_json::to_string(&value).expect("serialize scan value");
+        let ordered_markers = [
+            "\"version\"",
+            "\"symbol\"",
+            "\"ts_bucket\"",
+            "\"current_price\"",
+            "\"now\"",
+            "\"path_newest_to_oldest\"",
+            "\"events_newest_to_oldest\"",
+            "\"supporting_context\"",
+            "\"raw_overflow\"",
+        ];
+        let mut last_index = 0usize;
+        for marker in ordered_markers {
+            let index = serialized
+                .find(marker)
+                .unwrap_or_else(|| panic!("missing serialized marker: {marker}"));
+            assert!(
+                index >= last_index,
+                "marker {marker} was serialized out of order"
+            );
+            last_index = index;
+        }
     }
 
     #[test]
-    fn filter_fvg_omits_null_placeholders_but_keeps_present_structure() {
+    fn build_value_emits_value_state_and_path_context() {
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-14T08:00:00Z")
+            .expect("parse ts bucket")
+            .with_timezone(&Utc);
+        let input = sample_input(fixture_indicators(), ts_bucket);
+        let value = ScanFilter::build_value(&input).expect("build scan value");
+
+        let value_state_board = value
+            .pointer("/now/value_state_board")
+            .and_then(Value::as_array)
+            .expect("value state board array");
+        assert!(value_state_board.iter().any(|entry| {
+            entry.get("scope").and_then(Value::as_str) == Some("15m")
+                && entry.get("source").and_then(Value::as_str) == Some("price_volume_structure")
+                && entry.get("state").and_then(Value::as_str) == Some("inside_value")
+                && entry.get("position").and_then(Value::as_str) == Some("inside")
+        }));
+
+        assert_eq!(
+            value
+                .pointer("/path_newest_to_oldest/latest_15m_detail/summary/bars_count")
+                .and_then(Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            value
+                .pointer("/path_newest_to_oldest/latest_15m_detail/bars_newest_to_oldest/0/close")
+                .and_then(Value::as_f64),
+            Some(2104.0)
+        );
+        assert_eq!(
+            value
+                .pointer("/path_newest_to_oldest/latest_15m_detail/summary/atr14")
+                .and_then(Value::as_f64),
+            Some(3.5)
+        );
+        assert_eq!(
+            value
+                .pointer("/path_newest_to_oldest/latest_15m_detail/summary/atr14_pct")
+                .and_then(Value::as_f64),
+            Some(0.17)
+        );
+        assert_eq!(
+            value
+                .pointer("/path_newest_to_oldest/latest_15m_detail/current_partial_bar/ts")
+                .and_then(Value::as_str),
+            Some("2026-03-14T08:00:00Z")
+        );
+        assert_eq!(
+            value
+                .pointer("/path_newest_to_oldest/latest_4h_context/summary/atr14")
+                .and_then(Value::as_f64),
+            Some(13.0)
+        );
+        assert_eq!(
+            value
+                .pointer("/path_newest_to_oldest/latest_4h_context/summary/atr14_pct")
+                .and_then(Value::as_f64),
+            Some(0.62)
+        );
+        assert_eq!(
+            value
+                .pointer("/path_newest_to_oldest/latest_4h_context/current_partial_bar/ts")
+                .and_then(Value::as_str),
+            Some("2026-03-14T08:00:00Z")
+        );
+        assert_eq!(
+            value
+                .pointer("/path_newest_to_oldest/latest_1d_background/summary/atr14")
+                .and_then(Value::as_f64),
+            Some(27.67)
+        );
+        assert_eq!(
+            value
+                .pointer("/path_newest_to_oldest/latest_1d_background/summary/atr14_pct")
+                .and_then(Value::as_f64),
+            Some(1.31)
+        );
+        assert_eq!(
+            value
+                .pointer("/path_newest_to_oldest/latest_1d_background/current_partial_bar/ts")
+                .and_then(Value::as_str),
+            Some("2026-03-14T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn build_value_keeps_fine_grained_clusters_and_3d_sources() {
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-14T08:00:00Z")
+            .expect("parse ts bucket")
+            .with_timezone(&Utc);
+        let mut indicators = fixture_indicators();
+        indicators["price_volume_structure"]["payload"]["by_window"]["3d"] = json!({
+            "window_bars_used": 20,
+            "poc_price": 2092.2,
+            "poc_volume": 80.0,
+            "vah": 2118.0,
+            "val": 2088.0,
+            "bar_volume": 500.0,
+            "volume_zscore": 1.1,
+            "value_area_levels": [
+                {"price_level": 2102.0, "volume": 20.0},
+                {"price_level": 2102.1, "volume": 18.0},
+                {"price_level": 2092.18, "volume": 55.0},
+                {"price_level": 2092.19, "volume": 65.0},
+                {"price_level": 2092.20, "volume": 75.0},
+                {"price_level": 2092.21, "volume": 68.0},
+                {"price_level": 2092.22, "volume": 58.0}
+            ]
+        });
+        indicators["footprint"]["payload"]["by_window"]["3d"] = json!({
+            "window_delta": 420.0,
+            "window_total_qty": 4200.0,
+            "unfinished_auction": false,
+            "ua_top": 2112.0,
+            "ua_bottom": 2088.0,
+            "stacked_buy": true,
+            "stacked_sell": true,
+            "buy_stacks": [{"start_price": 2092.18, "end_price": 2092.22, "length": 5}],
+            "sell_stacks": [{"start_price": 2110.0, "end_price": 2111.0, "length": 3}],
+            "buy_imbalance_prices": [2102.0, 2102.1, 2092.18, 2092.19, 2092.20, 2092.21, 2092.22],
+            "sell_imbalance_prices": [2110.4, 2110.5]
+        });
+        indicators["orderbook_depth"]["payload"]["levels"] = json!([
+            {"price_level": 2092.18, "bid_liquidity": 80.0, "ask_liquidity": 0.0, "total_liquidity": 80.0},
+            {"price_level": 2092.19, "bid_liquidity": 82.0, "ask_liquidity": 0.0, "total_liquidity": 82.0},
+            {"price_level": 2092.20, "bid_liquidity": 84.0, "ask_liquidity": 0.0, "total_liquidity": 84.0},
+            {"price_level": 2092.21, "bid_liquidity": 83.0, "ask_liquidity": 0.0, "total_liquidity": 83.0},
+            {"price_level": 2092.22, "bid_liquidity": 81.0, "ask_liquidity": 0.0, "total_liquidity": 81.0},
+            {"price_level": 2102.0, "bid_liquidity": 30.0, "ask_liquidity": 0.0, "total_liquidity": 30.0},
+            {"price_level": 2102.1, "bid_liquidity": 28.0, "ask_liquidity": 0.0, "total_liquidity": 28.0},
+            {"price_level": 2107.0, "bid_liquidity": 0.0, "ask_liquidity": 55.0, "total_liquidity": 55.0},
+            {"price_level": 2108.0, "bid_liquidity": 0.0, "ask_liquidity": 65.0, "total_liquidity": 65.0}
+        ]);
+
+        let input = sample_input(indicators, ts_bucket);
+        let value = ScanFilter::build_value(&input).expect("build scan value");
+        let structures = value
+            .pointer("/raw_overflow/price_structures")
+            .and_then(Value::as_array)
+            .expect("price structures");
+
+        assert!(structures.iter().any(|entry| {
+            entry.get("source_kind").and_then(Value::as_str) == Some("pvs_value_cluster")
+                && entry.get("source_window").and_then(Value::as_str) == Some("3d")
+                && entry.get("price_low").and_then(Value::as_f64) == Some(2092.18)
+                && entry.get("price_high").and_then(Value::as_f64) == Some(2092.22)
+        }));
+        assert!(structures.iter().any(|entry| {
+            entry.get("source_kind").and_then(Value::as_str) == Some("footprint_price_cluster")
+                && entry.get("source_window").and_then(Value::as_str) == Some("3d")
+                && entry.get("price_low").and_then(Value::as_f64) == Some(2092.18)
+                && entry.get("price_high").and_then(Value::as_f64) == Some(2092.22)
+        }));
+        assert!(structures.iter().any(|entry| {
+            entry.get("source_kind").and_then(Value::as_str) == Some("orderbook_depth_cluster")
+                && entry.get("price_low").and_then(Value::as_f64) == Some(2092.18)
+                && entry.get("price_high").and_then(Value::as_f64) == Some(2092.22)
+        }));
+    }
+
+    #[test]
+    fn build_value_includes_active_fvg_absorption_and_footprint_stack_summaries() {
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-14T08:00:00Z")
+            .expect("parse ts bucket")
+            .with_timezone(&Utc);
+        let mut indicators = fixture_indicators();
+        indicators["fvg"]["payload"]["by_window"]["15m"]["nearest_bull_fvg"] = Value::Null;
+        indicators["fvg"]["payload"]["by_window"]["15m"]["nearest_bear_fvg"] = Value::Null;
+        indicators["fvg"]["payload"]["by_window"]["15m"]["active_bull_fvgs"] = json!([
+            {"upper": 2101.9, "lower": 2100.8, "state": "active", "touch_count": 2, "age_bars": 3}
+        ]);
+
+        let input = sample_input(indicators, ts_bucket);
+        let value = ScanFilter::build_value(&input).expect("build scan value");
+        let structures = value
+            .pointer("/raw_overflow/price_structures")
+            .and_then(Value::as_array)
+            .expect("price structures");
+
+        assert!(structures.iter().any(|entry| {
+            entry.get("source_kind").and_then(Value::as_str) == Some("fvg_boundary")
+                && entry.get("price_low").and_then(Value::as_f64) == Some(2100.8)
+                && entry.get("price_high").and_then(Value::as_f64) == Some(2101.9)
+        }));
+        assert!(structures.iter().any(|entry| {
+            entry.get("source_kind").and_then(Value::as_str) == Some("recent_swing_bracket")
+                && entry.get("source_window").and_then(Value::as_str) == Some("15m")
+        }));
+        assert!(structures.iter().any(|entry| {
+            entry.get("source_kind").and_then(Value::as_str) == Some("absorption_zone")
+        }));
+
+        let bracket_board = value
+            .pointer("/now/bracket_board")
+            .and_then(Value::as_object)
+            .expect("bracket board");
+        let has_absorption_evidence = [
+            "current_inside",
+            "nearest_above",
+            "nearest_below",
+            "higher_context",
+        ]
+        .iter()
+        .filter_map(|key| bracket_board.get(*key).and_then(Value::as_array))
+        .flat_map(|entries| entries.iter())
+        .any(|entry| {
+            entry
+                .get("support_evidence")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .chain(
+                    entry
+                        .get("resistance_evidence")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten(),
+                )
+                .filter_map(Value::as_str)
+                .any(|text| text.contains("absorption"))
+        });
+        assert!(has_absorption_evidence);
+
+        assert_eq!(
+            value
+                .pointer("/now/current_flow_snapshot/footprint/by_window/15m/max_buy_stack_len")
+                .and_then(Value::as_u64),
+            Some(6)
+        );
+        assert_eq!(
+            value
+                .pointer("/now/current_flow_snapshot/footprint/by_window/15m/max_sell_stack_len")
+                .and_then(Value::as_u64),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn build_value_merges_bracket_scopes_for_identical_boundaries() {
+        let merged = super::merge_bracket_candidates(vec![
+            super::BracketCandidate {
+                scopes: vec!["15m".to_string()],
+                kind: "tpo_value_area".to_string(),
+                source_indicators: vec!["tpo_market_profile".to_string()],
+                reference_ts: Some("2026-03-14T08:00:00Z".to_string()),
+                support: 2101.0,
+                resistance: 2105.0,
+                support_evidence: vec!["tpo support 2101.00".to_string()],
+                resistance_evidence: vec!["tpo resistance 2105.00".to_string()],
+            },
+            super::BracketCandidate {
+                scopes: vec!["4h".to_string()],
+                kind: "tpo_value_area".to_string(),
+                source_indicators: vec!["tpo_market_profile".to_string()],
+                reference_ts: Some("2026-03-14T08:05:00Z".to_string()),
+                support: 2101.0,
+                resistance: 2105.0,
+                support_evidence: vec!["tpo support 2101.00".to_string()],
+                resistance_evidence: vec!["tpo resistance 2105.00".to_string()],
+            },
+        ]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].scopes, vec!["15m".to_string(), "4h".to_string()]);
+        assert_eq!(
+            merged[0].reference_ts.as_deref(),
+            Some("2026-03-14T08:05:00Z")
+        );
+    }
+
+    #[test]
+    fn build_value_aggregates_raw_overflow_and_limits_absorption_per_scope_direction() {
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-14T08:00:00Z")
+            .expect("parse ts bucket")
+            .with_timezone(&Utc);
+        let mut indicators = fixture_indicators();
+        indicators["bullish_absorption"]["payload"]["recent_7d"]["events"] = json!((0..15)
+            .map(|idx| json!({
+                "event_start_ts": format!("2026-03-14T07:{:02}:00Z", idx),
+                "event_end_ts": format!("2026-03-14T07:{:02}:00Z", idx),
+                "confirm_ts": format!("2026-03-14T07:{:02}:00Z", idx),
+                "direction": 1,
+                "pivot_price": 2102.0 + (idx as f64 * 0.01),
+                "score": 0.50 + (idx as f64 * 0.01),
+                "type": "bullish_absorption",
+                "scope": "15m"
+            }))
+            .collect::<Vec<_>>());
+        indicators["bearish_absorption"]["payload"]["recent_7d"]["events"] = json!([]);
+
+        let input = sample_input(indicators, ts_bucket);
+        let value = ScanFilter::build_value(&input).expect("build scan value");
+        let structures = value
+            .pointer("/raw_overflow/price_structures")
+            .and_then(Value::as_array)
+            .expect("price structures");
+
+        assert!(structures
+            .iter()
+            .all(|entry| entry.get("source_kinds").is_none()));
+        assert!(structures
+            .iter()
+            .all(|entry| entry.get("source_windows").is_none()));
+        assert!(structures
+            .iter()
+            .all(|entry| entry.get("source_kind").is_some()));
+        assert!(structures
+            .iter()
+            .all(|entry| entry.get("source_window").is_some()));
+
+        let absorption_count = structures
+            .iter()
+            .filter(|entry| {
+                entry.get("source_kind").and_then(Value::as_str) == Some("absorption_zone")
+            })
+            .count();
+        assert!(absorption_count <= super::RAW_OVERFLOW_ABSORPTION_MAX_PER_SCOPE_DIRECTION);
+
+        let pvs_clusters = structures
+            .iter()
+            .filter(|entry| {
+                entry.get("source_kind").and_then(Value::as_str) == Some("pvs_value_cluster")
+            })
+            .collect::<Vec<_>>();
+        assert!(pvs_clusters
+            .iter()
+            .all(|entry| entry.get("count").is_some()));
+        assert!(pvs_clusters
+            .iter()
+            .all(|entry| entry.get("distance_to_mid_pct").is_some()));
+    }
+
+    #[test]
+    fn filter_cvd_pack_omits_null_large_window_cross_market_fields() {
         let payload = json!({
-            "source_market": "futures",
-            "base_detection_uses_spot": true,
+            "delta_fut": -244.476,
+            "delta_spot": 157.0657,
+            "relative_delta_fut": -0.0481,
+            "relative_delta_spot": 0.3447,
+            "xmk_delta_gap_s_minus_f": 401.5417,
+            "spot_flow_dominance": 0.3911,
             "by_window": {
                 "15m": {
-                    "active_bull_fvgs": [{
-                        "upper": 2102.5,
-                        "lower": 2101.5,
-                        "distance_to_avwap": null,
-                        "spot_confirm_at_birth": null,
-                        "state": "fresh"
-                    }],
-                    "active_bear_fvgs": [],
-                    "nearest_bull_fvg": {
-                        "upper": 2102.5,
-                        "lower": 2101.5,
-                        "distance_to_avwap": null,
-                        "spot_confirm_at_birth": null,
-                        "state": "fresh"
-                    },
-                    "nearest_bear_fvg": null,
-                    "is_ready": true,
-                    "coverage_ratio": 1.0
+                    "series": [{
+                        "ts": "2026-03-17T09:30:00+00:00",
+                        "close_fut": 2323.77,
+                        "close_spot": 2324.10,
+                        "delta_fut": 6207.6969,
+                        "delta_spot": -647.7018,
+                        "relative_delta_fut": 0.0800557,
+                        "relative_delta_spot": -0.1139836,
+                        "cvd_7d_fut": 1000.0,
+                        "cvd_7d_spot": 200.0,
+                        "spot_flow_dominance": 0.6867,
+                        "xmk_delta_gap_s_minus_f": -0.8306
+                    }]
+                },
+                "4h": {
+                    "series": [{
+                        "ts": "2026-03-17T08:00:00+00:00",
+                        "close_fut": 2326.75,
+                        "close_spot": 2327.12,
+                        "delta_fut": -8834.352,
+                        "delta_spot": -2316.9561,
+                        "relative_delta_fut": -0.0089874,
+                        "relative_delta_spot": -0.0268821,
+                        "cvd_7d_fut": 1500.0,
+                        "cvd_7d_spot": 300.0,
+                        "spot_flow_dominance": null,
+                        "xmk_delta_gap_s_minus_f": null
+                    }]
+                },
+                "1d": {
+                    "series": [{
+                        "ts": "2026-03-17T00:00:00+00:00",
+                        "close_fut": 2351.66,
+                        "close_spot": 2352.02,
+                        "delta_fut": 620534.926,
+                        "delta_spot": 46099.4636,
+                        "relative_delta_fut": 0.0672433,
+                        "relative_delta_spot": 0.0551008,
+                        "cvd_7d_fut": 9000.0,
+                        "cvd_7d_spot": 700.0,
+                        "spot_flow_dominance": null,
+                        "xmk_delta_gap_s_minus_f": null
+                    }]
                 }
             }
         });
 
-        let value = filter_fvg(&payload);
+        let value = filter_cvd_pack(&payload);
 
-        assert!(value.pointer("/by_window/15m/nearest_bear_fvg").is_none());
         assert!(value
-            .pointer("/by_window/15m/nearest_bull_fvg/fvg_top")
+            .pointer("/by_window/15m/series/0/xmk_delta_gap_s_minus_f")
             .is_some());
         assert!(value
-            .pointer("/by_window/15m/nearest_bull_fvg/distance_to_avwap")
+            .pointer("/by_window/15m/series/0/spot_flow_dominance")
+            .is_some());
+        assert!(value
+            .pointer("/by_window/4h/series/0/xmk_delta_gap_s_minus_f")
             .is_none());
         assert!(value
-            .pointer("/by_window/15m/nearest_bull_fvg/spot_confirm_at_birth")
+            .pointer("/by_window/4h/series/0/spot_flow_dominance")
             .is_none());
-        assert_eq!(
-            value
-                .pointer("/by_window/15m/nearest_bull_fvg/state")
-                .and_then(Value::as_str),
-            Some("fresh")
-        );
-        assert_eq!(
-            value
-                .pointer("/by_window/15m/active_bull_fvgs/0/state")
-                .and_then(Value::as_str),
-            Some("fresh")
-        );
-    }
-
-    #[test]
-    fn extract_ema_regime_current_uses_newest_after_normalization() {
-        let payload = json!({
-            "ffill_series_by_output_window": {
-                "15m": [
-                    {"ts": "2026-03-14T07:00:00Z", "trend_regime": "bear", "by_tf": {"4h": {"trend_regime": "bear"}, "1d": {"trend_regime": "bear"}}},
-                    {"ts": "2026-03-14T07:15:00Z", "trend_regime": "bull", "by_tf": {"4h": {"trend_regime": "bull"}, "1d": {"trend_regime": "bull"}}}
-                ]
-            }
-        });
-        let payload = payload.as_object().expect("ema payload object");
-        assert_eq!(
-            extract_ema_regime_current(Some(payload), "15m"),
-            json!("bull")
-        );
-        assert_eq!(
-            extract_ema_regime_current(Some(payload), "4h"),
-            json!("bull")
-        );
+        assert!(value
+            .pointer("/by_window/1d/series/0/xmk_delta_gap_s_minus_f")
+            .is_none());
+        assert!(value
+            .pointer("/by_window/1d/series/0/spot_flow_dominance")
+            .is_none());
     }
 
     #[test]
@@ -5068,265 +6058,247 @@ mod tests {
     }
 
     #[test]
-    fn weighted_event_score_penalizes_old_and_far_events() {
-        let now = DateTime::parse_from_rfc3339("2026-03-16T08:47:00Z")
-            .expect("parse now")
-            .with_timezone(&Utc);
-        let near_recent = json!({
-            "confirm_ts": "2026-03-16T08:29:00Z",
-            "pivot_price": 2244.18,
-            "score": 0.94,
-            "type": "selling_exhaustion"
-        })
-        .as_object()
-        .expect("near event")
-        .clone();
-        let old_far = json!({
-            "confirm_ts": "2026-03-15T10:13:00Z",
-            "pivot_price": 2113.65,
-            "score": 0.768,
-            "type": "bullish_absorption"
-        })
-        .as_object()
-        .expect("far event")
-        .clone();
-
-        let near_score =
-            weighted_event_score(&near_recent, Some(now), Some(2241.17), Some(35.43), "4h");
-        let far_score = weighted_event_score(&old_far, Some(now), Some(2241.17), Some(35.43), "4h");
-
-        assert!(near_score > far_score);
-    }
-
-    #[test]
-    fn build_event_summary_uses_weighted_scores_for_bias() {
-        let now = DateTime::parse_from_rfc3339("2026-03-16T08:47:00Z")
-            .expect("parse now")
-            .with_timezone(&Utc);
-        let indicators = fixture_indicators();
-        let atr14_by_tf = json!({
-            "15m": {"atr14": 12.0},
-            "4h": {"atr14": 35.0},
-            "1d": {"atr14": 100.0}
+    fn filter_high_volume_pulse_keeps_source_available_windows() {
+        let payload = json!({
+            "as_of_ts": "2026-03-17T08:15:00+00:00",
+            "by_z_window": {
+                "1d": {"window_minutes": 1440, "lookback_samples": 1440, "rolling_volume_w": 8509443.86, "volume_spike_z_w": -0.12, "is_volume_spike_z2": false, "is_volume_spike_z3": false},
+                "1h": {"window_minutes": 60, "lookback_samples": 60, "rolling_volume_w": 213636.91, "volume_spike_z_w": 1.27, "is_volume_spike_z2": false, "is_volume_spike_z3": false},
+                "4h": {"window_minutes": 240, "lookback_samples": 240, "rolling_volume_w": 917561.19, "volume_spike_z_w": -2.94, "is_volume_spike_z2": false, "is_volume_spike_z3": false}
+            },
+            "intrabar_poc_max_by_window": {
+                "15m": {"intrabar_poc_price": 2325.0, "intrabar_poc_volume": 602.083, "ts": "2026-03-17T08:11:00+00:00", "window_minutes": 15},
+                "1h": {"intrabar_poc_price": 2335.0, "intrabar_poc_volume": 2314.556, "ts": "2026-03-17T07:20:00+00:00", "window_minutes": 60}
+            }
         });
-        let events = vec![
-            json!({
-                "confirm_ts": "2026-03-16T08:40:00Z",
-                "pivot_price": 2103.0,
-                "score": 0.9,
-                "type": "bullish_absorption",
-                "direction": 1
-            })
-            .as_object()
-            .expect("event one")
-            .clone(),
-            json!({
-                "confirm_ts": "2026-03-15T00:00:00Z",
-                "pivot_price": 2000.0,
-                "score": 1.0,
-                "type": "bearish_absorption",
-                "direction": -1
-            })
-            .as_object()
-            .expect("event two")
-            .clone(),
-        ];
-        let summary = build_event_summary_from_events(
-            &events,
-            Some(now),
-            indicators
-                .get("price_volume_structure")
-                .and_then(|_| Some(2104.0)),
-            &atr14_by_tf,
-            super::event_direction_default,
-        );
-        assert_eq!(
-            summary.pointer("/15m/bias").and_then(Value::as_str),
-            Some("bullish")
-        );
-        assert!(
-            summary
-                .pointer("/15m/bullish_score")
-                .and_then(Value::as_f64)
-                .unwrap_or_default()
-                > summary
-                    .pointer("/15m/bearish_score")
-                    .and_then(Value::as_f64)
-                    .unwrap_or_default()
-        );
+
+        let value = filter_high_volume_pulse(&payload);
+
+        assert!(value.pointer("/by_z_window/15m").is_none());
+        assert!(value.pointer("/by_z_window/1h").is_some());
+        assert!(value.pointer("/by_z_window/4h").is_some());
+        assert!(value.pointer("/intrabar_poc_max_by_window/15m").is_some());
+        assert!(value.pointer("/intrabar_poc_max_by_window/1h").is_some());
+        assert!(value
+            .pointer("/by_z_window/1h/is_volume_spike_z2")
+            .is_none());
     }
 
     #[test]
-    fn build_value_exposes_session_value_area_range_for_intraday_context() {
+    fn build_events_reads_divergence_top_level_events_fallback() {
         let ts_bucket = DateTime::parse_from_rfc3339("2026-03-14T08:00:00Z")
             .expect("parse ts bucket")
             .with_timezone(&Utc);
-        let input = sample_input(fixture_indicators(), ts_bucket);
+        let mut indicators = fixture_indicators();
+        indicators["divergence"]["payload"] = json!({
+            "events": [sample_divergence_event("2026-03-14T07:25:00Z", "hidden_bullish_divergence", 0.9)]
+        });
+
+        let input = sample_input(indicators, ts_bucket);
         let value = ScanFilter::build_value(&input).expect("build scan value");
+        let events = value
+            .pointer("/events_newest_to_oldest/latest_24h_detail")
+            .and_then(Value::as_array)
+            .expect("events array");
 
+        assert!(events.iter().any(|entry| {
+            entry.get("indicator_code").and_then(Value::as_str) == Some("divergence")
+                && entry.get("event_type").and_then(Value::as_str)
+                    == Some("hidden_bullish_divergence")
+        }));
+    }
+
+    #[test]
+    fn build_events_backfills_scope_spot_confirm_trigger_side_and_divergence_prices() {
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-14T08:00:00Z")
+            .expect("parse ts bucket")
+            .with_timezone(&Utc);
+        let mut indicators = fixture_indicators();
+        indicators["kline_history"]["payload"]["intervals"]["1m"] = json!({
+            "markets": {"futures": {"bars": [
+                {"open": 2100.0, "high": 2101.5, "low": 2099.5, "close": 2101.0, "volume_base": 10.0, "open_time": "2026-03-14T07:15:00Z", "is_closed": true},
+                {"open": 2101.0, "high": 2102.5, "low": 2098.0, "close": 2100.5, "volume_base": 10.0, "open_time": "2026-03-14T07:16:00Z", "is_closed": true},
+                {"open": 2100.5, "high": 2103.0, "low": 2098.5, "close": 2102.0, "volume_base": 10.0, "open_time": "2026-03-14T07:17:00Z", "is_closed": true}
+            ]}}
+        });
+        indicators["selling_exhaustion"]["payload"]["recent_7d"]["events"] = json!([
+            {
+                "type": "selling_exhaustion",
+                "event_start_ts": "2026-03-14T07:03:00Z",
+                "event_end_ts": "2026-03-14T07:10:00Z",
+                "confirm_ts": "2026-03-14T07:10:00Z",
+                "direction": 1,
+                "pivot_price": 2105.0,
+                "score": 0.8,
+                "spot_exhaustion_confirm": false
+            }
+        ]);
+        indicators["buying_exhaustion"]["payload"]["recent_7d"]["events"] = json!([]);
+        indicators["bullish_initiation"]["payload"]["recent_7d"]["events"] = json!([
+            {
+                "type": "bullish_initiation",
+                "event_start_ts": "2026-03-14T07:11:00Z",
+                "event_end_ts": "2026-03-14T07:14:00Z",
+                "confirm_ts": "2026-03-14T07:14:00Z",
+                "direction": 1,
+                "pivot_price": 2102.0,
+                "price_low": 2100.0,
+                "price_high": 2104.0,
+                "score": 0.7,
+                "spot_break_confirm": true
+            }
+        ]);
+        indicators["bearish_initiation"]["payload"]["recent_7d"]["events"] = json!([]);
+        indicators["divergence"]["payload"]["recent_7d"]["events"] = json!([
+            {
+                "type": "bullish_divergence",
+                "event_start_ts": "2026-03-14T07:15:00Z",
+                "event_end_ts": "2026-03-14T07:17:00Z",
+                "pivot_side": "low",
+                "score": 0.9,
+                "spot_price_flow_confirm": false
+            }
+        ]);
+        indicators["bullish_absorption"]["payload"]["recent_7d"]["events"] = json!([]);
+        indicators["bearish_absorption"]["payload"]["recent_7d"]["events"] = json!([]);
+
+        let input = sample_input(indicators, ts_bucket);
+        let value = ScanFilter::build_value(&input).expect("build scan value");
+        let events = value
+            .pointer("/events_newest_to_oldest/latest_24h_detail")
+            .and_then(Value::as_array)
+            .expect("events array");
+
+        let selling_exhaustion = events
+            .iter()
+            .find(|event| {
+                event.get("indicator_code").and_then(Value::as_str) == Some("selling_exhaustion")
+            })
+            .expect("selling exhaustion event");
         assert_eq!(
-            value
-                .pointer("/timeframe_evidence/15m/ranges/session_value_area_range/support")
-                .and_then(Value::as_f64),
-            Some(2100.0)
+            selling_exhaustion.get("scope").and_then(Value::as_str),
+            Some("1m")
         );
         assert_eq!(
-            value
-                .pointer("/timeframe_evidence/15m/ranges/session_value_area_range/resistance")
-                .and_then(Value::as_f64),
-            Some(2109.0)
+            selling_exhaustion
+                .get("spot_confirm")
+                .and_then(Value::as_bool),
+            Some(false)
         );
         assert_eq!(
-            value
-                .pointer("/timeframe_evidence/15m/ranges/session_value_area_range/source_kind")
+            selling_exhaustion
+                .get("trigger_side")
                 .and_then(Value::as_str),
-            Some("tpo_value_area")
+            Some("sell")
+        );
+
+        let bullish_initiation = events
+            .iter()
+            .find(|event| {
+                event.get("indicator_code").and_then(Value::as_str) == Some("bullish_initiation")
+            })
+            .expect("bullish initiation event");
+        assert_eq!(
+            bullish_initiation.get("scope").and_then(Value::as_str),
+            Some("1m")
+        );
+        assert_eq!(
+            bullish_initiation
+                .get("spot_confirm")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            bullish_initiation
+                .get("trigger_side")
+                .and_then(Value::as_str),
+            Some("buy")
+        );
+
+        let divergence = events
+            .iter()
+            .find(|event| event.get("indicator_code").and_then(Value::as_str) == Some("divergence"))
+            .expect("divergence event");
+        assert_eq!(divergence.get("scope").and_then(Value::as_str), Some("1m"));
+        assert_eq!(
+            divergence.get("spot_confirm").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            divergence.get("pivot_price").and_then(Value::as_f64),
+            Some(2098.0)
+        );
+        assert_eq!(
+            divergence.get("price_low").and_then(Value::as_f64),
+            Some(2098.0)
+        );
+        assert_eq!(
+            divergence.get("price_high").and_then(Value::as_f64),
+            Some(2103.0)
+        );
+        assert!(divergence
+            .get("distance_to_current_pct")
+            .and_then(Value::as_f64)
+            .is_some());
+    }
+
+    #[test]
+    fn build_events_orders_latest_24h_by_visible_event_time_desc() {
+        let ts_bucket = DateTime::parse_from_rfc3339("2026-03-14T08:00:00Z")
+            .expect("parse ts bucket")
+            .with_timezone(&Utc);
+        let mut indicators = fixture_indicators();
+        indicators["selling_exhaustion"]["payload"]["recent_7d"]["events"] = json!([
+            {
+                "event_start_ts": "2026-03-14T07:00:00Z",
+                "event_end_ts": "2026-03-14T07:29:00Z",
+                "confirm_ts": "2026-03-14T07:30:00Z",
+                "pivot_price": 2101.0,
+                "score": 0.8,
+                "type": "selling_exhaustion"
+            }
+        ]);
+        indicators["bullish_absorption"]["payload"]["recent_7d"]["events"] = json!([
+            {
+                "event_start_ts": "2026-03-14T07:10:00Z",
+                "event_end_ts": "2026-03-14T07:19:00Z",
+                "confirm_ts": "2026-03-14T07:20:00Z",
+                "pivot_price": 2100.5,
+                "score": 0.7,
+                "type": "bullish_absorption"
+            }
+        ]);
+        indicators["bearish_absorption"]["payload"]["recent_7d"]["events"] = json!([]);
+        indicators["buying_exhaustion"]["payload"]["recent_7d"]["events"] = json!([]);
+        indicators["divergence"]["payload"]["recent_7d"]["events"] = json!([]);
+        indicators["bullish_initiation"]["payload"]["recent_7d"]["events"] = json!([]);
+        indicators["bearish_initiation"]["payload"]["recent_7d"]["events"] = json!([]);
+
+        let input = sample_input(indicators, ts_bucket);
+        let value = ScanFilter::build_value(&input).expect("build scan value");
+        let events = value
+            .pointer("/events_newest_to_oldest/latest_24h_detail")
+            .and_then(Value::as_array)
+            .expect("events array");
+
+        assert_eq!(
+            events
+                .first()
+                .and_then(|event| event.get("event_start_ts"))
+                .and_then(Value::as_str),
+            Some("2026-03-14T07:10:00Z")
+        );
+        assert_eq!(
+            events
+                .get(1)
+                .and_then(|event| event.get("event_start_ts"))
+                .and_then(Value::as_str),
+            Some("2026-03-14T07:00:00Z")
         );
     }
 
     #[test]
-    fn build_display_range_expands_resistance_for_narrow_bullish_breakout() {
-        let primary_support = LevelAnchor {
-            price: 2253.02,
-            strength: 4.2,
-            source_count: 4,
-        };
-        let primary_resistance = LevelAnchor {
-            price: 2260.0,
-            strength: 1.5,
-            source_count: 1,
-        };
-        let secondary_resistance = LevelAnchor {
-            price: 2271.72,
-            strength: 2.2,
-            source_count: 2,
-        };
-
-        let (display_support, display_resistance, mode) = build_display_range(
-            "4h",
-            Some(2253.35),
-            34.08,
-            Some(primary_support.price),
-            Some(primary_resistance.price),
-            Some(&primary_support),
-            None,
-            Some(&primary_resistance),
-            Some(&secondary_resistance),
-            Some(2288.0),
-            Some(2087.65),
-            BiasEvidence {
-                trend_balance_score: 0.55,
-                flow_balance_score: 0.48,
-                structure_balance_score: 0.22,
-                evidence_balance_score: 0.43,
-                conflict_score: 0.12,
-                compression_score: 0.25,
-            },
-        );
-
-        assert_eq!(display_support, Some(2253.02));
-        assert_eq!(display_resistance, Some(2271.72));
-        assert_eq!(mode, "expanded_resistance");
-    }
-
-    #[test]
-    fn build_display_range_keeps_primary_when_secondary_is_weak_far_wall() {
-        let primary_support = LevelAnchor {
-            price: 2253.02,
-            strength: 6.9,
-            source_count: 6,
-        };
-        let primary_resistance = LevelAnchor {
-            price: 2257.35,
-            strength: 0.8,
-            source_count: 1,
-        };
-        let secondary_resistance = LevelAnchor {
-            price: 2280.04,
-            strength: 0.8,
-            source_count: 1,
-        };
-
-        let (display_support, display_resistance, mode) = build_display_range(
-            "15m",
-            Some(2253.35),
-            12.47,
-            Some(primary_support.price),
-            Some(primary_resistance.price),
-            Some(&primary_support),
-            None,
-            Some(&primary_resistance),
-            Some(&secondary_resistance),
-            Some(2288.0),
-            Some(2244.68),
-            BiasEvidence {
-                trend_balance_score: 0.41,
-                flow_balance_score: 0.18,
-                structure_balance_score: 0.11,
-                evidence_balance_score: 0.26,
-                conflict_score: 0.24,
-                compression_score: 0.18,
-            },
-        );
-
-        assert_eq!(display_support, Some(2253.02));
-        assert_eq!(display_resistance, Some(2257.35));
-        assert_eq!(mode, "primary");
-    }
-
-    #[test]
-    fn build_display_range_expands_resistance_for_ultra_narrow_transition_when_second_level_is_stronger(
-    ) {
-        let primary_support = LevelAnchor {
-            price: 2239.13,
-            strength: 1.7,
-            source_count: 2,
-        };
-        let primary_resistance = LevelAnchor {
-            price: 2246.88,
-            strength: 4.2,
-            source_count: 4,
-        };
-        let secondary_resistance = LevelAnchor {
-            price: 2255.38,
-            strength: 5.7,
-            source_count: 5,
-        };
-        let secondary_support = LevelAnchor {
-            price: 2229.45,
-            strength: 0.8,
-            source_count: 1,
-        };
-
-        let (display_support, display_resistance, mode) = build_display_range(
-            "4h",
-            Some(2246.38),
-            34.63,
-            Some(primary_support.price),
-            Some(primary_resistance.price),
-            Some(&primary_support),
-            Some(&secondary_support),
-            Some(&primary_resistance),
-            Some(&secondary_resistance),
-            Some(2288.0),
-            Some(2087.65),
-            BiasEvidence {
-                trend_balance_score: -0.18,
-                flow_balance_score: -0.14,
-                structure_balance_score: 0.05,
-                evidence_balance_score: -0.22,
-                conflict_score: 0.47,
-                compression_score: 0.31,
-            },
-        );
-
-        assert_eq!(display_support, Some(2239.13));
-        assert_eq!(display_resistance, Some(2255.38));
-        assert_eq!(mode, "expanded_resistance");
-    }
-
-    #[test]
-    fn real_snapshot_scan_output_stays_under_v4_size_budget() {
+    fn real_snapshot_scan_output_emits_v6_sections() {
         let Some(path) = latest_temp_indicator_sample_path() else {
             return;
         };
@@ -5343,30 +6315,21 @@ mod tests {
         let input = sample_input(indicators, ts_bucket);
 
         let scan_value = ScanFilter::build_value(&input).expect("build real scan value");
-        let serialized = serde_json::to_vec(&scan_value).expect("serialize real scan value");
-
-        assert!(
-            serialized.len() < 130 * 1024,
-            "serialized scan too large: {}",
-            serialized.len()
-        );
         assert!(scan_value.pointer("/current_price").is_some());
-        assert!(scan_value.pointer("/by_timeframe/15m").is_some());
-        assert!(scan_value.pointer("/timeframe_evidence/15m").is_some());
+        assert!(scan_value.pointer("/now").is_some());
         assert!(scan_value
-            .pointer("/by_timeframe/4h/volatility/atr14")
-            .and_then(Value::as_f64)
+            .pointer("/path_newest_to_oldest/latest_15m_detail")
+            .is_some());
+        assert!(scan_value.pointer("/events_newest_to_oldest").is_some());
+        assert!(scan_value.pointer("/supporting_context").is_some());
+        assert!(scan_value
+            .pointer("/raw_overflow/price_structures/0")
             .is_some());
         assert!(scan_value
-            .pointer("/by_timeframe/4h/volatility/atr14_pct")
-            .and_then(Value::as_f64)
+            .pointer("/now/current_flow_snapshot/footprint/by_window/15m/buy_stacks")
             .is_some());
-        assert!(scan_value
-            .pointer("/indicators/footprint/payload/by_window/15m/buy_stacks")
-            .is_some());
-        assert!(scan_value.pointer("/indicators/kline_history").is_none());
-        assert!(scan_value.pointer("/indicators/cvd_pack").is_none());
-        assert!(scan_value.pointer("/indicators/absorption").is_none());
-        assert!(scan_value.pointer("/indicators/whale_trades").is_none());
+        assert!(scan_value.pointer("/indicators").is_none());
+        assert!(scan_value.pointer("/by_timeframe").is_none());
+        assert!(scan_value.pointer("/timeframe_evidence").is_none());
     }
 }

@@ -148,6 +148,12 @@ pub struct EntryStagePromptInputCapture {
     pub stage_1_setup_scan_json: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct FinalizeStageContext {
+    pub stage1_scan_ts_bucket: DateTime<Utc>,
+    pub stage2_core_ts_bucket: DateTime<Utc>,
+}
+
 #[derive(Debug, Default, Clone)]
 struct ProviderTrace {
     batch_id: Option<String>,
@@ -186,18 +192,6 @@ impl ProviderTrace {
 
     fn push_entry_stage_prompt_input(&mut self, capture: EntryStagePromptInputCapture) {
         self.entry_stage_prompt_inputs.push(capture);
-    }
-
-    fn prepend_entry_stage_prompt_inputs(
-        mut self,
-        captures: &[EntryStagePromptInputCapture],
-    ) -> Self {
-        if !captures.is_empty() {
-            let mut combined = captures.to_vec();
-            combined.extend(self.entry_stage_prompt_inputs);
-            self.entry_stage_prompt_inputs = combined;
-        }
-        self
     }
 
     fn output_entry_stage_trace(&self) -> Option<Vec<Value>> {
@@ -257,6 +251,19 @@ fn build_entry_finalize_trace_event(
         "scan_15m_trend": prior_scan.pointer("/15m/trend").cloned().unwrap_or(Value::Null),
         "scan_4h_trend": prior_scan.pointer("/4h/trend").cloned().unwrap_or(Value::Null),
         "scan_1d_trend": prior_scan.pointer("/1d/trend").cloned().unwrap_or(Value::Null),
+        "stage_1_scan_ts_bucket": prior_scan.get("stage_1_scan_ts_bucket").cloned().unwrap_or(Value::Null),
+        "stage_2_core_ts_bucket": prior_scan
+            .get("stage_2_core_ts_bucket")
+            .cloned()
+            .unwrap_or_else(|| Value::String(input.ts_bucket.to_rfc3339())),
+        "stage_1_to_stage_2_gap_seconds": prior_scan
+            .get("stage_1_to_stage_2_gap_seconds")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "stage_1_to_stage_2_gap_minutes": prior_scan
+            .get("stage_1_to_stage_2_gap_minutes")
+            .cloned()
+            .unwrap_or(Value::Null),
         "stage_2_filter": "core",
         "raw_indicator_count": input.indicators.as_object().map(|obj| obj.len()).unwrap_or(0),
         "missing_indicator_codes": &input.missing_indicator_codes,
@@ -317,6 +324,38 @@ fn build_prompt_pair(
         None
     };
     if matches!(entry_stage, prompt::EntryPromptStage::Finalize) {
+        if let Some(scan_ts_bucket) = sanitized_prior_scan
+            .as_ref()
+            .and_then(|value| value.get("stage_1_scan_ts_bucket"))
+            .and_then(Value::as_str)
+        {
+            user.push_str("\n\nSTAGE_1_SCAN_TS_BUCKET: ");
+            user.push_str(scan_ts_bucket);
+        }
+        if let Some(core_ts_bucket) = sanitized_prior_scan
+            .as_ref()
+            .and_then(|value| value.get("stage_2_core_ts_bucket"))
+            .and_then(Value::as_str)
+        {
+            user.push_str("\nSTAGE_2_CORE_TS_BUCKET: ");
+            user.push_str(core_ts_bucket);
+        }
+        if let Some(gap_minutes) = sanitized_prior_scan
+            .as_ref()
+            .and_then(|value| value.get("stage_1_to_stage_2_gap_minutes"))
+            .and_then(Value::as_f64)
+        {
+            user.push_str("\nSTAGE_1_TO_STAGE_2_GAP_MINUTES: ");
+            user.push_str(&format!("{gap_minutes:.2}"));
+        }
+        if let Some(gap_seconds) = sanitized_prior_scan
+            .as_ref()
+            .and_then(|value| value.get("stage_1_to_stage_2_gap_seconds"))
+            .and_then(Value::as_i64)
+        {
+            user.push_str("\nSTAGE_1_TO_STAGE_2_GAP_SECONDS: ");
+            user.push_str(&gap_seconds.to_string());
+        }
         let scan_json = serde_json::to_string(
             sanitized_prior_scan
                 .as_ref()
@@ -436,14 +475,36 @@ fn sanitize_scan_for_stage2(value: &Value) -> Value {
     sanitized
 }
 
-pub async fn invoke_models(
-    http_client: &Client,
-    loopback_http_client: &Client,
-    config: &RootConfig,
-    input: &ModelInvocationInput,
-) -> Vec<ModelCallOutput> {
+fn annotate_scan_for_stage2(value: &Value, context: FinalizeStageContext) -> Value {
+    let mut annotated = sanitize_scan_for_stage2(value);
+    let gap_seconds = context
+        .stage2_core_ts_bucket
+        .signed_duration_since(context.stage1_scan_ts_bucket)
+        .num_seconds();
+    let gap_minutes = (gap_seconds as f64) / 60.0;
+    if let Some(root) = annotated.as_object_mut() {
+        root.insert(
+            "stage_1_scan_ts_bucket".to_string(),
+            Value::String(context.stage1_scan_ts_bucket.to_rfc3339()),
+        );
+        root.insert(
+            "stage_2_core_ts_bucket".to_string(),
+            Value::String(context.stage2_core_ts_bucket.to_rfc3339()),
+        );
+        root.insert(
+            "stage_1_to_stage_2_gap_seconds".to_string(),
+            json!(gap_seconds),
+        );
+        root.insert(
+            "stage_1_to_stage_2_gap_minutes".to_string(),
+            json!(gap_minutes),
+        );
+    }
+    annotated
+}
+
+fn enabled_models_for_default(config: &RootConfig) -> Vec<LlmModelConfig> {
     let default_provider = config.active_default_model();
-    let prompt_template = config.llm.prompt_template.clone();
     let mut enabled = config.selected_enabled_models_for_default();
     if enabled.is_empty() && default_provider == "qwen" {
         enabled.push(LlmModelConfig {
@@ -505,23 +566,39 @@ pub async fn invoke_models(
             reasoning: None,
         });
     }
+    enabled
+}
+
+fn no_enabled_models_output(default_provider: &str) -> ModelCallOutput {
+    ModelCallOutput {
+        model_name: format!("{}_default", default_provider),
+        provider: default_provider.to_string(),
+        model: "-".to_string(),
+        latency_ms: 0,
+        batch_id: None,
+        batch_status: None,
+        provider_finish_reason: None,
+        provider_usage: None,
+        raw_response_text: None,
+        parsed_decision: None,
+        validation_warning: None,
+        entry_stage_trace: None,
+        entry_stage_prompt_inputs: None,
+        error: Some("no enabled model matches llm.default_model".to_string()),
+    }
+}
+
+pub async fn invoke_models_scan_stage(
+    http_client: &Client,
+    loopback_http_client: &Client,
+    config: &RootConfig,
+    input: &ModelInvocationInput,
+) -> Vec<ModelCallOutput> {
+    let default_provider = config.active_default_model();
+    let prompt_template = config.llm.prompt_template.clone();
+    let enabled = enabled_models_for_default(config);
     if enabled.is_empty() {
-        return vec![ModelCallOutput {
-            model_name: format!("{}_default", default_provider),
-            provider: default_provider,
-            model: "-".to_string(),
-            latency_ms: 0,
-            batch_id: None,
-            batch_status: None,
-            provider_finish_reason: None,
-            provider_usage: None,
-            raw_response_text: None,
-            parsed_decision: None,
-            validation_warning: None,
-            entry_stage_trace: None,
-            entry_stage_prompt_inputs: None,
-            error: Some("no enabled model matches llm.default_model".to_string()),
-        }];
+        return vec![no_enabled_models_output(&default_provider)];
     }
 
     let mut tasks = Vec::with_capacity(enabled.len());
@@ -537,7 +614,7 @@ pub async fn invoke_models(
         let input = input.clone();
         let prompt_template = prompt_template.clone();
         tasks.push(async move {
-            invoke_one_model(
+            invoke_one_model_scan_stage(
                 &http_client,
                 &loopback_http_client,
                 &claude_cfg,
@@ -556,7 +633,163 @@ pub async fn invoke_models(
     join_all(tasks).await
 }
 
-async fn invoke_one_model(
+pub async fn invoke_models_finalize_stage(
+    http_client: &Client,
+    loopback_http_client: &Client,
+    config: &RootConfig,
+    input: &ModelInvocationInput,
+    stage1_scan_outputs: &[ModelCallOutput],
+    context: FinalizeStageContext,
+) -> Vec<ModelCallOutput> {
+    let prompt_template = config.llm.prompt_template.clone();
+    let enabled = enabled_models_for_default(config);
+    let mut tasks = Vec::new();
+
+    for model in enabled {
+        let Some(stage1_output) = stage1_scan_outputs.iter().find(|output| {
+            output.model_name == model.name
+                && output.provider == model.provider
+                && output.model == model.model
+        }) else {
+            continue;
+        };
+        let Some(scan_value) = stage1_output.parsed_decision.as_ref() else {
+            continue;
+        };
+
+        let http_client = http_client.clone();
+        let loopback_http_client = loopback_http_client.clone();
+        let claude_cfg = config.api.claude.clone();
+        let qwen_cfg = config.api.qwen.clone();
+        let custom_llm_cfg = config.api.custom_llm.clone();
+        let gemini_cfg = config.api.gemini.clone();
+        let openrouter_cfg = config.api.openrouter.clone();
+        let grok_cfg = config.api.grok.clone();
+        let input = input.clone();
+        let prompt_template = prompt_template.clone();
+        let annotated_scan = annotate_scan_for_stage2(scan_value, context);
+        let prior_stage_trace = stage1_output.entry_stage_trace.clone().unwrap_or_default();
+        tasks.push(async move {
+            invoke_one_model_finalize_stage(
+                &http_client,
+                &loopback_http_client,
+                &claude_cfg,
+                &qwen_cfg,
+                &custom_llm_cfg,
+                &gemini_cfg,
+                &openrouter_cfg,
+                &grok_cfg,
+                model,
+                &input,
+                &prompt_template,
+                annotated_scan,
+                prior_stage_trace,
+            )
+            .await
+        });
+    }
+
+    join_all(tasks).await
+}
+
+async fn invoke_provider_stage(
+    http_client: &Client,
+    loopback_http_client: &Client,
+    claude_cfg: &ClaudeApiConfig,
+    qwen_cfg: &QwenApiConfig,
+    custom_llm_cfg: &CustomLlmApiConfig,
+    gemini_cfg: &GeminiApiConfig,
+    openrouter_cfg: &OpenRouterApiConfig,
+    grok_cfg: &GrokApiConfig,
+    model: &LlmModelConfig,
+    input: &ModelInvocationInput,
+    prompt_template: &str,
+    entry_stage: prompt::EntryPromptStage,
+    prior_scan: Option<&Value>,
+) -> Result<ProviderSuccess, ProviderFailure> {
+    match model.provider.to_ascii_lowercase().as_str() {
+        "claude" => {
+            invoke_claude_batch(
+                http_client,
+                claude_cfg,
+                model,
+                input,
+                prompt_template,
+                entry_stage,
+                prior_scan,
+            )
+            .await
+        }
+        "qwen" => {
+            invoke_qwen_stage(
+                http_client,
+                qwen_cfg,
+                model,
+                input,
+                prompt_template,
+                entry_stage,
+                prior_scan,
+            )
+            .await
+        }
+        "custom_llm" => {
+            invoke_custom_llm_stage(
+                http_client,
+                loopback_http_client,
+                custom_llm_cfg,
+                model,
+                input,
+                prompt_template,
+                entry_stage,
+                prior_scan,
+            )
+            .await
+        }
+        "gemini" => {
+            if model.should_use_openrouter() {
+                invoke_gemini_via_openrouter(
+                    http_client,
+                    openrouter_cfg,
+                    model,
+                    input,
+                    prompt_template,
+                    entry_stage,
+                    prior_scan,
+                )
+                .await
+            } else {
+                invoke_gemini_direct(
+                    http_client,
+                    gemini_cfg,
+                    model,
+                    input,
+                    prompt_template,
+                    entry_stage,
+                    prior_scan,
+                )
+                .await
+            }
+        }
+        "grok" => {
+            invoke_grok_stage(
+                http_client,
+                grok_cfg,
+                model,
+                input,
+                prompt_template,
+                entry_stage,
+                prior_scan,
+            )
+            .await
+        }
+        other => Err(ProviderFailure {
+            error: anyhow!("unsupported provider: {}", other),
+            trace: ProviderTrace::default(),
+        }),
+    }
+}
+
+async fn invoke_one_model_scan_stage(
     http_client: &Client,
     loopback_http_client: &Client,
     claude_cfg: &ClaudeApiConfig,
@@ -574,40 +807,157 @@ async fn invoke_one_model(
     let model_name = model.name.clone();
     let model_id = model.model.clone();
 
-    let output: Result<ProviderSuccess, ProviderFailure> = match provider
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "claude" => invoke_claude(http_client, claude_cfg, &model, input, prompt_template).await,
-        "qwen" => invoke_qwen(http_client, qwen_cfg, &model, input, prompt_template).await,
-        "custom_llm" => {
-            invoke_custom_llm(
-                http_client,
-                loopback_http_client,
-                custom_llm_cfg,
-                &model,
-                input,
-                prompt_template,
-            )
-            .await
+    let output = invoke_provider_stage(
+        http_client,
+        loopback_http_client,
+        claude_cfg,
+        qwen_cfg,
+        custom_llm_cfg,
+        gemini_cfg,
+        openrouter_cfg,
+        grok_cfg,
+        &model,
+        input,
+        prompt_template,
+        prompt::EntryPromptStage::Scan,
+        None,
+    )
+    .await;
+
+    match output {
+        Ok(success) => {
+            let ProviderSuccess {
+                raw_text,
+                mut trace,
+            } = success;
+            let scan_latency_ms = elapsed_ms_u64(started);
+            match parse_entry_scan_output(&provider, &raw_text) {
+                Ok(scan_value) => {
+                    trace.push_entry_stage_event(build_entry_scan_trace_event(
+                        &provider,
+                        &raw_text,
+                        Some(&scan_value),
+                        scan_latency_ms,
+                    ));
+                    let entry_stage_trace = trace.output_entry_stage_trace();
+                    let entry_stage_prompt_inputs = trace.output_entry_stage_prompt_inputs();
+                    ModelCallOutput {
+                        model_name,
+                        provider,
+                        model: model_id,
+                        latency_ms: started.elapsed().as_millis(),
+                        batch_id: trace.batch_id,
+                        batch_status: trace.batch_status,
+                        provider_finish_reason: trace.provider_finish_reason,
+                        provider_usage: trace.provider_usage,
+                        raw_response_text: Some(raw_text),
+                        parsed_decision: Some(scan_value),
+                        validation_warning: None,
+                        entry_stage_trace,
+                        entry_stage_prompt_inputs,
+                        error: None,
+                    }
+                }
+                Err(failure) => {
+                    trace.push_entry_stage_event(build_entry_scan_trace_event(
+                        &provider,
+                        &raw_text,
+                        None,
+                        scan_latency_ms,
+                    ));
+                    let entry_stage_trace = trace.output_entry_stage_trace();
+                    let entry_stage_prompt_inputs = trace.output_entry_stage_prompt_inputs();
+                    ModelCallOutput {
+                        model_name,
+                        provider,
+                        model: model_id,
+                        latency_ms: started.elapsed().as_millis(),
+                        batch_id: trace.batch_id,
+                        batch_status: trace.batch_status,
+                        provider_finish_reason: trace.provider_finish_reason,
+                        provider_usage: trace.provider_usage,
+                        raw_response_text: Some(raw_text),
+                        parsed_decision: None,
+                        validation_warning: None,
+                        entry_stage_trace,
+                        entry_stage_prompt_inputs,
+                        error: Some(format!(
+                            "{:#}",
+                            failure.error.context("market scan stage failed")
+                        )),
+                    }
+                }
+            }
         }
-        "gemini" => {
-            invoke_gemini(
-                http_client,
-                gemini_cfg,
-                openrouter_cfg,
-                &model,
-                input,
-                prompt_template,
-            )
-            .await
+        Err(failure) => {
+            let ProviderFailure { error, trace } = failure;
+            let entry_stage_trace = trace.output_entry_stage_trace();
+            let entry_stage_prompt_inputs = trace.output_entry_stage_prompt_inputs();
+            ModelCallOutput {
+                model_name,
+                provider,
+                model: model_id,
+                latency_ms: started.elapsed().as_millis(),
+                batch_id: trace.batch_id,
+                batch_status: trace.batch_status,
+                provider_finish_reason: trace.provider_finish_reason,
+                provider_usage: trace.provider_usage,
+                raw_response_text: None,
+                parsed_decision: None,
+                validation_warning: None,
+                entry_stage_trace,
+                entry_stage_prompt_inputs,
+                error: Some(format!("{:#}", error)),
+            }
         }
-        "grok" => invoke_grok(http_client, grok_cfg, &model, input, prompt_template).await,
-        other => Err(ProviderFailure {
-            error: anyhow!("unsupported provider: {}", other),
-            trace: ProviderTrace::default(),
-        }),
-    };
+    }
+}
+
+async fn invoke_one_model_finalize_stage(
+    http_client: &Client,
+    loopback_http_client: &Client,
+    claude_cfg: &ClaudeApiConfig,
+    qwen_cfg: &QwenApiConfig,
+    custom_llm_cfg: &CustomLlmApiConfig,
+    gemini_cfg: &GeminiApiConfig,
+    openrouter_cfg: &OpenRouterApiConfig,
+    grok_cfg: &GrokApiConfig,
+    model: LlmModelConfig,
+    input: &ModelInvocationInput,
+    prompt_template: &str,
+    annotated_scan: Value,
+    prior_stage_trace: Vec<Value>,
+) -> ModelCallOutput {
+    let started = Instant::now();
+    let provider = model.provider.clone();
+    let model_name = model.name.clone();
+    let model_id = model.model.clone();
+
+    let output = invoke_provider_stage(
+        http_client,
+        loopback_http_client,
+        claude_cfg,
+        qwen_cfg,
+        custom_llm_cfg,
+        gemini_cfg,
+        openrouter_cfg,
+        grok_cfg,
+        &model,
+        input,
+        prompt_template,
+        prompt::EntryPromptStage::Finalize,
+        Some(&annotated_scan),
+    )
+    .await;
+
+    let finalize_latency_ms = elapsed_ms_u64(started);
+    let finalize_event =
+        build_entry_finalize_trace_event(input, &annotated_scan, Some(finalize_latency_ms));
+    let prior_stage_latency_ms = prior_stage_trace
+        .iter()
+        .filter_map(|event| event.get("latency_ms").and_then(Value::as_u64))
+        .fold(0u128, |acc, latency| acc.saturating_add(latency as u128));
+    let total_latency_ms = prior_stage_latency_ms.saturating_add(started.elapsed().as_millis());
 
     match output {
         Ok(success) => {
@@ -636,13 +986,16 @@ async fn invoke_one_model(
                         None
                     }
                 });
+            let trace = trace
+                .prepend_entry_stage_events(&[finalize_event])
+                .prepend_entry_stage_events(&prior_stage_trace);
             let entry_stage_trace = trace.output_entry_stage_trace();
             let entry_stage_prompt_inputs = trace.output_entry_stage_prompt_inputs();
             ModelCallOutput {
                 model_name,
                 provider,
                 model: model_id,
-                latency_ms: started.elapsed().as_millis(),
+                latency_ms: total_latency_ms,
                 batch_id: trace.batch_id,
                 batch_status: trace.batch_status,
                 provider_finish_reason: trace.provider_finish_reason,
@@ -657,13 +1010,16 @@ async fn invoke_one_model(
         }
         Err(failure) => {
             let ProviderFailure { error, trace } = failure;
+            let trace = trace
+                .prepend_entry_stage_events(&[finalize_event])
+                .prepend_entry_stage_events(&prior_stage_trace);
             let entry_stage_trace = trace.output_entry_stage_trace();
             let entry_stage_prompt_inputs = trace.output_entry_stage_prompt_inputs();
             ModelCallOutput {
                 model_name,
                 provider,
                 model: model_id,
-                latency_ms: started.elapsed().as_millis(),
+                latency_ms: total_latency_ms,
                 batch_id: trace.batch_id,
                 batch_status: trace.batch_status,
                 provider_finish_reason: trace.provider_finish_reason,
@@ -677,94 +1033,6 @@ async fn invoke_one_model(
             }
         }
     }
-}
-
-async fn invoke_qwen(
-    http_client: &Client,
-    qwen_cfg: &QwenApiConfig,
-    model: &LlmModelConfig,
-    input: &ModelInvocationInput,
-    prompt_template: &str,
-) -> Result<ProviderSuccess, ProviderFailure> {
-    invoke_qwen_two_stage(http_client, qwen_cfg, model, input, prompt_template).await
-}
-
-async fn invoke_qwen_two_stage(
-    http_client: &Client,
-    qwen_cfg: &QwenApiConfig,
-    model: &LlmModelConfig,
-    input: &ModelInvocationInput,
-    prompt_template: &str,
-) -> Result<ProviderSuccess, ProviderFailure> {
-    let scan_started = Instant::now();
-    let scan = invoke_qwen_stage(
-        http_client,
-        qwen_cfg,
-        model,
-        input,
-        prompt_template,
-        prompt::EntryPromptStage::Scan,
-        None,
-    )
-    .await?;
-    let scan_latency_ms = elapsed_ms_u64(scan_started);
-    let scan_value = parse_entry_scan_output("qwen", &scan.raw_text).map_err(|failure| {
-        let mut trace = scan.trace.clone();
-        trace.push_entry_stage_event(build_entry_scan_trace_event(
-            "qwen",
-            &scan.raw_text,
-            None,
-            scan_latency_ms,
-        ));
-        ProviderFailure {
-            error: failure.error.context("market scan stage failed"),
-            trace,
-        }
-    })?;
-    let scan_event =
-        build_entry_scan_trace_event("qwen", &scan.raw_text, Some(&scan_value), scan_latency_ms);
-    let scan_prompt_inputs = scan
-        .trace
-        .output_entry_stage_prompt_inputs()
-        .unwrap_or_default();
-    let finalize_started = Instant::now();
-    let finalize = invoke_qwen_stage(
-        http_client,
-        qwen_cfg,
-        model,
-        input,
-        prompt_template,
-        prompt::EntryPromptStage::Finalize,
-        Some(&scan_value),
-    )
-    .await
-    .map_err(|failure| ProviderFailure {
-        error: failure.error,
-        trace: failure
-            .trace
-            .prepend_entry_stage_events(&[
-                scan_event.clone(),
-                build_entry_finalize_trace_event(
-                    input,
-                    &scan_value,
-                    Some(elapsed_ms_u64(finalize_started)),
-                ),
-            ])
-            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
-    })?;
-    let finalize_event = build_entry_finalize_trace_event(
-        input,
-        &scan_value,
-        Some(elapsed_ms_u64(finalize_started)),
-    );
-
-    Ok(ProviderSuccess {
-        raw_text: finalize.raw_text,
-        trace: finalize
-            .trace
-            .prepend_entry_stage_events(&[scan_event, finalize_event])
-            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
-    })
 }
 
 async fn invoke_qwen_stage(
@@ -883,110 +1151,6 @@ async fn invoke_qwen_stage(
     })
 }
 
-async fn invoke_custom_llm(
-    http_client: &Client,
-    loopback_http_client: &Client,
-    custom_llm_cfg: &CustomLlmApiConfig,
-    model: &LlmModelConfig,
-    input: &ModelInvocationInput,
-    prompt_template: &str,
-) -> Result<ProviderSuccess, ProviderFailure> {
-    invoke_custom_llm_two_stage(
-        http_client,
-        loopback_http_client,
-        custom_llm_cfg,
-        model,
-        input,
-        prompt_template,
-    )
-    .await
-}
-
-async fn invoke_custom_llm_two_stage(
-    http_client: &Client,
-    loopback_http_client: &Client,
-    custom_llm_cfg: &CustomLlmApiConfig,
-    model: &LlmModelConfig,
-    input: &ModelInvocationInput,
-    prompt_template: &str,
-) -> Result<ProviderSuccess, ProviderFailure> {
-    let scan_started = Instant::now();
-    let scan = invoke_custom_llm_stage(
-        http_client,
-        loopback_http_client,
-        custom_llm_cfg,
-        model,
-        input,
-        prompt_template,
-        prompt::EntryPromptStage::Scan,
-        None,
-    )
-    .await?;
-    let scan_latency_ms = elapsed_ms_u64(scan_started);
-    let scan_value = parse_entry_scan_output("custom_llm", &scan.raw_text).map_err(|failure| {
-        let mut trace = scan.trace.clone();
-        trace.push_entry_stage_event(build_entry_scan_trace_event(
-            "custom_llm",
-            &scan.raw_text,
-            None,
-            scan_latency_ms,
-        ));
-        ProviderFailure {
-            error: failure.error.context("market scan stage failed"),
-            trace,
-        }
-    })?;
-    let scan_event = build_entry_scan_trace_event(
-        "custom_llm",
-        &scan.raw_text,
-        Some(&scan_value),
-        scan_latency_ms,
-    );
-    let scan_prompt_inputs = scan
-        .trace
-        .output_entry_stage_prompt_inputs()
-        .unwrap_or_default();
-    let finalize_started = Instant::now();
-    let finalize = invoke_custom_llm_stage(
-        http_client,
-        loopback_http_client,
-        custom_llm_cfg,
-        model,
-        input,
-        prompt_template,
-        prompt::EntryPromptStage::Finalize,
-        Some(&scan_value),
-    )
-    .await
-    .map_err(|failure| ProviderFailure {
-        error: failure.error,
-        trace: failure
-            .trace
-            .prepend_entry_stage_events(&[
-                scan_event.clone(),
-                build_entry_finalize_trace_event(
-                    input,
-                    &scan_value,
-                    Some(elapsed_ms_u64(finalize_started)),
-                ),
-            ])
-            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
-    })?;
-    let finalize_event = build_entry_finalize_trace_event(
-        input,
-        &scan_value,
-        Some(elapsed_ms_u64(finalize_started)),
-    );
-
-    Ok(ProviderSuccess {
-        raw_text: finalize.raw_text,
-        trace: finalize
-            .trace
-            .prepend_entry_stage_events(&[scan_event, finalize_event])
-            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
-    })
-}
-
 async fn invoke_custom_llm_stage(
     http_client: &Client,
     loopback_http_client: &Client,
@@ -1039,60 +1203,98 @@ async fn invoke_custom_llm_stage(
     } else {
         http_client
     };
-    let mut request = client
-        .post(&url)
-        .bearer_auth(custom_llm_cfg.resolved_api_key())
-        .json(&req);
-    if is_loopback_chat_completions_url(&url) {
-        request = request.header("Connection", "close");
-    }
-    let response = request
-        .send()
-        .await
-        .context("call custom_llm chat completions api")
-        .map_err(|error| ProviderFailure {
-            error,
-            trace: trace.clone(),
-        })?;
+    let is_loopback = is_loopback_chat_completions_url(&url);
 
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(ProviderFailure {
-            error: anyhow!(
-                "custom_llm chat completions failed status={} body={}",
+    let max_attempts = 2u32;
+    let mut last_err: Option<ProviderFailure> = None;
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            tracing::warn!("custom_llm retry attempt {} after server error", attempt);
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        let mut request = client
+            .post(&url)
+            .bearer_auth(custom_llm_cfg.resolved_api_key())
+            .json(&req);
+        if is_loopback {
+            request = request.header("Connection", "close");
+        }
+        let response = match request.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(ProviderFailure {
+                    error: anyhow::Error::from(e).context("call custom_llm chat completions api"),
+                    trace: trace.clone(),
+                });
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if status.is_server_error() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                "custom_llm chat completions server error status={} body={}",
                 status,
                 body
-            ),
+            );
+            last_err = Some(ProviderFailure {
+                error: anyhow!(
+                    "custom_llm chat completions failed status={} body={}",
+                    status,
+                    body
+                ),
+                trace: trace.clone(),
+            });
+            continue;
+        }
+
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderFailure {
+                error: anyhow!(
+                    "custom_llm chat completions failed status={} body={}",
+                    status,
+                    body
+                ),
+                trace,
+            });
+        }
+
+        let body: QwenChatCompletionsResponse = response
+            .json()
+            .await
+            .context("decode custom_llm chat completions response body")
+            .map_err(|error| ProviderFailure {
+                error,
+                trace: trace.clone(),
+            })?;
+
+        let text = body
+            .choices
+            .first()
+            .map(|c| c.message.content.trim().to_string())
+            .unwrap_or_default();
+        if text.is_empty() {
+            return Err(ProviderFailure {
+                error: anyhow!("custom_llm chat completions response text is empty"),
+                trace,
+            });
+        }
+
+        return Ok(ProviderSuccess {
+            raw_text: text,
             trace,
         });
     }
 
-    let body: QwenChatCompletionsResponse = response
-        .json()
-        .await
-        .context("decode custom_llm chat completions response body")
-        .map_err(|error| ProviderFailure {
-            error,
-            trace: trace.clone(),
-        })?;
-
-    let text = body
-        .choices
-        .first()
-        .map(|c| c.message.content.trim().to_string())
-        .unwrap_or_default();
-    if text.is_empty() {
-        return Err(ProviderFailure {
-            error: anyhow!("custom_llm chat completions response text is empty"),
-            trace,
-        });
-    }
-
-    Ok(ProviderSuccess {
-        raw_text: text,
+    Err(last_err.unwrap_or_else(|| ProviderFailure {
+        error: anyhow!(
+            "custom_llm chat completions failed after {} attempts",
+            max_attempts
+        ),
         trace,
-    })
+    }))
 }
 
 fn is_loopback_chat_completions_url(url: &str) -> bool {
@@ -1558,130 +1760,6 @@ fn custom_llm_pending_order_response_schema() -> Value {
     })
 }
 
-async fn invoke_gemini(
-    http_client: &Client,
-    gemini_cfg: &GeminiApiConfig,
-    openrouter_cfg: &OpenRouterApiConfig,
-    model: &LlmModelConfig,
-    input: &ModelInvocationInput,
-    prompt_template: &str,
-) -> Result<ProviderSuccess, ProviderFailure> {
-    invoke_gemini_two_stage(
-        http_client,
-        gemini_cfg,
-        openrouter_cfg,
-        model,
-        input,
-        prompt_template,
-    )
-    .await
-}
-
-async fn invoke_gemini_two_stage(
-    http_client: &Client,
-    gemini_cfg: &GeminiApiConfig,
-    openrouter_cfg: &OpenRouterApiConfig,
-    model: &LlmModelConfig,
-    input: &ModelInvocationInput,
-    prompt_template: &str,
-) -> Result<ProviderSuccess, ProviderFailure> {
-    let scan_started = Instant::now();
-    let scan = if model.should_use_openrouter() {
-        invoke_gemini_via_openrouter(
-            http_client,
-            openrouter_cfg,
-            model,
-            input,
-            prompt_template,
-            prompt::EntryPromptStage::Scan,
-            None,
-        )
-        .await?
-    } else {
-        invoke_gemini_direct(
-            http_client,
-            gemini_cfg,
-            model,
-            input,
-            prompt_template,
-            prompt::EntryPromptStage::Scan,
-            None,
-        )
-        .await?
-    };
-    let scan_latency_ms = elapsed_ms_u64(scan_started);
-    let scan_value = parse_entry_scan_output("gemini", &scan.raw_text).map_err(|failure| {
-        let mut trace = scan.trace.clone();
-        trace.push_entry_stage_event(build_entry_scan_trace_event(
-            "gemini",
-            &scan.raw_text,
-            None,
-            scan_latency_ms,
-        ));
-        ProviderFailure {
-            error: failure.error.context("market scan stage failed"),
-            trace,
-        }
-    })?;
-    let scan_event =
-        build_entry_scan_trace_event("gemini", &scan.raw_text, Some(&scan_value), scan_latency_ms);
-    let scan_prompt_inputs = scan
-        .trace
-        .output_entry_stage_prompt_inputs()
-        .unwrap_or_default();
-    let finalize_started = Instant::now();
-    let finalize = if model.should_use_openrouter() {
-        invoke_gemini_via_openrouter(
-            http_client,
-            openrouter_cfg,
-            model,
-            input,
-            prompt_template,
-            prompt::EntryPromptStage::Finalize,
-            Some(&scan_value),
-        )
-        .await
-    } else {
-        invoke_gemini_direct(
-            http_client,
-            gemini_cfg,
-            model,
-            input,
-            prompt_template,
-            prompt::EntryPromptStage::Finalize,
-            Some(&scan_value),
-        )
-        .await
-    }
-    .map_err(|failure| ProviderFailure {
-        error: failure.error,
-        trace: failure
-            .trace
-            .prepend_entry_stage_events(&[
-                scan_event.clone(),
-                build_entry_finalize_trace_event(
-                    input,
-                    &scan_value,
-                    Some(elapsed_ms_u64(finalize_started)),
-                ),
-            ])
-            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
-    })?;
-    let finalize_event = build_entry_finalize_trace_event(
-        input,
-        &scan_value,
-        Some(elapsed_ms_u64(finalize_started)),
-    );
-
-    Ok(ProviderSuccess {
-        raw_text: finalize.raw_text,
-        trace: finalize
-            .trace
-            .prepend_entry_stage_events(&[scan_event, finalize_event])
-            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
-    })
-}
-
 async fn invoke_gemini_direct(
     http_client: &Client,
     gemini_cfg: &GeminiApiConfig,
@@ -1907,94 +1985,6 @@ async fn invoke_gemini_via_openrouter(
     Ok(ProviderSuccess {
         raw_text: text,
         trace,
-    })
-}
-
-async fn invoke_grok(
-    http_client: &Client,
-    grok_cfg: &GrokApiConfig,
-    model: &LlmModelConfig,
-    input: &ModelInvocationInput,
-    prompt_template: &str,
-) -> Result<ProviderSuccess, ProviderFailure> {
-    invoke_grok_two_stage(http_client, grok_cfg, model, input, prompt_template).await
-}
-
-async fn invoke_grok_two_stage(
-    http_client: &Client,
-    grok_cfg: &GrokApiConfig,
-    model: &LlmModelConfig,
-    input: &ModelInvocationInput,
-    prompt_template: &str,
-) -> Result<ProviderSuccess, ProviderFailure> {
-    let scan_started = Instant::now();
-    let scan = invoke_grok_stage(
-        http_client,
-        grok_cfg,
-        model,
-        input,
-        prompt_template,
-        prompt::EntryPromptStage::Scan,
-        None,
-    )
-    .await?;
-    let scan_latency_ms = elapsed_ms_u64(scan_started);
-    let scan_value = parse_entry_scan_output("grok", &scan.raw_text).map_err(|failure| {
-        let mut trace = scan.trace.clone();
-        trace.push_entry_stage_event(build_entry_scan_trace_event(
-            "grok",
-            &scan.raw_text,
-            None,
-            scan_latency_ms,
-        ));
-        ProviderFailure {
-            error: failure.error.context("market scan stage failed"),
-            trace,
-        }
-    })?;
-    let scan_event =
-        build_entry_scan_trace_event("grok", &scan.raw_text, Some(&scan_value), scan_latency_ms);
-    let scan_prompt_inputs = scan
-        .trace
-        .output_entry_stage_prompt_inputs()
-        .unwrap_or_default();
-    let finalize_started = Instant::now();
-    let finalize = invoke_grok_stage(
-        http_client,
-        grok_cfg,
-        model,
-        input,
-        prompt_template,
-        prompt::EntryPromptStage::Finalize,
-        Some(&scan_value),
-    )
-    .await
-    .map_err(|failure| ProviderFailure {
-        error: failure.error,
-        trace: failure
-            .trace
-            .prepend_entry_stage_events(&[
-                scan_event.clone(),
-                build_entry_finalize_trace_event(
-                    input,
-                    &scan_value,
-                    Some(elapsed_ms_u64(finalize_started)),
-                ),
-            ])
-            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
-    })?;
-    let finalize_event = build_entry_finalize_trace_event(
-        input,
-        &scan_value,
-        Some(elapsed_ms_u64(finalize_started)),
-    );
-
-    Ok(ProviderSuccess {
-        raw_text: finalize.raw_text,
-        trace: finalize
-            .trace
-            .prepend_entry_stage_events(&[scan_event, finalize_event])
-            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
     })
 }
 
@@ -2736,94 +2726,6 @@ fn gemini_pending_order_response_schema() -> Value {
     })
 }
 
-async fn invoke_claude(
-    http_client: &Client,
-    claude_cfg: &ClaudeApiConfig,
-    model: &LlmModelConfig,
-    input: &ModelInvocationInput,
-    prompt_template: &str,
-) -> Result<ProviderSuccess, ProviderFailure> {
-    invoke_claude_two_stage(http_client, claude_cfg, model, input, prompt_template).await
-}
-
-async fn invoke_claude_two_stage(
-    http_client: &Client,
-    claude_cfg: &ClaudeApiConfig,
-    model: &LlmModelConfig,
-    input: &ModelInvocationInput,
-    prompt_template: &str,
-) -> Result<ProviderSuccess, ProviderFailure> {
-    let scan_started = Instant::now();
-    let scan = invoke_claude_batch(
-        http_client,
-        claude_cfg,
-        model,
-        input,
-        prompt_template,
-        prompt::EntryPromptStage::Scan,
-        None,
-    )
-    .await?;
-    let scan_latency_ms = elapsed_ms_u64(scan_started);
-    let scan_value = parse_entry_scan_output("claude", &scan.raw_text).map_err(|failure| {
-        let mut trace = scan.trace.clone();
-        trace.push_entry_stage_event(build_entry_scan_trace_event(
-            "claude",
-            &scan.raw_text,
-            None,
-            scan_latency_ms,
-        ));
-        ProviderFailure {
-            error: failure.error.context("market scan stage failed"),
-            trace,
-        }
-    })?;
-    let scan_event =
-        build_entry_scan_trace_event("claude", &scan.raw_text, Some(&scan_value), scan_latency_ms);
-    let scan_prompt_inputs = scan
-        .trace
-        .output_entry_stage_prompt_inputs()
-        .unwrap_or_default();
-    let finalize_started = Instant::now();
-    let finalize = invoke_claude_batch(
-        http_client,
-        claude_cfg,
-        model,
-        input,
-        prompt_template,
-        prompt::EntryPromptStage::Finalize,
-        Some(&scan_value),
-    )
-    .await
-    .map_err(|failure| ProviderFailure {
-        error: failure.error,
-        trace: failure
-            .trace
-            .prepend_entry_stage_events(&[
-                scan_event.clone(),
-                build_entry_finalize_trace_event(
-                    input,
-                    &scan_value,
-                    Some(elapsed_ms_u64(finalize_started)),
-                ),
-            ])
-            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
-    })?;
-    let finalize_event = build_entry_finalize_trace_event(
-        input,
-        &scan_value,
-        Some(elapsed_ms_u64(finalize_started)),
-    );
-
-    Ok(ProviderSuccess {
-        raw_text: finalize.raw_text,
-        trace: finalize
-            .trace
-            .prepend_entry_stage_events(&[scan_event, finalize_event])
-            .prepend_entry_stage_prompt_inputs(&scan_prompt_inputs),
-    })
-}
-
 async fn invoke_claude_batch(
     http_client: &Client,
     claude_cfg: &ClaudeApiConfig,
@@ -3474,7 +3376,7 @@ mod tests {
         ManagementSnapshotForLlm, ModelInvocationInput, PendingOrderSummaryForLlm,
         PositionContextForLlm, PositionSummaryForLlm,
     };
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use serde_json::{json, Value};
 
     fn sample_scan_tf(
@@ -4122,11 +4024,21 @@ mod tests {
             trading_state: None,
             management_snapshot: None,
         };
-        let scan = json!({
-            "15m": sample_scan_tf("Bullish", "mixed", 2030.0, 2060.0, &["positive cvd", "range support held"], &["funding stretched"], "Push through 2060 extends 15m trend", "Loss of 2030 weakens trigger structure"),
-            "4h": sample_scan_tf("Bullish", "strong", 2020.0, 2080.0, &["4h trend up", "support defended"], &[], "Acceptance above 2080 opens continuation", "Failure below 2020 damages setup"),
-            "1d": sample_scan_tf("Sideways", "mixed", 2000.0, 2100.0, &["daily auction balanced"], &["macro trend unresolved"], "Breakout above 2100 improves daily backdrop", "Loss of 2000 reopens downside risk"),
-        });
+        let scan = super::annotate_scan_for_stage2(
+            &json!({
+                "15m": sample_scan_tf("Bullish", "mixed", 2030.0, 2060.0, &["positive cvd", "range support held"], &["funding stretched"], "Push through 2060 extends 15m trend", "Loss of 2030 weakens trigger structure"),
+                "4h": sample_scan_tf("Bullish", "strong", 2020.0, 2080.0, &["4h trend up", "support defended"], &[], "Acceptance above 2080 opens continuation", "Failure below 2020 damages setup"),
+                "1d": sample_scan_tf("Sideways", "mixed", 2000.0, 2100.0, &["daily auction balanced"], &["macro trend unresolved"], "Breakout above 2100 improves daily backdrop", "Loss of 2000 reopens downside risk"),
+            }),
+            super::FinalizeStageContext {
+                stage1_scan_ts_bucket: DateTime::parse_from_rfc3339("2026-03-18T07:00:00Z")
+                    .expect("parse stage1 ts")
+                    .with_timezone(&Utc),
+                stage2_core_ts_bucket: DateTime::parse_from_rfc3339("2026-03-18T07:05:00Z")
+                    .expect("parse stage2 ts")
+                    .with_timezone(&Utc),
+            },
+        );
 
         let event = super::build_entry_finalize_trace_event(&input, &scan, Some(123));
         assert_eq!(
@@ -4145,6 +4057,14 @@ mod tests {
         assert_eq!(
             event.get("stage_mode").and_then(Value::as_str),
             Some("entry")
+        );
+        assert_eq!(
+            event.get("stage_1_scan_ts_bucket").and_then(Value::as_str),
+            Some("2026-03-18T07:00:00+00:00")
+        );
+        assert_eq!(
+            event.get("stage_2_core_ts_bucket").and_then(Value::as_str),
+            Some("2026-03-18T07:05:00+00:00")
         );
     }
 
@@ -4537,43 +4457,21 @@ mod tests {
         let serialized = serialize_llm_input_minified(&input).expect("serialize optimized");
         let value: Value = serde_json::from_str(&serialized).expect("parse optimized");
 
-        assert_eq!(value.as_object().map(|obj| obj.len()), Some(7));
+        assert_eq!(value.as_object().map(|obj| obj.len()), Some(9));
         assert_eq!(
-            value
-                .pointer("/by_timeframe/15m/flow/funding/current_rate")
-                .cloned(),
-            Some(Value::Null)
+            value.get("version").and_then(Value::as_str),
+            Some("scan_v6")
         );
-        assert_eq!(
-            value
-                .pointer("/by_timeframe/15m/flow/funding/trend_sign")
-                .and_then(Value::as_i64),
-            Some(-1)
-        );
+        assert!(value.pointer("/now").is_some());
         assert!(value
-            .pointer("/timeframe_evidence/15m/ranges/local_structure_range/support")
+            .pointer("/path_newest_to_oldest/latest_15m_detail")
             .is_some());
-        assert!(value.pointer("/indicators/kline_history").is_none());
-        assert!(value.pointer("/by_timeframe/15m/flow/absorption").is_some());
-        assert!(value.pointer("/indicators/absorption").is_none());
-        assert_eq!(
-            value.pointer("/indicators/avwap/payload/fut_mark_price"),
-            Some(&json!(2001.57))
-        );
-        assert_eq!(
-            value
-                .pointer("/indicators/avwap/payload/series_by_window/15m/0/ts")
-                .and_then(|v| v.as_str()),
-            Some("2026-03-11T06:15:00Z")
-        );
-        assert_eq!(
-            value.pointer("/indicators/orderbook_depth/payload/by_window/15m/obi_fut"),
-            Some(&json!(0.027879672288433154_f64))
-        );
-        assert_eq!(
-            value.pointer("/indicators/orderbook_depth/payload/by_window/15m/spread_twa_fut"),
-            Some(&json!(0.003691128132476528_f64))
-        );
+        assert!(value.pointer("/events_newest_to_oldest").is_some());
+        assert!(value.pointer("/supporting_context").is_some());
+        assert!(value.pointer("/raw_overflow").is_some());
+        assert!(value.pointer("/indicators").is_none());
+        assert!(value.pointer("/by_timeframe").is_none());
+        assert!(value.pointer("/timeframe_evidence").is_none());
     }
 
     #[test]
@@ -4629,12 +4527,15 @@ mod tests {
         .expect("serialize management scan input");
         let value: Value = serde_json::from_str(&serialized).expect("parse management scan input");
 
-        assert_eq!(value.as_object().map(|obj| obj.len()), Some(7));
+        assert_eq!(value.as_object().map(|obj| obj.len()), Some(9));
         assert!(value.pointer("/management_snapshot").is_none());
+        assert!(value.pointer("/now").is_some());
         assert!(value
-            .pointer("/timeframe_evidence/15m/ranges/local_structure_range/support")
+            .pointer("/path_newest_to_oldest/latest_15m_detail")
             .is_some());
+        assert!(value.pointer("/events_newest_to_oldest").is_some());
         assert!(value.pointer("/indicators/kline_history").is_none());
+        assert!(value.pointer("/timeframe_evidence").is_none());
     }
 
     #[test]
@@ -4681,12 +4582,15 @@ mod tests {
         let value: Value =
             serde_json::from_str(&serialized).expect("parse pending-order scan input");
 
-        assert_eq!(value.as_object().map(|obj| obj.len()), Some(7));
+        assert_eq!(value.as_object().map(|obj| obj.len()), Some(9));
         assert!(value.pointer("/management_snapshot").is_none());
+        assert!(value.pointer("/now").is_some());
         assert!(value
-            .pointer("/timeframe_evidence/15m/ranges/local_structure_range/support")
+            .pointer("/path_newest_to_oldest/latest_15m_detail")
             .is_some());
+        assert!(value.pointer("/events_newest_to_oldest").is_some());
         assert!(value.pointer("/indicators/kline_history").is_none());
+        assert!(value.pointer("/timeframe_evidence").is_none());
     }
 
     #[test]
@@ -4737,6 +4641,60 @@ mod tests {
             .as_ref()
             .and_then(|value| value.pointer("/15m/story"))
             .is_none());
+    }
+
+    #[test]
+    fn finalize_prompt_includes_stage_timestamps_when_scan_is_annotated() {
+        let input = prompt_route_test_input(false, false);
+        let stage1_scan_ts_bucket = DateTime::parse_from_rfc3339("2026-03-18T07:00:00Z")
+            .expect("parse stage1 ts")
+            .with_timezone(&Utc);
+        let stage2_core_ts_bucket = DateTime::parse_from_rfc3339("2026-03-18T07:05:00Z")
+            .expect("parse stage2 ts")
+            .with_timezone(&Utc);
+        let scan = super::annotate_scan_for_stage2(
+            &sample_stage_1_scan(),
+            super::FinalizeStageContext {
+                stage1_scan_ts_bucket,
+                stage2_core_ts_bucket,
+            },
+        );
+
+        let prompt = super::build_prompt_pair(
+            &input,
+            "medium_large_opportunity",
+            super::prompt::EntryPromptStage::Finalize,
+            Some(&scan),
+        )
+        .expect("build entry prompt");
+        let capture = prompt
+            .prompt_input_capture
+            .expect("capture finalize prompt input");
+
+        assert!(prompt
+            .user
+            .contains("STAGE_1_SCAN_TS_BUCKET: 2026-03-18T07:00:00+00:00"));
+        assert!(prompt
+            .user
+            .contains("STAGE_2_CORE_TS_BUCKET: 2026-03-18T07:05:00+00:00"));
+        assert!(prompt.user.contains("STAGE_1_TO_STAGE_2_GAP_MINUTES: 5.00"));
+        assert!(prompt.user.contains("STAGE_1_MARKET_SCAN_JSON:"));
+        assert_eq!(
+            capture
+                .stage_1_setup_scan_json
+                .as_ref()
+                .and_then(|value| value.get("stage_1_scan_ts_bucket"))
+                .and_then(Value::as_str),
+            Some("2026-03-18T07:00:00+00:00")
+        );
+        assert_eq!(
+            capture
+                .stage_1_setup_scan_json
+                .as_ref()
+                .and_then(|value| value.get("stage_2_core_ts_bucket"))
+                .and_then(Value::as_str),
+            Some("2026-03-18T07:05:00+00:00")
+        );
     }
 
     #[test]
