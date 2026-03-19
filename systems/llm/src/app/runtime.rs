@@ -355,7 +355,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                                 if let Err(err) = persist_bundle_to_disk(
                                     &bundle,
                                     &delivery.data,
-                                    ctx.config.llm.temp_cache_retention_minutes,
+                                    ctx.config.llm.temp_cache_retention_minutes(),
                                 )
                                 .await
                                 {
@@ -1338,13 +1338,21 @@ fn context_state_from_trading_state(
         .unwrap_or("NO_ACTIVE_CONTEXT")
 }
 
+fn pending_order_mode_from_trading_state(
+    trading_state: Option<&crate::execution::binance::TradingStateSnapshot>,
+) -> bool {
+    trading_state.is_some_and(|state| {
+        !state.has_active_positions && primary_pending_entry_order(state).is_some()
+    })
+}
+
 async fn resolve_invocation_routing_context(
     config: &RootConfig,
     http_client: &Client,
     bundle: &LatestBundle,
     runtime_lifecycle_state: &Arc<Mutex<RuntimeLifecycleStore>>,
 ) -> Result<InvocationRoutingContext> {
-    let trading_state = if config.llm.execution.enabled {
+    let mut trading_state = if config.llm.execution.enabled {
         Some(
             fetch_symbol_trading_state(
                 http_client,
@@ -1357,6 +1365,27 @@ async fn resolve_invocation_routing_context(
     } else {
         None
     };
+    if let Some(state) = trading_state.as_ref() {
+        if state.has_open_orders
+            && crate::execution::binance::cleanup_orphan_exit_orders_for_symbol(
+                http_client,
+                &config.api.binance,
+                &config.llm.execution,
+                &bundle.raw.symbol,
+            )
+            .await?
+        {
+            trading_state = Some(
+                fetch_symbol_trading_state(
+                    http_client,
+                    &config.api.binance,
+                    &config.llm.execution,
+                    &bundle.raw.symbol,
+                )
+                .await?,
+            );
+        }
+    }
 
     let management_mode = trading_state
         .as_ref()
@@ -1370,7 +1399,7 @@ async fn resolve_invocation_routing_context(
         .as_ref()
         .map(|state| state.open_orders.len())
         .unwrap_or(0);
-    let pending_order_mode = active_position_count == 0 && open_order_count > 0;
+    let pending_order_mode = pending_order_mode_from_trading_state(trading_state.as_ref());
     let context_state = context_state_from_trading_state(trading_state.as_ref());
     let global_management_reason = {
         let guard = runtime_lifecycle_state.lock().await;
@@ -3045,7 +3074,7 @@ async fn invoke_bundle_models(
     let stage1_scan_input_path = match persist_scan_input_to_disk(
         &stage1_bundle.raw,
         &stage1_input,
-        config.llm.temp_cache_retention_minutes,
+        config.llm.temp_cache_retention_minutes(),
     )
     .await
     {
@@ -3182,7 +3211,7 @@ async fn invoke_bundle_models(
                 &out.provider,
                 &out.model,
                 captures,
-                config.llm.temp_cache_retention_minutes,
+                config.llm.temp_cache_retention_minutes(),
             )
             .await
             {
@@ -3427,7 +3456,7 @@ async fn invoke_bundle_models(
         stage2_prepared.routing_context.management_mode,
         stage2_prepared.routing_context.pending_order_mode,
         &stage2_prepared.input,
-        config.llm.temp_cache_retention_minutes,
+        config.llm.temp_cache_retention_minutes(),
     )
     .await
     {
@@ -3577,7 +3606,7 @@ async fn invoke_bundle_models(
                 &out.provider,
                 &out.model,
                 captures,
-                config.llm.temp_cache_retention_minutes,
+                config.llm.temp_cache_retention_minutes(),
             )
             .await
             {
@@ -6329,6 +6358,7 @@ mod tests {
                 stop_price: 0.0,
                 close_position: false,
                 reduce_only: false,
+                is_algo_order: false,
             }],
             total_wallet_balance: 1000.0,
             available_balance: 900.0,
@@ -6816,6 +6846,7 @@ mod tests {
                     stop_price: 2050.0,
                     close_position: true,
                     reduce_only: true,
+                    is_algo_order: false,
                 },
                 OpenOrderSnapshot {
                     order_id: 2,
@@ -6829,6 +6860,7 @@ mod tests {
                     stop_price: 2125.0,
                     close_position: true,
                     reduce_only: true,
+                    is_algo_order: false,
                 },
             ],
             total_wallet_balance: 1000.0,
@@ -6871,6 +6903,7 @@ mod tests {
                     stop_price: 2235.63,
                     close_position: false,
                     reduce_only: true,
+                    is_algo_order: false,
                 },
                 OpenOrderSnapshot {
                     order_id: 2,
@@ -6884,6 +6917,7 @@ mod tests {
                     stop_price: 2287.22,
                     close_position: false,
                     reduce_only: true,
+                    is_algo_order: false,
                 },
             ],
             total_wallet_balance: 1000.0,
@@ -6929,6 +6963,7 @@ mod tests {
                     stop_price: 0.0,
                     close_position: false,
                     reduce_only: true,
+                    is_algo_order: false,
                 },
                 OpenOrderSnapshot {
                     order_id: 2,
@@ -6942,6 +6977,7 @@ mod tests {
                     stop_price: 2253.07,
                     close_position: false,
                     reduce_only: true,
+                    is_algo_order: false,
                 },
             ],
             total_wallet_balance: 1000.0,
@@ -7115,6 +7151,7 @@ mod tests {
                     stop_price: 2050.0,
                     close_position: true,
                     reduce_only: true,
+                    is_algo_order: false,
                 },
                 OpenOrderSnapshot {
                     order_id: 2,
@@ -7128,6 +7165,7 @@ mod tests {
                     stop_price: 2125.0,
                     close_position: true,
                     reduce_only: true,
+                    is_algo_order: false,
                 },
             ],
             total_wallet_balance: 1000.0,
@@ -7172,6 +7210,7 @@ mod tests {
                     stop_price: 2235.63,
                     close_position: false,
                     reduce_only: true,
+                    is_algo_order: false,
                 },
                 OpenOrderSnapshot {
                     order_id: 2,
@@ -7185,6 +7224,7 @@ mod tests {
                     stop_price: 2287.22,
                     close_position: false,
                     reduce_only: true,
+                    is_algo_order: false,
                 },
             ],
             total_wallet_balance: 1000.0,
@@ -7227,6 +7267,7 @@ mod tests {
                     stop_price: 0.0,
                     close_position: false,
                     reduce_only: true,
+                    is_algo_order: false,
                 },
                 OpenOrderSnapshot {
                     order_id: 2,
@@ -7240,6 +7281,7 @@ mod tests {
                     stop_price: 2253.07,
                     close_position: false,
                     reduce_only: true,
+                    is_algo_order: false,
                 },
             ],
             total_wallet_balance: 1000.0,
@@ -7275,6 +7317,7 @@ mod tests {
                     stop_price: 0.0,
                     close_position: false,
                     reduce_only: false,
+                    is_algo_order: false,
                 },
                 OpenOrderSnapshot {
                     order_id: 12,
@@ -7288,6 +7331,7 @@ mod tests {
                     stop_price: 1974.0,
                     close_position: true,
                     reduce_only: true,
+                    is_algo_order: false,
                 },
                 OpenOrderSnapshot {
                     order_id: 13,
@@ -7301,6 +7345,7 @@ mod tests {
                     stop_price: 1961.2,
                     close_position: true,
                     reduce_only: true,
+                    is_algo_order: false,
                 },
             ],
             total_wallet_balance: 1000.0,
@@ -7346,6 +7391,96 @@ mod tests {
         assert_eq!(pending.leverage, Some(20));
         assert!(snapshot.positions.is_empty());
         assert!(snapshot.position_context.is_some());
+    }
+
+    #[test]
+    fn pending_order_mode_requires_entry_like_open_order() {
+        let state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: false,
+            has_open_orders: true,
+            active_positions: vec![],
+            open_orders: vec![
+                OpenOrderSnapshot {
+                    order_id: 21,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "TAKE_PROFIT_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.0,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2162.25,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: false,
+                },
+                OpenOrderSnapshot {
+                    order_id: 22,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "STOP_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.0,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2219.0,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: false,
+                },
+            ],
+            total_wallet_balance: 1000.0,
+            available_balance: 800.0,
+        };
+
+        assert!(!pending_order_mode_from_trading_state(Some(&state)));
+    }
+
+    #[test]
+    fn pending_order_mode_detects_entry_like_open_order() {
+        let state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: false,
+            has_open_orders: true,
+            active_positions: vec![],
+            open_orders: vec![
+                OpenOrderSnapshot {
+                    order_id: 31,
+                    side: "SELL".to_string(),
+                    position_side: "SHORT".to_string(),
+                    order_type: "LIMIT".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.07,
+                    executed_qty: 0.0,
+                    price: 2202.87,
+                    stop_price: 0.0,
+                    close_position: false,
+                    reduce_only: false,
+                    is_algo_order: false,
+                },
+                OpenOrderSnapshot {
+                    order_id: 32,
+                    side: "BUY".to_string(),
+                    position_side: "SHORT".to_string(),
+                    order_type: "TAKE_PROFIT_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.07,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2162.25,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: false,
+                },
+            ],
+            total_wallet_balance: 1000.0,
+            available_balance: 800.0,
+        };
+
+        assert!(pending_order_mode_from_trading_state(Some(&state)));
     }
 
     #[test]
@@ -7925,6 +8060,7 @@ mod tests {
                     stop_price: 0.0,
                     close_position: false,
                     reduce_only: false,
+                    is_algo_order: false,
                 }],
                 total_wallet_balance: 1000.0,
                 available_balance: 800.0,

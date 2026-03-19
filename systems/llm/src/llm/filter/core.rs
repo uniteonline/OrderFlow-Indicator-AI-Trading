@@ -425,6 +425,7 @@ mod tests {
                 stop_price: 0.0,
                 close_position: false,
                 reduce_only: false,
+                is_algo_order: false,
             }],
             total_wallet_balance: 1000.0,
             available_balance: 900.0,

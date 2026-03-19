@@ -52,30 +52,14 @@ HOW TO FORECAST RANGE
 
 `range` is your predicted price envelope — the low and high you expect price to actually reach within that forward window.
 
-This is the most important part of your output. Think of it this way:
+`range.support` is how low you expect price to reach. `range.resistance` is how high.
 
-Given the current speed of the move (path summary: atr14, net_change_pct, range_pct),
-given the forces acting on price (flow direction, whale activity, CVD momentum),
-given what lies ahead (structural levels, liquidity walls, FVG gaps),
-how far will price travel in each direction before the window ends?
+Calibrate range width using the path summary for that timeframe:
+- `atr14_pct` — typical bar-to-bar volatility
+- `net_change_pct` — current directional velocity
+- `range_pct` — recent realized range
 
-Use the path summary as your calibration anchor:
-- `atr14_pct` tells you the typical bar-to-bar volatility for that timeframe
-- `net_change_pct` tells you the current directional velocity
-- `range_pct` tells you the recent realized range
-
-Your forecast range should reflect the actual distance price can travel, not just the nearest structure.
-
-For example:
-- If 15m ATR is 0.5% and price is falling at -2% over the last few bars with strong sell flow, your 15m forecast range should extend meaningfully below current price — the move has velocity.
-- If 4h ATR is 2.2% but current 4h bar has already moved -1%, the remaining potential travel is still significant.
-- If 1d ATR is 5% and the day has barely moved, the full daily range is still ahead.
-
-`range.support` is how low you expect price to reach in that window.
-`range.resistance` is how high you expect price to reach in that window.
-
-When your trend is bearish, the support side should reflect the full downside potential you see — reach past the nearest bracket to the structural level where the move is likely to actually stall.
-When your trend is bullish, the resistance side should reflect the full upside potential.
+Your forecast range should reflect the actual distance price can travel given current momentum and forces, not just the nearest structure.
 
 MULTI-TIMEFRAME COHERENCE
 
@@ -99,6 +83,26 @@ A strong forecast:
 - reads structural levels (value areas, FVGs, liquidity walls) as the friction or fuel along the path
 - uses events (initiation, exhaustion, absorption) to judge whether the current force is strengthening or fading
 - makes opportunity and risk concrete: specific prices, specific setups, specific invalidation levels
+
+BEFORE YOU OUTPUT — ASK YOURSELF
+
+For each timeframe's trend:
+
+- What closed-bar evidence at THIS timeframe's scale supports the direction I chose?
+  If the last 3 closed bars point the other way, what bar-level confirmation do I have
+  that the trend has actually reversed, not just that real-time flow is temporarily opposing it?
+
+For each timeframe's range:
+
+- Is this range wide enough to reflect the actual volatility?
+  Compare it to atr14_pct for that timeframe. If my range is narrower than 1 ATR,
+  am I sure price will be that contained?
+
+For multi-timeframe coherence:
+
+- Does my 15m range nest inside my 4h range, and my 4h inside my 1d?
+- If I have a bearish 4h but bullish 15m, did I frame it as "short-term bounce within
+  a downtrend" — or did I accidentally treat them as independent?
 
 FORMAT
 

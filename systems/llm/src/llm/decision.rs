@@ -393,10 +393,15 @@ pub fn pending_order_management_intent_from_value_with_context(
     Ok(intent)
 }
 
-/// Returns true if model level and current level are within 0.05% of each other (or both absent).
+/// Returns true if the model is effectively asking to keep the live level unchanged.
+///
+/// Omitted model levels (`None`) are treated as "leave unchanged". Concrete model levels require a
+/// concrete live level to compare against; otherwise we must preserve MODIFY_MAKER instead of
+/// collapsing into HOLD.
 fn levels_match(model: Option<f64>, current: Option<f64>) -> bool {
     match (model, current) {
-        (None, _) | (_, None) => true,
+        (None, _) => true,
+        (Some(_), None) => false,
         (Some(m), Some(c)) => {
             if c == 0.0 {
                 m == 0.0
@@ -619,6 +624,30 @@ mod tests {
             current_tp: Some(1974.0),
             current_sl: Some(1961.2),
             current_leverage: Some(3.0),
+        };
+
+        let intent = pending_order_management_intent_from_value_with_context(&value, &ctx)
+            .expect("pending intent parses");
+        assert_eq!(intent.decision, PendingOrderManagementDecision::ModifyMaker);
+    }
+
+    #[test]
+    fn pending_missing_live_levels_does_not_collapse_into_hold() {
+        let value = json!({
+            "reason": "re-anchor to a fresher pending short zone",
+            "params": {
+                "entry": 2194.29,
+                "tp": 2162.25,
+                "sl": 2219.0,
+                "leverage": 3.0
+            }
+        });
+        let ctx = PendingOrderContext {
+            has_open_orders: true,
+            current_entry: None,
+            current_tp: None,
+            current_sl: None,
+            current_leverage: None,
         };
 
         let intent = pending_order_management_intent_from_value_with_context(&value, &ctx)

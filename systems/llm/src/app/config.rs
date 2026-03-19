@@ -462,8 +462,10 @@ pub struct LlmConfig {
     pub bundle_consume_stale_secs: u64,
     #[serde(default = "default_bundle_execution_stale_secs")]
     pub bundle_execution_stale_secs: u64,
-    #[serde(default = "default_temp_cache_retention_minutes")]
-    pub temp_cache_retention_minutes: u64,
+    #[serde(default)]
+    pub temp_cache_retention_hours: Option<u64>,
+    #[serde(default, rename = "temp_cache_retention_minutes")]
+    pub temp_cache_retention_minutes_legacy: Option<u64>,
     #[serde(default = "default_call_schedule_minutes")]
     pub call_schedule_minutes: Vec<u8>,
     #[serde(default)]
@@ -499,7 +501,8 @@ impl Default for LlmConfig {
             bundle_stale_secs: default_bundle_stale_secs(),
             bundle_consume_stale_secs: default_bundle_consume_stale_secs(),
             bundle_execution_stale_secs: default_bundle_execution_stale_secs(),
-            temp_cache_retention_minutes: default_temp_cache_retention_minutes(),
+            temp_cache_retention_hours: Some(default_temp_cache_retention_hours()),
+            temp_cache_retention_minutes_legacy: None,
             call_schedule_minutes: default_call_schedule_minutes(),
             call_schedule_minutes_by_model: HashMap::new(),
             min_invoke_interval_secs_by_model: HashMap::new(),
@@ -510,6 +513,15 @@ impl Default for LlmConfig {
             models: default_models(),
             execution: LlmExecutionConfig::default(),
         }
+    }
+}
+
+impl LlmConfig {
+    pub fn temp_cache_retention_minutes(&self) -> u64 {
+        self.temp_cache_retention_hours
+            .and_then(|hours| hours.checked_mul(60))
+            .or(self.temp_cache_retention_minutes_legacy)
+            .unwrap_or_else(default_temp_cache_retention_minutes)
     }
 }
 
@@ -647,8 +659,12 @@ fn default_bundle_execution_stale_secs() -> u64 {
     300
 }
 
+fn default_temp_cache_retention_hours() -> u64 {
+    12
+}
+
 fn default_temp_cache_retention_minutes() -> u64 {
-    60
+    default_temp_cache_retention_hours() * 60
 }
 
 fn default_call_schedule_minutes() -> Vec<u8> {
@@ -675,6 +691,22 @@ fn validate_schedule_minutes(minutes: &[u8], field_name: &str) -> Result<()> {
                 minute
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_temp_cache_retention_config(llm: &LlmConfig) -> Result<()> {
+    if llm.temp_cache_retention_hours.is_some() && llm.temp_cache_retention_minutes_legacy.is_some()
+    {
+        return Err(anyhow!(
+            "llm.temp_cache_retention_hours and llm.temp_cache_retention_minutes cannot both be set"
+        ));
+    }
+    if llm.temp_cache_retention_hours == Some(0) {
+        return Err(anyhow!("llm.temp_cache_retention_hours must be > 0"));
+    }
+    if llm.temp_cache_retention_minutes_legacy == Some(0) {
+        return Err(anyhow!("llm.temp_cache_retention_minutes must be > 0"));
     }
     Ok(())
 }
@@ -818,7 +850,9 @@ fn default_indicator_codes() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_indicator_codes, LlmConfig, LlmModelConfig};
+    use super::{
+        default_indicator_codes, validate_temp_cache_retention_config, LlmConfig, LlmModelConfig,
+    };
 
     #[test]
     fn default_indicator_codes_include_fvg() {
@@ -829,6 +863,43 @@ mod tests {
     #[test]
     fn default_llm_request_enabled_is_true() {
         assert!(LlmConfig::default().request_enabled);
+    }
+
+    #[test]
+    fn default_temp_cache_retention_is_twelve_hours() {
+        let config = LlmConfig::default();
+        assert_eq!(config.temp_cache_retention_hours, Some(12));
+        assert_eq!(config.temp_cache_retention_minutes(), 12 * 60);
+    }
+
+    #[test]
+    fn temp_cache_retention_uses_configured_hours() {
+        let config: LlmConfig =
+            serde_yaml::from_str("temp_cache_retention_hours: 6").expect("parse llm config");
+        assert_eq!(config.temp_cache_retention_hours, Some(6));
+        assert_eq!(config.temp_cache_retention_minutes(), 6 * 60);
+    }
+
+    #[test]
+    fn temp_cache_retention_supports_legacy_minutes_field() {
+        let config: LlmConfig =
+            serde_yaml::from_str("temp_cache_retention_minutes: 90").expect("parse llm config");
+        assert_eq!(config.temp_cache_retention_hours, None);
+        assert_eq!(config.temp_cache_retention_minutes_legacy, Some(90));
+        assert_eq!(config.temp_cache_retention_minutes(), 90);
+    }
+
+    #[test]
+    fn temp_cache_retention_rejects_conflicting_units() {
+        let config: LlmConfig = serde_yaml::from_str(
+            "temp_cache_retention_hours: 12\ntemp_cache_retention_minutes: 60",
+        )
+        .expect("parse llm config");
+        let err =
+            validate_temp_cache_retention_config(&config).expect_err("expected conflict error");
+        assert!(err
+            .to_string()
+            .contains("temp_cache_retention_hours and llm.temp_cache_retention_minutes"));
     }
 
     #[test]
@@ -1027,6 +1098,7 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     if cfg.llm.bundle_settle_ms == 0 {
         return Err(anyhow!("llm.bundle_settle_ms must be > 0"));
     }
+    validate_temp_cache_retention_config(&cfg.llm)?;
     validate_schedule_minutes(&cfg.llm.call_schedule_minutes, "llm.call_schedule_minutes")?;
     for (provider, minutes) in &cfg.llm.call_schedule_minutes_by_model {
         let key = provider.trim().to_ascii_lowercase();

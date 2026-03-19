@@ -11,9 +11,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
@@ -93,6 +94,8 @@ pub struct OpenOrderSnapshot {
     pub stop_price: f64,
     pub close_position: bool,
     pub reduce_only: bool,
+    #[serde(skip_serializing)]
+    pub is_algo_order: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +140,7 @@ struct AccountWsState {
     total_wallet_balance: Option<f64>,
     available_balance: Option<f64>,
     positions: HashMap<(String, String), ActivePositionSnapshot>,
+    flattened_at: HashMap<(String, String), Instant>,
 }
 
 fn account_ws_state() -> Arc<Mutex<AccountWsState>> {
@@ -145,21 +149,292 @@ fn account_ws_state() -> Arc<Mutex<AccountWsState>> {
         .clone()
 }
 
-fn ensure_account_ws_listener_started(http_client: &Client, api_config: &BinanceApiConfig) {
+fn ws_state_has_recent_flatten_event(
+    state: &AccountWsState,
+    symbol: &str,
+    position_side: &str,
+    watch_started_at: Instant,
+) -> bool {
+    state
+        .flattened_at
+        .iter()
+        .any(|((sym, side), flattened_at)| {
+            sym.eq_ignore_ascii_case(symbol)
+                && side.eq_ignore_ascii_case(position_side)
+                && *flattened_at >= watch_started_at
+        })
+}
+
+fn has_recent_account_flatten_event(
+    symbol: &str,
+    position_side: &str,
+    watch_started_at: Instant,
+) -> bool {
+    let state = account_ws_state();
+    state.lock().ok().is_some_and(|guard| {
+        ws_state_has_recent_flatten_event(&guard, symbol, position_side, watch_started_at)
+    })
+}
+
+fn is_exit_like_order(order: &OpenOrderSnapshot) -> bool {
+    order.reduce_only || order.close_position
+}
+
+fn is_entry_like_order(order: &OpenOrderSnapshot) -> bool {
+    !is_exit_like_order(order)
+        && (order.side.eq_ignore_ascii_case("BUY") || order.side.eq_ignore_ascii_case("SELL"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitKind {
+    TakeProfit,
+    StopLoss,
+}
+
+fn strict_hedge_position_side(value: &str) -> Option<&'static str> {
+    let raw = value.trim();
+    if raw.eq_ignore_ascii_case("LONG") {
+        Some("LONG")
+    } else if raw.eq_ignore_ascii_case("SHORT") {
+        Some("SHORT")
+    } else {
+        None
+    }
+}
+
+fn tracked_exit_order(order: &OpenOrderSnapshot) -> TrackedExitOrder {
+    TrackedExitOrder {
+        order_id: order.order_id,
+        is_algo_order: order.is_algo_order,
+    }
+}
+
+fn effective_order_position_side(
+    order: &OpenOrderSnapshot,
+    hedge_mode: bool,
+) -> Option<&'static str> {
+    if !hedge_mode {
+        return Some("BOTH");
+    }
+    if let Some(side) = strict_hedge_position_side(&order.position_side) {
+        return Some(side);
+    }
+    if is_entry_like_order(order) {
+        if order.side.eq_ignore_ascii_case("BUY") {
+            Some("LONG")
+        } else if order.side.eq_ignore_ascii_case("SELL") {
+            Some("SHORT")
+        } else {
+            None
+        }
+    } else if is_exit_like_order(order) {
+        if order.side.eq_ignore_ascii_case("SELL") {
+            Some("LONG")
+        } else if order.side.eq_ignore_ascii_case("BUY") {
+            Some("SHORT")
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn order_matches_position_side(
+    order: &OpenOrderSnapshot,
+    position_side: &str,
+    hedge_mode: bool,
+) -> bool {
+    if !hedge_mode {
+        return true;
+    }
+    effective_order_position_side(order, hedge_mode)
+        .is_some_and(|side| side.eq_ignore_ascii_case(position_side))
+}
+
+fn collect_tracked_orders_for_position_side(
+    open_orders: &[OpenOrderSnapshot],
+    position_side: &str,
+    hedge_mode: bool,
+    include_entry_like: bool,
+    include_exit_like: bool,
+) -> Vec<TrackedExitOrder> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for order in open_orders {
+        let include = (include_entry_like && is_entry_like_order(order))
+            || (include_exit_like && is_exit_like_order(order));
+        if !include || !order_matches_position_side(order, position_side, hedge_mode) {
+            continue;
+        }
+        if seen.insert(order.order_id) {
+            out.push(tracked_exit_order(order));
+        }
+    }
+    out
+}
+
+fn exit_order_trigger_price(order: &OpenOrderSnapshot) -> Option<f64> {
+    if order.stop_price > 0.0 {
+        Some(order.stop_price)
+    } else if order.price > 0.0 {
+        Some(order.price)
+    } else {
+        None
+    }
+}
+
+fn exact_order_type_matches_exit_kind(order_type: &str, exit_kind: ExitKind) -> bool {
+    match exit_kind {
+        ExitKind::TakeProfit => {
+            order_type.eq_ignore_ascii_case("TAKE_PROFIT_MARKET")
+                || order_type.eq_ignore_ascii_case("TAKE_PROFIT")
+                || order_type.eq_ignore_ascii_case("TAKE_PROFIT_MARKET_ALGO")
+        }
+        ExitKind::StopLoss => {
+            order_type.eq_ignore_ascii_case("STOP_MARKET")
+                || order_type.eq_ignore_ascii_case("STOP")
+                || order_type.eq_ignore_ascii_case("STOP_MARKET_ALGO")
+        }
+    }
+}
+
+fn price_matches_exit_kind(
+    position_side: &str,
+    entry_price: f64,
+    candidate_price: f64,
+    exit_kind: ExitKind,
+) -> bool {
+    if candidate_price <= 0.0 {
+        return false;
+    }
+    if position_side.eq_ignore_ascii_case("LONG") {
+        match exit_kind {
+            ExitKind::TakeProfit => candidate_price > entry_price,
+            ExitKind::StopLoss => candidate_price < entry_price,
+        }
+    } else if position_side.eq_ignore_ascii_case("SHORT") {
+        match exit_kind {
+            ExitKind::TakeProfit => candidate_price < entry_price,
+            ExitKind::StopLoss => candidate_price > entry_price,
+        }
+    } else {
+        false
+    }
+}
+
+fn matching_exit_prices_for_order(
+    order: &OpenOrderSnapshot,
+    position_side: &str,
+    entry_price: f64,
+    exit_kind: ExitKind,
+) -> Vec<f64> {
+    if !is_exit_like_order(order) {
+        return Vec::new();
+    }
+    let mut out: Vec<f64> = Vec::new();
+    for candidate_price in [order.price, order.stop_price] {
+        if price_matches_exit_kind(position_side, entry_price, candidate_price, exit_kind)
+            && !out
+                .iter()
+                .any(|existing| (*existing - candidate_price).abs() < f64::EPSILON)
+        {
+            out.push(candidate_price);
+        }
+    }
+    out
+}
+
+fn choose_preferred_exit_price(
+    prices: impl IntoIterator<Item = f64>,
+    entry_price: f64,
+    position_side: &str,
+    exit_kind: ExitKind,
+) -> Option<f64> {
+    let mut candidates = prices.into_iter().filter(|v| *v > 0.0).collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+    match (position_side.eq_ignore_ascii_case("LONG"), exit_kind) {
+        (true, ExitKind::TakeProfit) => candidates.sort_by(|a, b| a.total_cmp(b)),
+        (true, ExitKind::StopLoss) => candidates.sort_by(|a, b| b.total_cmp(a)),
+        (false, ExitKind::TakeProfit) => candidates.sort_by(|a, b| b.total_cmp(a)),
+        (false, ExitKind::StopLoss) => candidates.sort_by(|a, b| a.total_cmp(b)),
+    }
+    candidates
+        .into_iter()
+        .min_by(|a, b| (a - entry_price).abs().total_cmp(&(b - entry_price).abs()))
+}
+
+fn find_live_exit_trigger_price(
+    open_orders: &[OpenOrderSnapshot],
+    position_side: &str,
+    hedge_mode: bool,
+    entry_price: Option<f64>,
+    exit_kind: ExitKind,
+) -> Option<f64> {
+    if let Some(entry_price) = entry_price {
+        let exact_matches = open_orders
+            .iter()
+            .filter(|order| order_matches_position_side(order, position_side, hedge_mode))
+            .filter(|order| exact_order_type_matches_exit_kind(&order.order_type, exit_kind))
+            .flat_map(|order| {
+                matching_exit_prices_for_order(order, position_side, entry_price, exit_kind)
+            })
+            .collect::<Vec<_>>();
+        if !exact_matches.is_empty() {
+            return choose_preferred_exit_price(
+                exact_matches,
+                entry_price,
+                position_side,
+                exit_kind,
+            );
+        }
+
+        let inferred_matches = open_orders
+            .iter()
+            .filter(|order| order_matches_position_side(order, position_side, hedge_mode))
+            .flat_map(|order| {
+                matching_exit_prices_for_order(order, position_side, entry_price, exit_kind)
+            })
+            .collect::<Vec<_>>();
+        return choose_preferred_exit_price(
+            inferred_matches,
+            entry_price,
+            position_side,
+            exit_kind,
+        );
+    }
+
+    open_orders
+        .iter()
+        .filter(|order| order_matches_position_side(order, position_side, hedge_mode))
+        .filter(|order| exact_order_type_matches_exit_kind(&order.order_type, exit_kind))
+        .filter_map(exit_order_trigger_price)
+        .next()
+}
+
+fn ensure_account_ws_listener_started(
+    http_client: &Client,
+    api_config: &BinanceApiConfig,
+    exec_config: &LlmExecutionConfig,
+) {
     if ACCOUNT_WS_LISTENER_STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
     let client = http_client.clone();
     let api = api_config.clone();
+    let exec = exec_config.clone();
     let state = account_ws_state();
     tokio::spawn(async move {
-        run_account_ws_listener_loop(client, api, state).await;
+        run_account_ws_listener_loop(client, api, exec, state).await;
     });
 }
 
 async fn run_account_ws_listener_loop(
     http_client: Client,
     api_config: BinanceApiConfig,
+    exec_config: LlmExecutionConfig,
     state: Arc<Mutex<AccountWsState>>,
 ) {
     loop {
@@ -206,7 +481,27 @@ async fn run_account_ws_listener_loop(
             let Ok(payload) = serde_json::from_str::<Value>(&text) else {
                 continue;
             };
-            apply_account_update_event(&payload, &state);
+            let flattened_symbols = apply_account_update_event(&payload, &state);
+            for symbol in flattened_symbols {
+                let client = http_client.clone();
+                let api = api_config.clone();
+                let exec = exec_config.clone();
+                tokio::spawn(async move {
+                    match cleanup_orphan_exit_orders_for_symbol(&client, &api, &exec, &symbol).await
+                    {
+                        Ok(true) => info!(
+                            symbol = %symbol,
+                            "account_update_cleanup: canceled orphan exit orders after flatten"
+                        ),
+                        Ok(false) => {}
+                        Err(err) => warn!(
+                            symbol = %symbol,
+                            error = %err,
+                            "account_update_cleanup: failed to cancel orphan exit orders after flatten"
+                        ),
+                    }
+                });
+            }
         }
 
         let _ = delete_user_data_listen_key(&http_client, &api_config, &listen_key).await;
@@ -214,13 +509,13 @@ async fn run_account_ws_listener_loop(
     }
 }
 
-fn apply_account_update_event(payload: &Value, state: &Arc<Mutex<AccountWsState>>) {
+fn apply_account_update_event(payload: &Value, state: &Arc<Mutex<AccountWsState>>) -> Vec<String> {
     let event_type = payload.get("e").and_then(Value::as_str).unwrap_or_default();
     if event_type != "ACCOUNT_UPDATE" {
-        return;
+        return Vec::new();
     }
     let Some(account_obj) = payload.get("a").and_then(Value::as_object) else {
-        return;
+        return Vec::new();
     };
 
     let mut total_wallet_balance: Option<f64> = None;
@@ -239,8 +534,9 @@ fn apply_account_update_event(payload: &Value, state: &Arc<Mutex<AccountWsState>
 
     let mut guard = match state.lock() {
         Ok(g) => g,
-        Err(_) => return,
+        Err(_) => return Vec::new(),
     };
+    let mut flattened_symbols = HashSet::new();
     if let Some(v) = total_wallet_balance {
         guard.total_wallet_balance = Some(v);
     }
@@ -265,10 +561,19 @@ fn apply_account_update_event(payload: &Value, state: &Arc<Mutex<AccountWsState>
                 .to_string();
             let position_amt = parse_optional_f64(p, &["pa"]).unwrap_or(0.0);
             let key = (symbol.clone(), position_side.clone());
+            let had_live_position = guard
+                .positions
+                .get(&key)
+                .is_some_and(|v| v.position_amt.abs() > f64::EPSILON);
             if position_amt.abs() <= f64::EPSILON {
+                if had_live_position {
+                    flattened_symbols.insert(symbol.clone());
+                    guard.flattened_at.insert(key.clone(), Instant::now());
+                }
                 guard.positions.remove(&key);
                 continue;
             }
+            guard.flattened_at.remove(&key);
 
             let entry_price = parse_optional_f64(p, &["ep"]).unwrap_or(0.0);
             let unrealized_pnl = parse_optional_f64(p, &["up"]).unwrap_or(0.0);
@@ -292,6 +597,7 @@ fn apply_account_update_event(payload: &Value, state: &Arc<Mutex<AccountWsState>
         }
     }
     guard.has_account_update = true;
+    flattened_symbols.into_iter().collect()
 }
 
 pub async fn execute_trade_intent(
@@ -558,6 +864,128 @@ pub async fn fetch_symbol_trading_state(
     })
 }
 
+fn should_cleanup_orphan_exit_orders_when_flat(state: &TradingStateSnapshot) -> bool {
+    !state.has_active_positions
+        && state.has_open_orders
+        && state.open_orders.iter().all(is_exit_like_order)
+}
+
+fn has_pending_entry_order_for_side(
+    state: &TradingStateSnapshot,
+    position_side: &str,
+    hedge_mode: bool,
+) -> bool {
+    state.open_orders.iter().any(|order| {
+        is_entry_like_order(order) && order_matches_position_side(order, position_side, hedge_mode)
+    })
+}
+
+fn collect_orphan_exit_orders_to_cancel(
+    state: &TradingStateSnapshot,
+    hedge_mode: bool,
+) -> Vec<TrackedExitOrder> {
+    if should_cleanup_orphan_exit_orders_when_flat(state) {
+        return state
+            .open_orders
+            .iter()
+            .filter(|order| is_exit_like_order(order))
+            .map(tracked_exit_order)
+            .collect();
+    }
+    if !hedge_mode {
+        return Vec::new();
+    }
+
+    let active_sides: HashSet<&'static str> = state
+        .active_positions
+        .iter()
+        .filter(|position| position.position_amt.abs() > f64::EPSILON)
+        .filter_map(|position| strict_hedge_position_side(&position.position_side))
+        .collect();
+
+    let mut out = Vec::new();
+    for position_side in ["LONG", "SHORT"] {
+        if active_sides.contains(position_side)
+            || has_pending_entry_order_for_side(state, position_side, hedge_mode)
+        {
+            continue;
+        }
+        out.extend(
+            state
+                .open_orders
+                .iter()
+                .filter(|order| is_exit_like_order(order))
+                .filter(|order| order_matches_position_side(order, position_side, hedge_mode))
+                .map(tracked_exit_order),
+        );
+    }
+    out
+}
+
+fn is_order_already_gone_error(err: &anyhow::Error) -> bool {
+    let text = err.to_string();
+    text.contains("\"code\":-2011")
+        || text.contains("\"code\":-2013")
+        || text.contains("Unknown order sent")
+        || text.contains("Order does not exist")
+        || text.contains("order not found")
+}
+
+async fn cancel_tracked_exit_orders(
+    http_client: &Client,
+    api_config: &BinanceApiConfig,
+    exec_config: &LlmExecutionConfig,
+    symbol: &str,
+    orders: &[TrackedExitOrder],
+) -> Result<bool> {
+    if orders.is_empty() {
+        return Ok(false);
+    }
+
+    for order in orders {
+        let cancel_result = if order.is_algo_order {
+            cancel_algo_order_by_id(http_client, api_config, exec_config, symbol, order.order_id)
+                .await
+        } else {
+            cancel_order_by_id(http_client, api_config, exec_config, symbol, order.order_id).await
+        };
+        if let Err(err) = cancel_result {
+            if is_order_already_gone_error(&err) {
+                continue;
+            }
+            return Err(err);
+        }
+    }
+    Ok(true)
+}
+
+fn collect_exit_orders_for_side(
+    open_orders: &[OpenOrderSnapshot],
+    position_side: &str,
+    hedge_mode: bool,
+) -> Vec<TrackedExitOrder> {
+    collect_tracked_orders_for_position_side(open_orders, position_side, hedge_mode, false, true)
+}
+
+fn collect_pending_context_orders_for_side(
+    open_orders: &[OpenOrderSnapshot],
+    position_side: &str,
+    hedge_mode: bool,
+) -> Vec<TrackedExitOrder> {
+    collect_tracked_orders_for_position_side(open_orders, position_side, hedge_mode, true, true)
+}
+
+pub(crate) async fn cleanup_orphan_exit_orders_for_symbol(
+    http_client: &Client,
+    api_config: &BinanceApiConfig,
+    exec_config: &LlmExecutionConfig,
+    symbol: &str,
+) -> Result<bool> {
+    let state = fetch_symbol_trading_state(http_client, api_config, exec_config, symbol).await?;
+    let orphan_orders = collect_orphan_exit_orders_to_cancel(&state, exec_config.hedge_mode);
+    cancel_tracked_exit_orders(http_client, api_config, exec_config, symbol, &orphan_orders).await
+}
+
 pub async fn execute_management_intent(
     http_client: &Client,
     api_config: &BinanceApiConfig,
@@ -810,9 +1238,19 @@ pub async fn execute_management_intent(
             // In open-orders-only mode, treat ADD as "re-price/replace pending entry":
             // cancel existing open orders first to avoid duplicated entry orders.
             if open_orders_only_mode && state.has_open_orders {
-                cancel_all_open_orders(http_client, api_config, exec_config, symbol).await?;
-                cancel_all_open_algo_orders(http_client, api_config, exec_config, symbol).await?;
-                report.canceled_open_orders = true;
+                let replace_candidates = collect_pending_context_orders_for_side(
+                    &state.open_orders,
+                    &position_side,
+                    exec_config.hedge_mode,
+                );
+                report.canceled_open_orders = cancel_tracked_exit_orders(
+                    http_client,
+                    api_config,
+                    exec_config,
+                    symbol,
+                    &replace_candidates,
+                )
+                .await?;
             }
 
             let order_id = place_limit_post_only_order_with_side(
@@ -863,6 +1301,7 @@ pub async fn execute_management_intent(
                 ));
             }
 
+            let mut expected_remaining_positions = Vec::new();
             for position in &state.active_positions {
                 let position_side = if exec_config.hedge_mode {
                     position.position_side.as_str()
@@ -881,6 +1320,10 @@ pub async fn execute_management_intent(
                 if reduce_qty < symbol_filters.min_qty {
                     continue;
                 }
+                expected_remaining_positions.push((
+                    position_side.to_string(),
+                    (position.position_amt.abs() - reduce_qty).max(0.0),
+                ));
                 let reduce_qty_str = format_decimal(reduce_qty, symbol_filters.qty_precision);
                 let reduce_side = if position.position_amt > 0.0 {
                     "SELL"
@@ -922,6 +1365,24 @@ pub async fn execute_management_intent(
                 }
             }
             if intent.new_tp.is_some() || intent.new_sl.is_some() {
+                if !expected_remaining_positions.is_empty() {
+                    wait_for_position_reconcile_after_reduce(
+                        http_client,
+                        api_config,
+                        exec_config,
+                        symbol,
+                        &expected_remaining_positions,
+                        symbol_filters.step_size,
+                    )
+                    .await?;
+                }
+                if !expected_remaining_positions.is_empty()
+                    && expected_remaining_positions
+                        .iter()
+                        .all(|(_, expected_qty)| *expected_qty <= symbol_filters.step_size)
+                {
+                    return Ok(report);
+                }
                 let (tp_ids, sl_ids) = apply_reanchor_exits(
                     http_client,
                     api_config,
@@ -965,13 +1426,25 @@ pub async fn execute_management_intent(
                 } else {
                     "BOTH"
                 };
-                let current_tp = extract_existing_exit_trigger(
+                let semantic_side = if position.position_amt > 0.0 {
+                    "LONG"
+                } else {
+                    "SHORT"
+                };
+                let current_tp = find_live_exit_trigger_price(
                     &state.open_orders,
-                    position_side,
-                    "TAKE_PROFIT_MARKET",
+                    semantic_side,
+                    exec_config.hedge_mode,
+                    Some(position.entry_price),
+                    ExitKind::TakeProfit,
                 );
-                let current_sl =
-                    extract_existing_exit_trigger(&state.open_orders, position_side, "STOP_MARKET");
+                let current_sl = find_live_exit_trigger_price(
+                    &state.open_orders,
+                    semantic_side,
+                    exec_config.hedge_mode,
+                    Some(position.entry_price),
+                    ExitKind::StopLoss,
+                );
                 let is_long = position.position_amt > 0.0;
                 let (new_tp, new_sl) = resolve_modify_tpsl_targets(
                     intent,
@@ -997,11 +1470,24 @@ pub async fn execute_management_intent(
                 });
             }
 
-            // Re-anchor exit protection as a replace operation: remove existing algo exits only
-            // after all requested updates have been validated against the current live exits.
-            if state.has_open_orders {
-                cancel_all_open_algo_orders(http_client, api_config, exec_config, symbol).await?;
-            }
+            let cancel_candidates = plans
+                .iter()
+                .flat_map(|plan| {
+                    collect_exit_orders_for_side(
+                        &state.open_orders,
+                        &plan.position_side,
+                        exec_config.hedge_mode,
+                    )
+                })
+                .collect::<Vec<_>>();
+            report.canceled_open_orders = cancel_tracked_exit_orders(
+                http_client,
+                api_config,
+                exec_config,
+                symbol,
+                &cancel_candidates,
+            )
+            .await?;
 
             for plan in plans {
                 let exit_side = if plan.is_long { "SELL" } else { "BUY" };
@@ -1135,6 +1621,7 @@ pub async fn execute_pending_order_intent(
                 .ok_or_else(|| anyhow!("MODIFY_MAKER requires one entry-like open order"))?;
 
             let is_long = base_order.side.eq_ignore_ascii_case("BUY");
+            let semantic_side = if is_long { "LONG" } else { "SHORT" };
             let decision = if is_long {
                 TradeDecision::Long
             } else {
@@ -1196,13 +1683,20 @@ pub async fn execute_pending_order_intent(
             report.best_ask_price = Some(best_ask_price);
             report.maker_entry_price = Some(maker_entry_price);
 
-            let current_tp = extract_existing_exit_trigger(
+            let current_tp = find_live_exit_trigger_price(
                 &state.open_orders,
-                &position_side,
-                "TAKE_PROFIT_MARKET",
+                semantic_side,
+                exec_config.hedge_mode,
+                Some(current_entry),
+                ExitKind::TakeProfit,
             );
-            let current_sl =
-                extract_existing_exit_trigger(&state.open_orders, &position_side, "STOP_MARKET");
+            let current_sl = find_live_exit_trigger_price(
+                &state.open_orders,
+                semantic_side,
+                exec_config.hedge_mode,
+                Some(current_entry),
+                ExitKind::StopLoss,
+            );
             let (effective_tp, effective_sl) = resolve_pending_order_exit_levels(
                 intent,
                 current_tp,
@@ -1231,9 +1725,19 @@ pub async fn execute_pending_order_intent(
                 return Ok(report);
             }
 
-            cancel_all_open_orders(http_client, api_config, exec_config, symbol).await?;
-            cancel_all_open_algo_orders(http_client, api_config, exec_config, symbol).await?;
-            report.canceled_open_orders = true;
+            let replace_candidates = collect_pending_context_orders_for_side(
+                &state.open_orders,
+                &position_side,
+                exec_config.hedge_mode,
+            );
+            report.canceled_open_orders = cancel_tracked_exit_orders(
+                http_client,
+                api_config,
+                exec_config,
+                symbol,
+                &replace_candidates,
+            )
+            .await?;
 
             let replacement_qty = format_decimal(remaining_qty, symbol_filters.qty_precision);
             let replacement_price =
@@ -1397,10 +1901,25 @@ fn validate_reanchor_request(
         } else {
             "BOTH"
         };
-        let current_tp =
-            extract_existing_exit_trigger(&state.open_orders, position_side, "TAKE_PROFIT_MARKET");
-        let current_sl =
-            extract_existing_exit_trigger(&state.open_orders, position_side, "STOP_MARKET");
+        let semantic_side = if position.position_amt > 0.0 {
+            "LONG"
+        } else {
+            "SHORT"
+        };
+        let current_tp = find_live_exit_trigger_price(
+            &state.open_orders,
+            semantic_side,
+            exec_config.hedge_mode,
+            Some(position.entry_price),
+            ExitKind::TakeProfit,
+        );
+        let current_sl = find_live_exit_trigger_price(
+            &state.open_orders,
+            semantic_side,
+            exec_config.hedge_mode,
+            Some(position.entry_price),
+            ExitKind::StopLoss,
+        );
         let effective_tp = intent
             .new_tp
             .or(current_tp)
@@ -1451,21 +1970,53 @@ async fn apply_reanchor_exits(
             "re-anchor requested but active positions are gone while applying exits"
         ));
     }
-    if state.has_open_orders {
-        cancel_all_open_algo_orders(http_client, api_config, exec_config, symbol).await?;
-    }
     let mut tp_ids = Vec::new();
     let mut sl_ids = Vec::new();
+    let cancel_candidates = state
+        .active_positions
+        .iter()
+        .flat_map(|position| {
+            let position_side = if exec_config.hedge_mode {
+                position.position_side.as_str()
+            } else {
+                "BOTH"
+            };
+            collect_exit_orders_for_side(&state.open_orders, position_side, exec_config.hedge_mode)
+        })
+        .collect::<Vec<_>>();
+    cancel_tracked_exit_orders(
+        http_client,
+        api_config,
+        exec_config,
+        symbol,
+        &cancel_candidates,
+    )
+    .await?;
     for position in &state.active_positions {
         let position_side = if exec_config.hedge_mode {
             position.position_side.as_str()
         } else {
             "BOTH"
         };
-        let current_tp =
-            extract_existing_exit_trigger(&state.open_orders, position_side, "TAKE_PROFIT_MARKET");
-        let current_sl =
-            extract_existing_exit_trigger(&state.open_orders, position_side, "STOP_MARKET");
+        let semantic_side = if position.position_amt > 0.0 {
+            "LONG"
+        } else {
+            "SHORT"
+        };
+        let current_tp = find_live_exit_trigger_price(
+            &state.open_orders,
+            semantic_side,
+            exec_config.hedge_mode,
+            Some(position.entry_price),
+            ExitKind::TakeProfit,
+        );
+        let current_sl = find_live_exit_trigger_price(
+            &state.open_orders,
+            semantic_side,
+            exec_config.hedge_mode,
+            Some(position.entry_price),
+            ExitKind::StopLoss,
+        );
         let new_tp = intent
             .new_tp
             .or(current_tp)
@@ -1899,48 +2450,109 @@ fn parse_optional_id(value: &Value, keys: &[&str]) -> Option<i64> {
     None
 }
 
-fn extract_existing_exit_trigger(
-    open_orders: &[OpenOrderSnapshot],
-    position_side: &str,
-    order_type: &str,
-) -> Option<f64> {
-    open_orders
-        .iter()
-        .filter(|o| o.order_type.eq_ignore_ascii_case(order_type))
-        .filter(|o| {
-            o.position_side.eq_ignore_ascii_case(position_side)
-                || o.position_side.eq_ignore_ascii_case("BOTH")
-                || o.position_side.trim().is_empty()
-                || o.position_side == "-"
-        })
-        .filter_map(|o| {
-            if o.stop_price > 0.0 {
-                Some(o.stop_price)
-            } else if o.price > 0.0 {
-                Some(o.price)
-            } else {
-                None
-            }
-        })
-        .next()
-}
-
 fn has_active_position_for_side(
     state: &TradingStateSnapshot,
     position_side: &str,
     hedge_mode: bool,
 ) -> bool {
+    positions_have_active_position_for_side(&state.active_positions, position_side, hedge_mode)
+}
+
+fn positions_have_active_position_for_side(
+    positions: &[ActivePositionSnapshot],
+    position_side: &str,
+    hedge_mode: bool,
+) -> bool {
     if hedge_mode {
-        state.active_positions.iter().any(|p| {
-            p.position_amt.abs() > f64::EPSILON
-                && p.position_side.eq_ignore_ascii_case(position_side)
+        positions.iter().any(|position| {
+            position.position_amt.abs() > f64::EPSILON
+                && position.position_side.eq_ignore_ascii_case(position_side)
         })
+    } else {
+        positions
+            .iter()
+            .any(|position| position.position_amt.abs() > f64::EPSILON)
+    }
+}
+
+fn active_position_abs_qty_for_side(
+    state: &TradingStateSnapshot,
+    position_side: &str,
+    hedge_mode: bool,
+) -> f64 {
+    if hedge_mode {
+        state
+            .active_positions
+            .iter()
+            .filter(|position| {
+                position.position_amt.abs() > f64::EPSILON
+                    && position.position_side.eq_ignore_ascii_case(position_side)
+            })
+            .map(|position| position.position_amt.abs())
+            .next()
+            .unwrap_or(0.0)
     } else {
         state
             .active_positions
             .iter()
-            .any(|p| p.position_amt.abs() > f64::EPSILON)
+            .filter(|position| position.position_amt.abs() > f64::EPSILON)
+            .map(|position| position.position_amt.abs())
+            .sum()
     }
+}
+
+async fn wait_for_position_reconcile_after_reduce(
+    http_client: &Client,
+    api_config: &BinanceApiConfig,
+    exec_config: &LlmExecutionConfig,
+    symbol: &str,
+    expected_remaining_positions: &[(String, f64)],
+    qty_tolerance: f64,
+) -> Result<()> {
+    const MAX_ATTEMPTS: usize = 8;
+    const RETRY_DELAY_MS: u64 = 250;
+
+    if expected_remaining_positions.is_empty() {
+        return Ok(());
+    }
+
+    let tolerance = qty_tolerance.max(f64::EPSILON);
+    let mut last_mismatch = String::new();
+    for attempt in 0..MAX_ATTEMPTS {
+        let state =
+            fetch_symbol_trading_state(http_client, api_config, exec_config, symbol).await?;
+        let mismatches = expected_remaining_positions
+            .iter()
+            .filter_map(|(position_side, expected_qty)| {
+                let actual_qty =
+                    active_position_abs_qty_for_side(&state, position_side, exec_config.hedge_mode);
+                let matches = if *expected_qty <= tolerance {
+                    actual_qty <= tolerance
+                } else {
+                    (actual_qty - expected_qty).abs() <= tolerance
+                };
+                (!matches).then(|| {
+                    format!(
+                        "{} expected {:.8} actual {:.8}",
+                        position_side, expected_qty, actual_qty
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if mismatches.is_empty() {
+            return Ok(());
+        }
+        last_mismatch = mismatches.join(", ");
+        if attempt + 1 < MAX_ATTEMPTS {
+            sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+        }
+    }
+
+    Err(anyhow!(
+        "position state did not reconcile after reduce for {}: {}",
+        symbol,
+        last_mismatch
+    ))
 }
 
 fn should_cleanup_staged_exit_orders(
@@ -1954,6 +2566,27 @@ fn should_cleanup_staged_exit_orders(
             .open_orders
             .iter()
             .any(|o| o.order_id == entry_order_id)
+}
+
+async fn should_cleanup_staged_exit_orders_after_confirmation(
+    http_client: &Client,
+    api_config: &BinanceApiConfig,
+    exec_config: &LlmExecutionConfig,
+    symbol: &str,
+    position_side: &str,
+    watch_started_at: Instant,
+) -> Result<Option<&'static str>> {
+    if has_recent_account_flatten_event(symbol, position_side, watch_started_at) {
+        return Ok(Some("account_update_flatten"));
+    }
+
+    if is_position_side_flat_on_rest(http_client, api_config, exec_config, symbol, position_side)
+        .await?
+    {
+        return Ok(Some("rest_confirmed_flat"));
+    }
+
+    Ok(None)
 }
 
 fn resolve_modify_tpsl_targets(
@@ -2069,7 +2702,7 @@ async fn fetch_account_balance(
     api_config: &BinanceApiConfig,
     exec_config: &LlmExecutionConfig,
 ) -> Result<FuturesAccountBalance> {
-    ensure_account_ws_listener_started(http_client, api_config);
+    ensure_account_ws_listener_started(http_client, api_config, exec_config);
     if let Ok(guard) = account_ws_state().lock() {
         if guard.has_account_update {
             if let (Some(total_wallet_balance), Some(available_balance)) =
@@ -2115,7 +2748,7 @@ async fn fetch_active_positions(
     exec_config: &LlmExecutionConfig,
     symbol: &str,
 ) -> Result<Vec<ActivePositionSnapshot>> {
-    ensure_account_ws_listener_started(http_client, api_config);
+    ensure_account_ws_listener_started(http_client, api_config, exec_config);
     if let Ok(guard) = account_ws_state().lock() {
         if guard.has_account_update {
             let mut out = Vec::new();
@@ -2128,6 +2761,15 @@ async fn fetch_active_positions(
         }
     }
 
+    fetch_active_positions_from_rest(http_client, api_config, exec_config, symbol).await
+}
+
+async fn fetch_active_positions_from_rest(
+    http_client: &Client,
+    api_config: &BinanceApiConfig,
+    exec_config: &LlmExecutionConfig,
+    symbol: &str,
+) -> Result<Vec<ActivePositionSnapshot>> {
     let positions: Vec<FuturesPositionRiskRow> = signed_get_json(
         http_client,
         api_config,
@@ -2156,14 +2798,47 @@ async fn fetch_active_positions(
             leverage,
         });
     }
-    if let Ok(mut guard) = account_ws_state().lock() {
-        for pos in &out {
-            guard
-                .positions
-                .insert((symbol.to_string(), pos.position_side.clone()), pos.clone());
-        }
-    }
+    sync_account_ws_positions_from_rest(symbol, &out);
     Ok(out)
+}
+
+fn sync_account_ws_positions_from_rest(symbol: &str, positions: &[ActivePositionSnapshot]) {
+    let state = account_ws_state();
+    let Ok(mut guard) = state.lock() else {
+        return;
+    };
+
+    let stale_keys = guard
+        .positions
+        .keys()
+        .filter(|(sym, _)| sym.eq_ignore_ascii_case(symbol))
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in stale_keys {
+        guard.positions.remove(&key);
+    }
+
+    for position in positions {
+        let key = (symbol.to_string(), position.position_side.clone());
+        guard.flattened_at.remove(&key);
+        guard.positions.insert(key, position.clone());
+    }
+}
+
+async fn is_position_side_flat_on_rest(
+    http_client: &Client,
+    api_config: &BinanceApiConfig,
+    exec_config: &LlmExecutionConfig,
+    symbol: &str,
+    position_side: &str,
+) -> Result<bool> {
+    let positions =
+        fetch_active_positions_from_rest(http_client, api_config, exec_config, symbol).await?;
+    Ok(!positions_have_active_position_for_side(
+        &positions,
+        position_side,
+        exec_config.hedge_mode,
+    ))
 }
 
 pub(crate) async fn fetch_pending_order_leverage(
@@ -2355,6 +3030,7 @@ async fn watch_staged_exit_orders(
         return;
     }
 
+    let watch_started_at = Instant::now();
     let mut ticker = tokio::time::interval(Duration::from_secs(STAGED_EXIT_CLEANUP_INTERVAL_SECS));
     ticker.tick().await; // skip the immediate first tick
 
@@ -2388,6 +3064,29 @@ async fn watch_staged_exit_orders(
         ) {
             continue;
         }
+
+        let cleanup_confirmation = match should_cleanup_staged_exit_orders_after_confirmation(
+            &http_client,
+            &api_config,
+            &exec_config,
+            &symbol,
+            &position_side,
+            watch_started_at,
+        )
+        .await
+        {
+            Ok(Some(source)) => source,
+            Ok(None) => continue,
+            Err(err) => {
+                warn!(
+                    symbol = %symbol,
+                    entry_order_id = entry_order_id,
+                    error = %err,
+                    "staged_exit_cleanup: flat_confirmation_failed"
+                );
+                continue;
+            }
+        };
 
         for (label, order) in [
             ("take_profit", take_profit_order),
@@ -2423,6 +3122,16 @@ async fn watch_staged_exit_orders(
                 .await
             };
             if let Err(err) = cancel_result {
+                if is_order_already_gone_error(&err) {
+                    info!(
+                        symbol = %symbol,
+                        entry_order_id = entry_order_id,
+                        exit_order_kind = label,
+                        exit_order_id = order.order_id,
+                        "staged_exit_cleanup: exit already gone"
+                    );
+                    continue;
+                }
                 warn!(
                     symbol = %symbol,
                     entry_order_id = entry_order_id,
@@ -2445,6 +3154,7 @@ async fn watch_staged_exit_orders(
         info!(
             symbol = %symbol,
             entry_order_id = entry_order_id,
+            cleanup_confirmation = cleanup_confirmation,
             "staged_exit_cleanup: entry_gone_and_flat"
         );
         return;
@@ -2561,6 +3271,7 @@ async fn fetch_open_orders(
             stop_price: row.stop_price.parse::<f64>().unwrap_or(0.0),
             close_position: row.close_position,
             reduce_only: row.reduce_only,
+            is_algo_order: false,
         })
         .collect())
 }
@@ -2624,6 +3335,7 @@ async fn fetch_open_algo_orders(
             stop_price: parse_optional_f64(&row, &["triggerPrice", "stopPrice"]).unwrap_or(0.0),
             close_position: parse_optional_bool(&row, &["closePosition"]).unwrap_or(false),
             reduce_only: parse_optional_bool(&row, &["reduceOnly"]).unwrap_or(false),
+            is_algo_order: true,
         });
     }
     Ok(out)
@@ -3323,6 +4035,9 @@ struct SymbolFilters {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     fn sample_trade_intent(leverage: f64) -> TradeIntent {
         TradeIntent {
@@ -3393,6 +4108,41 @@ mod tests {
     }
 
     #[test]
+    fn active_position_abs_qty_for_side_respects_mode() {
+        let state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: false,
+            active_positions: vec![
+                ActivePositionSnapshot {
+                    position_side: "LONG".to_string(),
+                    position_amt: 0.12,
+                    entry_price: 100.0,
+                    mark_price: 101.0,
+                    unrealized_pnl: 0.12,
+                    leverage: 5,
+                },
+                ActivePositionSnapshot {
+                    position_side: "SHORT".to_string(),
+                    position_amt: -0.07,
+                    entry_price: 102.0,
+                    mark_price: 101.5,
+                    unrealized_pnl: 0.04,
+                    leverage: 5,
+                },
+            ],
+            open_orders: Vec::new(),
+            total_wallet_balance: 10.0,
+            available_balance: 9.0,
+        };
+
+        assert!((active_position_abs_qty_for_side(&state, "LONG", true) - 0.12).abs() < 1e-9);
+        assert!((active_position_abs_qty_for_side(&state, "SHORT", true) - 0.07).abs() < 1e-9);
+        assert!((active_position_abs_qty_for_side(&state, "BOTH", false) - 0.19).abs() < 1e-9);
+    }
+
+    #[test]
     fn staged_exit_cleanup_only_runs_when_entry_gone_and_flat() {
         let state_with_entry = TradingStateSnapshot {
             symbol: "ETHUSDT".to_string(),
@@ -3412,6 +4162,7 @@ mod tests {
                 stop_price: 0.0,
                 close_position: false,
                 reduce_only: false,
+                is_algo_order: false,
             }],
             total_wallet_balance: 10.0,
             available_balance: 9.0,
@@ -3463,6 +4214,545 @@ mod tests {
             "LONG",
             true
         ));
+    }
+
+    #[test]
+    fn recent_flatten_event_must_happen_after_watcher_started() {
+        let flatten_at = Instant::now();
+        let mut state = AccountWsState::default();
+        state
+            .flattened_at
+            .insert(("ETHUSDT".to_string(), "LONG".to_string()), flatten_at);
+
+        assert!(ws_state_has_recent_flatten_event(
+            &state, "ETHUSDT", "LONG", flatten_at
+        ));
+        assert!(!ws_state_has_recent_flatten_event(
+            &state,
+            "ETHUSDT",
+            "LONG",
+            flatten_at.checked_add(Duration::from_secs(1)).unwrap()
+        ));
+    }
+
+    #[test]
+    fn orphan_exit_cleanup_requires_flat_exit_only_state() {
+        let flat_exit_only_state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: false,
+            has_open_orders: true,
+            active_positions: Vec::new(),
+            open_orders: vec![
+                OpenOrderSnapshot {
+                    order_id: 101,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "TAKE_PROFIT_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.0,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2162.25,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: false,
+                },
+                OpenOrderSnapshot {
+                    order_id: 102,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "STOP_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.0,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2219.0,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: true,
+                },
+            ],
+            total_wallet_balance: 10.0,
+            available_balance: 9.0,
+        };
+        assert!(should_cleanup_orphan_exit_orders_when_flat(
+            &flat_exit_only_state
+        ));
+
+        let state_with_entry = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: false,
+            has_open_orders: true,
+            active_positions: Vec::new(),
+            open_orders: vec![OpenOrderSnapshot {
+                order_id: 103,
+                side: "SELL".to_string(),
+                position_side: "SHORT".to_string(),
+                order_type: "LIMIT".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.05,
+                executed_qty: 0.0,
+                price: 2202.87,
+                stop_price: 0.0,
+                close_position: false,
+                reduce_only: false,
+                is_algo_order: false,
+            }],
+            total_wallet_balance: 10.0,
+            available_balance: 9.0,
+        };
+        assert!(!should_cleanup_orphan_exit_orders_when_flat(
+            &state_with_entry
+        ));
+    }
+
+    #[test]
+    fn account_update_reports_flattened_symbols() {
+        let state = Arc::new(Mutex::new(AccountWsState {
+            has_account_update: true,
+            total_wallet_balance: Some(100.0),
+            available_balance: Some(90.0),
+            positions: HashMap::from([(
+                ("ETHUSDT".to_string(), "BOTH".to_string()),
+                ActivePositionSnapshot {
+                    position_side: "BOTH".to_string(),
+                    position_amt: -0.25,
+                    entry_price: 2200.0,
+                    mark_price: 2190.0,
+                    unrealized_pnl: 2.5,
+                    leverage: 10,
+                },
+            )]),
+            flattened_at: HashMap::new(),
+        }));
+        let payload = json!({
+            "e": "ACCOUNT_UPDATE",
+            "a": {
+                "B": [{"a": "USDT", "wb": "100.0", "cw": "95.0"}],
+                "P": [{"s": "ETHUSDT", "ps": "BOTH", "pa": "0", "ep": "0", "up": "0"}]
+            }
+        });
+
+        let flattened = apply_account_update_event(&payload, &state);
+        assert_eq!(flattened, vec!["ETHUSDT".to_string()]);
+
+        let guard = state.lock().expect("lock state");
+        assert!(guard
+            .positions
+            .get(&("ETHUSDT".to_string(), "BOTH".to_string()))
+            .is_none());
+        assert_eq!(guard.available_balance, Some(95.0));
+        assert!(guard
+            .flattened_at
+            .contains_key(&("ETHUSDT".to_string(), "BOTH".to_string())));
+    }
+
+    #[test]
+    fn account_update_clears_flatten_marker_after_position_reopens() {
+        let state = Arc::new(Mutex::new(AccountWsState {
+            has_account_update: true,
+            total_wallet_balance: Some(100.0),
+            available_balance: Some(90.0),
+            positions: HashMap::from([(
+                ("ETHUSDT".to_string(), "LONG".to_string()),
+                ActivePositionSnapshot {
+                    position_side: "LONG".to_string(),
+                    position_amt: 0.25,
+                    entry_price: 2200.0,
+                    mark_price: 2190.0,
+                    unrealized_pnl: 2.5,
+                    leverage: 10,
+                },
+            )]),
+            flattened_at: HashMap::new(),
+        }));
+        let flatten_payload = json!({
+            "e": "ACCOUNT_UPDATE",
+            "a": {
+                "P": [{"s": "ETHUSDT", "ps": "LONG", "pa": "0", "ep": "0", "up": "0"}]
+            }
+        });
+        let reopen_payload = json!({
+            "e": "ACCOUNT_UPDATE",
+            "a": {
+                "P": [{"s": "ETHUSDT", "ps": "LONG", "pa": "0.30", "ep": "2210", "up": "3.0"}]
+            }
+        });
+
+        let flattened = apply_account_update_event(&flatten_payload, &state);
+        assert_eq!(flattened, vec!["ETHUSDT".to_string()]);
+        let reopened = apply_account_update_event(&reopen_payload, &state);
+        assert!(reopened.is_empty());
+
+        let guard = state.lock().expect("lock state");
+        assert!(!guard
+            .flattened_at
+            .contains_key(&("ETHUSDT".to_string(), "LONG".to_string())));
+        assert_eq!(
+            guard
+                .positions
+                .get(&("ETHUSDT".to_string(), "LONG".to_string()))
+                .map(|position| position.position_amt),
+            Some(0.30)
+        );
+    }
+
+    #[test]
+    fn orphan_exit_cleanup_collects_only_flattened_hedge_side_orders() {
+        let state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: true,
+            active_positions: vec![ActivePositionSnapshot {
+                position_side: "SHORT".to_string(),
+                position_amt: -0.18,
+                entry_price: 2200.0,
+                mark_price: 2194.0,
+                unrealized_pnl: 1.08,
+                leverage: 8,
+            }],
+            open_orders: vec![
+                OpenOrderSnapshot {
+                    order_id: 201,
+                    side: "SELL".to_string(),
+                    position_side: "LONG".to_string(),
+                    order_type: "TAKE_PROFIT_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.12,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2235.0,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: false,
+                },
+                OpenOrderSnapshot {
+                    order_id: 202,
+                    side: "SELL".to_string(),
+                    position_side: "LONG".to_string(),
+                    order_type: "STOP_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.12,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2178.0,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: true,
+                },
+                OpenOrderSnapshot {
+                    order_id: 203,
+                    side: "BUY".to_string(),
+                    position_side: "SHORT".to_string(),
+                    order_type: "TAKE_PROFIT_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.18,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2162.0,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: false,
+                },
+                OpenOrderSnapshot {
+                    order_id: 204,
+                    side: "BUY".to_string(),
+                    position_side: "SHORT".to_string(),
+                    order_type: "STOP_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.18,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2219.0,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: true,
+                },
+                OpenOrderSnapshot {
+                    order_id: 205,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "STOP_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.18,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2221.0,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: true,
+                },
+            ],
+            total_wallet_balance: 100.0,
+            available_balance: 90.0,
+        };
+
+        let orphan_orders = collect_orphan_exit_orders_to_cancel(&state, true);
+        assert_eq!(orphan_orders.len(), 2);
+        assert_eq!(orphan_orders[0].order_id, 201);
+        assert!(!orphan_orders[0].is_algo_order);
+        assert_eq!(orphan_orders[1].order_id, 202);
+        assert!(orphan_orders[1].is_algo_order);
+    }
+
+    #[test]
+    fn orphan_exit_cleanup_skips_side_when_pending_entry_still_exists() {
+        let state = TradingStateSnapshot {
+            symbol: "ETHUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: true,
+            has_open_orders: true,
+            active_positions: vec![ActivePositionSnapshot {
+                position_side: "SHORT".to_string(),
+                position_amt: -0.18,
+                entry_price: 2200.0,
+                mark_price: 2194.0,
+                unrealized_pnl: 1.08,
+                leverage: 8,
+            }],
+            open_orders: vec![
+                OpenOrderSnapshot {
+                    order_id: 301,
+                    side: "BUY".to_string(),
+                    position_side: "LONG".to_string(),
+                    order_type: "LIMIT".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.11,
+                    executed_qty: 0.0,
+                    price: 2189.0,
+                    stop_price: 0.0,
+                    close_position: false,
+                    reduce_only: false,
+                    is_algo_order: false,
+                },
+                OpenOrderSnapshot {
+                    order_id: 302,
+                    side: "SELL".to_string(),
+                    position_side: "LONG".to_string(),
+                    order_type: "TAKE_PROFIT_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.11,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2235.0,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: false,
+                },
+                OpenOrderSnapshot {
+                    order_id: 303,
+                    side: "SELL".to_string(),
+                    position_side: "LONG".to_string(),
+                    order_type: "STOP_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.11,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2178.0,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: true,
+                },
+            ],
+            total_wallet_balance: 100.0,
+            available_balance: 90.0,
+        };
+
+        let orphan_orders = collect_orphan_exit_orders_to_cancel(&state, true);
+        assert!(orphan_orders.is_empty());
+    }
+
+    #[test]
+    fn find_live_exit_trigger_price_recovers_reduce_only_limit_tp_and_sl_by_side() {
+        let open_orders = vec![
+            OpenOrderSnapshot {
+                order_id: 401,
+                side: "SELL".to_string(),
+                position_side: "BOTH".to_string(),
+                order_type: "LIMIT".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.1,
+                executed_qty: 0.0,
+                price: 2235.0,
+                stop_price: 0.0,
+                close_position: false,
+                reduce_only: true,
+                is_algo_order: false,
+            },
+            OpenOrderSnapshot {
+                order_id: 402,
+                side: "SELL".to_string(),
+                position_side: "BOTH".to_string(),
+                order_type: "CONDITIONAL".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.1,
+                executed_qty: 0.0,
+                price: 0.0,
+                stop_price: 2178.0,
+                close_position: false,
+                reduce_only: true,
+                is_algo_order: true,
+            },
+        ];
+
+        assert_eq!(
+            find_live_exit_trigger_price(
+                &open_orders,
+                "LONG",
+                true,
+                Some(2200.0),
+                ExitKind::TakeProfit,
+            ),
+            Some(2235.0)
+        );
+        assert_eq!(
+            find_live_exit_trigger_price(
+                &open_orders,
+                "LONG",
+                true,
+                Some(2200.0),
+                ExitKind::StopLoss,
+            ),
+            Some(2178.0)
+        );
+    }
+
+    #[test]
+    fn find_live_exit_trigger_price_recovers_pending_maker_tp_stop_limit_from_limit_price() {
+        let open_orders = vec![
+            OpenOrderSnapshot {
+                order_id: 411,
+                side: "SELL".to_string(),
+                position_side: "LONG".to_string(),
+                order_type: "STOP".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.1,
+                executed_qty: 0.0,
+                price: 2235.0,
+                stop_price: 2200.0,
+                close_position: false,
+                reduce_only: true,
+                is_algo_order: true,
+            },
+            OpenOrderSnapshot {
+                order_id: 412,
+                side: "SELL".to_string(),
+                position_side: "LONG".to_string(),
+                order_type: "STOP_MARKET".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.1,
+                executed_qty: 0.0,
+                price: 0.0,
+                stop_price: 2178.0,
+                close_position: true,
+                reduce_only: true,
+                is_algo_order: true,
+            },
+        ];
+
+        assert_eq!(
+            find_live_exit_trigger_price(
+                &open_orders,
+                "LONG",
+                true,
+                Some(2200.0),
+                ExitKind::TakeProfit,
+            ),
+            Some(2235.0)
+        );
+        assert_eq!(
+            find_live_exit_trigger_price(
+                &open_orders,
+                "LONG",
+                true,
+                Some(2200.0),
+                ExitKind::StopLoss,
+            ),
+            Some(2178.0)
+        );
+    }
+
+    #[test]
+    fn collect_pending_context_orders_for_side_uses_inferred_hedge_direction() {
+        let open_orders = vec![
+            OpenOrderSnapshot {
+                order_id: 421,
+                side: "BUY".to_string(),
+                position_side: "BOTH".to_string(),
+                order_type: "LIMIT".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.1,
+                executed_qty: 0.0,
+                price: 2200.0,
+                stop_price: 0.0,
+                close_position: false,
+                reduce_only: false,
+                is_algo_order: false,
+            },
+            OpenOrderSnapshot {
+                order_id: 422,
+                side: "SELL".to_string(),
+                position_side: "BOTH".to_string(),
+                order_type: "STOP".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.1,
+                executed_qty: 0.0,
+                price: 2235.0,
+                stop_price: 2200.0,
+                close_position: false,
+                reduce_only: true,
+                is_algo_order: true,
+            },
+            OpenOrderSnapshot {
+                order_id: 423,
+                side: "SELL".to_string(),
+                position_side: "BOTH".to_string(),
+                order_type: "LIMIT".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.1,
+                executed_qty: 0.0,
+                price: 2205.0,
+                stop_price: 0.0,
+                close_position: false,
+                reduce_only: false,
+                is_algo_order: false,
+            },
+            OpenOrderSnapshot {
+                order_id: 424,
+                side: "BUY".to_string(),
+                position_side: "BOTH".to_string(),
+                order_type: "STOP_MARKET".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.1,
+                executed_qty: 0.0,
+                price: 0.0,
+                stop_price: 2219.0,
+                close_position: true,
+                reduce_only: true,
+                is_algo_order: true,
+            },
+        ];
+
+        let long_orders = collect_pending_context_orders_for_side(&open_orders, "LONG", true);
+        let short_orders = collect_pending_context_orders_for_side(&open_orders, "SHORT", true);
+
+        assert_eq!(
+            long_orders
+                .iter()
+                .map(|order| order.order_id)
+                .collect::<Vec<_>>(),
+            vec![421, 422]
+        );
+        assert_eq!(
+            short_orders
+                .iter()
+                .map(|order| order.order_id)
+                .collect::<Vec<_>>(),
+            vec![423, 424]
+        );
     }
 
     #[test]
