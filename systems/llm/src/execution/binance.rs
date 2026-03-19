@@ -22,6 +22,8 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 const ACCOUNT_WS_RECONNECT_DELAY_SECS: u64 = 3;
+const ACCOUNT_WS_LOG_VALUE_PREVIEW_CHARS: usize = 240;
+const ACCOUNT_WS_POSITION_SUMMARY_LIMIT: usize = 4;
 const POST_ONLY_MAKER_REPRICE_RETRY_COUNT: usize = 3;
 static ACCOUNT_WS_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 static ACCOUNT_WS_STATE: OnceLock<Arc<Mutex<AccountWsState>>> = OnceLock::new();
@@ -444,20 +446,47 @@ async fn run_account_ws_listener_loop(
     exec_config: LlmExecutionConfig,
     state: Arc<Mutex<AccountWsState>>,
 ) {
+    let mut connection_attempt: u64 = 0;
     loop {
+        connection_attempt += 1;
+        info!(
+            connection_attempt = connection_attempt,
+            reconnect_delay_secs = ACCOUNT_WS_RECONNECT_DELAY_SECS,
+            "account ws listener: establishing user stream connection"
+        );
         let listen_key = match create_user_data_listen_key(&http_client, &api_config).await {
             Ok(v) => v,
             Err(err) => {
-                warn!(error = %err, "account ws listener: create listenKey failed");
+                warn!(
+                    connection_attempt = connection_attempt,
+                    error = %err,
+                    reconnect_delay_secs = ACCOUNT_WS_RECONNECT_DELAY_SECS,
+                    "account ws listener: create listenKey failed"
+                );
                 sleep(Duration::from_secs(ACCOUNT_WS_RECONNECT_DELAY_SECS)).await;
                 continue;
             }
         };
+        info!(
+            connection_attempt = connection_attempt,
+            listen_key = %redact_secret_for_log(&listen_key),
+            "account ws listener: listenKey created"
+        );
         let ws_url = match build_futures_user_stream_ws_url(&api_config, &listen_key) {
             Ok(v) => v,
             Err(err) => {
-                warn!(error = %err, "account ws listener: build ws url failed");
-                let _ = delete_user_data_listen_key(&http_client, &api_config, &listen_key).await;
+                warn!(
+                    connection_attempt = connection_attempt,
+                    listen_key = %redact_secret_for_log(&listen_key),
+                    error = %err,
+                    reconnect_delay_secs = ACCOUNT_WS_RECONNECT_DELAY_SECS,
+                    "account ws listener: build ws url failed"
+                );
+                log_listen_key_delete_result(
+                    connection_attempt,
+                    &listen_key,
+                    delete_user_data_listen_key(&http_client, &api_config, &listen_key).await,
+                );
                 sleep(Duration::from_secs(ACCOUNT_WS_RECONNECT_DELAY_SECS)).await;
                 continue;
             }
@@ -467,52 +496,342 @@ async fn run_account_ws_listener_loop(
         let (mut ws_stream, _) = match ws_conn {
             Ok(v) => v,
             Err(err) => {
-                warn!(error = %err, "account ws listener: connect failed");
-                let _ = delete_user_data_listen_key(&http_client, &api_config, &listen_key).await;
+                warn!(
+                    connection_attempt = connection_attempt,
+                    listen_key = %redact_secret_for_log(&listen_key),
+                    error = %err,
+                    reconnect_delay_secs = ACCOUNT_WS_RECONNECT_DELAY_SECS,
+                    "account ws listener: connect failed"
+                );
+                log_listen_key_delete_result(
+                    connection_attempt,
+                    &listen_key,
+                    delete_user_data_listen_key(&http_client, &api_config, &listen_key).await,
+                );
                 sleep(Duration::from_secs(ACCOUNT_WS_RECONNECT_DELAY_SECS)).await;
                 continue;
             }
         };
+        info!(
+            connection_attempt = connection_attempt,
+            listen_key = %redact_secret_for_log(&listen_key),
+            "account ws listener: websocket connected"
+        );
 
+        let mut message_index: u64 = 0;
         loop {
             let next = ws_stream.next().await;
             let Some(frame) = next else {
+                warn!(
+                    connection_attempt = connection_attempt,
+                    message_index = message_index,
+                    listen_key = %redact_secret_for_log(&listen_key),
+                    reconnect_delay_secs = ACCOUNT_WS_RECONNECT_DELAY_SECS,
+                    "account ws listener: stream ended unexpectedly"
+                );
                 break;
             };
             let Ok(msg) = frame else {
+                let err = frame.err().expect("frame error available");
+                warn!(
+                    connection_attempt = connection_attempt,
+                    message_index = message_index,
+                    listen_key = %redact_secret_for_log(&listen_key),
+                    error = %err,
+                    reconnect_delay_secs = ACCOUNT_WS_RECONNECT_DELAY_SECS,
+                    "account ws listener: frame read failed"
+                );
                 break;
             };
-            let Some(text) = ws_message_text(msg) else {
-                continue;
-            };
-            let Ok(payload) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            let flattened_symbols = apply_account_update_event(&payload, &state);
-            for symbol in flattened_symbols {
-                let client = http_client.clone();
-                let api = api_config.clone();
-                let exec = exec_config.clone();
-                tokio::spawn(async move {
-                    match cleanup_orphan_exit_orders_for_symbol(&client, &api, &exec, &symbol).await
-                    {
-                        Ok(true) => info!(
-                            symbol = %symbol,
-                            "account_update_cleanup: canceled orphan exit orders after flatten"
-                        ),
-                        Ok(false) => {}
-                        Err(err) => warn!(
-                            symbol = %symbol,
-                            error = %err,
-                            "account_update_cleanup: failed to cancel orphan exit orders after flatten"
-                        ),
+            message_index += 1;
+            let text = match msg {
+                Message::Text(t) => t.to_string(),
+                Message::Binary(b) => match String::from_utf8(b.to_vec()) {
+                    Ok(text) => {
+                        info!(
+                            connection_attempt = connection_attempt,
+                            message_index = message_index,
+                            byte_len = b.len(),
+                            "account ws listener: decoded binary websocket frame as utf8 text"
+                        );
+                        text
                     }
-                });
+                    Err(err) => {
+                        warn!(
+                            connection_attempt = connection_attempt,
+                            message_index = message_index,
+                            byte_len = b.len(),
+                            error = %err,
+                            "account ws listener: ignored non-utf8 binary websocket frame"
+                        );
+                        continue;
+                    }
+                },
+                Message::Close(frame) => {
+                    info!(
+                        connection_attempt = connection_attempt,
+                        message_index = message_index,
+                        close_code = frame
+                            .as_ref()
+                            .map(|value| u16::from(value.code))
+                            .unwrap_or_default(),
+                        close_reason = frame
+                            .as_ref()
+                            .map(|value| value.reason.to_string())
+                            .unwrap_or_default(),
+                        reconnect_delay_secs = ACCOUNT_WS_RECONNECT_DELAY_SECS,
+                        "account ws listener: close frame received"
+                    );
+                    break;
+                }
+                Message::Ping(_) | Message::Pong(_) => continue,
+                _ => {
+                    info!(
+                        connection_attempt = connection_attempt,
+                        message_index = message_index,
+                        "account ws listener: ignored unsupported websocket frame"
+                    );
+                    continue;
+                }
+            };
+            let payload = match serde_json::from_str::<Value>(&text) {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        connection_attempt = connection_attempt,
+                        message_index = message_index,
+                        error = %err,
+                        payload_preview = %truncate_for_log(&text, ACCOUNT_WS_LOG_VALUE_PREVIEW_CHARS),
+                        "account ws listener: json decode failed"
+                    );
+                    continue;
+                }
+            };
+            let event_type = payload.get("e").and_then(Value::as_str).unwrap_or_default();
+            if event_type.is_empty() {
+                warn!(
+                    connection_attempt = connection_attempt,
+                    message_index = message_index,
+                    payload_preview = %truncate_for_log(&text, ACCOUNT_WS_LOG_VALUE_PREVIEW_CHARS),
+                    "account ws listener: websocket event missing type"
+                );
+                continue;
+            }
+            match event_type {
+                "ACCOUNT_UPDATE" => {
+                    let event_summary = summarize_account_update_event(&payload);
+                    let flattened_symbols = apply_account_update_event(&payload, &state);
+                    info!(
+                        connection_attempt = connection_attempt,
+                        message_index = message_index,
+                        event_type = event_type,
+                        flattened_symbols = %join_or_dash(&flattened_symbols),
+                        event_summary = %event_summary,
+                        "account ws listener: applied account update"
+                    );
+                    for symbol in flattened_symbols {
+                        let client = http_client.clone();
+                        let api = api_config.clone();
+                        let exec = exec_config.clone();
+                        tokio::spawn(async move {
+                            match cleanup_orphan_exit_orders_for_symbol(
+                                &client, &api, &exec, &symbol,
+                            )
+                            .await
+                            {
+                                Ok(true) => info!(
+                                    symbol = %symbol,
+                                    "account_update_cleanup: canceled orphan exit orders after flatten"
+                                ),
+                                Ok(false) => {}
+                                Err(err) => warn!(
+                                    symbol = %symbol,
+                                    error = %err,
+                                    "account_update_cleanup: failed to cancel orphan exit orders after flatten"
+                                ),
+                            }
+                        });
+                    }
+                }
+                "ORDER_TRADE_UPDATE" => {
+                    info!(
+                        connection_attempt = connection_attempt,
+                        message_index = message_index,
+                        event_type = event_type,
+                        event_summary = %summarize_order_trade_update_event(&payload),
+                        "account ws listener: observed order trade update"
+                    );
+                }
+                _ => {
+                    info!(
+                        connection_attempt = connection_attempt,
+                        message_index = message_index,
+                        event_type = event_type,
+                        event_summary = %truncate_for_log(
+                            &payload.to_string(),
+                            ACCOUNT_WS_LOG_VALUE_PREVIEW_CHARS,
+                        ),
+                        "account ws listener: ignored unsupported user-stream event"
+                    );
+                }
             }
         }
 
-        let _ = delete_user_data_listen_key(&http_client, &api_config, &listen_key).await;
+        log_listen_key_delete_result(
+            connection_attempt,
+            &listen_key,
+            delete_user_data_listen_key(&http_client, &api_config, &listen_key).await,
+        );
+        info!(
+            connection_attempt = connection_attempt,
+            reconnect_delay_secs = ACCOUNT_WS_RECONNECT_DELAY_SECS,
+            "account ws listener: reconnect scheduled"
+        );
         sleep(Duration::from_secs(ACCOUNT_WS_RECONNECT_DELAY_SECS)).await;
+    }
+}
+
+fn redact_secret_for_log(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= 8 {
+        return "*".repeat(chars.len().max(1));
+    }
+    let head = chars.iter().take(4).collect::<String>();
+    let tail = chars[chars.len().saturating_sub(4)..].iter().collect::<String>();
+    format!("{head}...{tail}")
+}
+
+fn truncate_for_log(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut out = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
+fn join_or_dash(values: &[String]) -> String {
+    if values.is_empty() {
+        "-".to_string()
+    } else {
+        values.join(",")
+    }
+}
+
+fn json_log_value(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(v)) => v.clone(),
+        Some(Value::Number(v)) => v.to_string(),
+        Some(Value::Bool(v)) => v.to_string(),
+        Some(Value::Null) | None => "-".to_string(),
+        Some(other) => truncate_for_log(&other.to_string(), ACCOUNT_WS_LOG_VALUE_PREVIEW_CHARS),
+    }
+}
+
+fn summarize_account_update_event(payload: &Value) -> String {
+    let Some(account_obj) = payload.get("a").and_then(Value::as_object) else {
+        return "missing_account_object=true".to_string();
+    };
+    let reason = account_obj
+        .get("m")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
+    let usdt_balance_summary = account_obj
+        .get("B")
+        .and_then(Value::as_array)
+        .and_then(|balances| {
+            balances.iter().find_map(|balance| {
+                let asset = balance.get("a").and_then(Value::as_str).unwrap_or_default();
+                if asset.eq_ignore_ascii_case("USDT") {
+                    Some(format!(
+                        "wb={} cw={}",
+                        json_log_value(balance.get("wb")),
+                        json_log_value(balance.get("cw"))
+                    ))
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| "-".to_string());
+    let positions = account_obj
+        .get("P")
+        .and_then(Value::as_array)
+        .map(|positions| {
+            let mut summaries = positions
+                .iter()
+                .take(ACCOUNT_WS_POSITION_SUMMARY_LIMIT)
+                .map(|position| {
+                    format!(
+                        "{}:{}:pa={}:ep={}:up={}",
+                        json_log_value(position.get("s")),
+                        json_log_value(position.get("ps")),
+                        json_log_value(position.get("pa")),
+                        json_log_value(position.get("ep")),
+                        json_log_value(position.get("up")),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if positions.len() > ACCOUNT_WS_POSITION_SUMMARY_LIMIT {
+                summaries.push(format!(
+                    "+{} more",
+                    positions.len() - ACCOUNT_WS_POSITION_SUMMARY_LIMIT
+                ));
+            }
+            summaries.join(",")
+        })
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "reason={} event_time={} usdt_balance={} positions=[{}]",
+        reason,
+        json_log_value(payload.get("E")),
+        usdt_balance_summary,
+        positions,
+    )
+}
+
+fn summarize_order_trade_update_event(payload: &Value) -> String {
+    let Some(order_obj) = payload.get("o").and_then(Value::as_object) else {
+        return format!(
+            "missing_order_object=true event_time={}",
+            json_log_value(payload.get("E"))
+        );
+    };
+    format!(
+        "event_time={} symbol={} order_id={} client_order_id={} side={} position_side={} order_type={} exec_type={} order_status={} last_fill_qty={} cum_fill_qty={} realized_pnl={} avg_price={}",
+        json_log_value(payload.get("E")),
+        json_log_value(order_obj.get("s")),
+        json_log_value(order_obj.get("i")),
+        json_log_value(order_obj.get("c")),
+        json_log_value(order_obj.get("S")),
+        json_log_value(order_obj.get("ps")),
+        json_log_value(order_obj.get("o")),
+        json_log_value(order_obj.get("x")),
+        json_log_value(order_obj.get("X")),
+        json_log_value(order_obj.get("l")),
+        json_log_value(order_obj.get("z")),
+        json_log_value(order_obj.get("rp")),
+        json_log_value(order_obj.get("ap")),
+    )
+}
+
+fn log_listen_key_delete_result(
+    connection_attempt: u64,
+    listen_key: &str,
+    result: Result<()>,
+) {
+    match result {
+        Ok(()) => info!(
+            connection_attempt = connection_attempt,
+            listen_key = %redact_secret_for_log(listen_key),
+            "account ws listener: listenKey deleted"
+        ),
+        Err(err) => warn!(
+            connection_attempt = connection_attempt,
+            listen_key = %redact_secret_for_log(listen_key),
+            error = %err,
+            "account ws listener: listenKey delete failed"
+        ),
     }
 }
 
@@ -3195,14 +3514,6 @@ async fn watch_staged_exit_orders(
             "staged_exit_cleanup: entry_gone_and_flat"
         );
         return;
-    }
-}
-
-fn ws_message_text(msg: Message) -> Option<String> {
-    match msg {
-        Message::Text(t) => Some(t.to_string()),
-        Message::Binary(b) => String::from_utf8(b.to_vec()).ok(),
-        _ => None,
     }
 }
 
