@@ -192,6 +192,12 @@ enum ExitKind {
     StopLoss,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivePositionSource {
+    AccountWs,
+    Rest,
+}
+
 fn strict_hedge_position_side(value: &str) -> Option<&'static str> {
     let raw = value.trim();
     if raw.eq_ignore_ascii_case("LONG") {
@@ -845,12 +851,30 @@ pub async fn fetch_symbol_trading_state(
     symbol: &str,
 ) -> Result<TradingStateSnapshot> {
     let account_balance = fetch_account_balance(http_client, api_config, exec_config).await?;
-    let active_positions =
-        fetch_active_positions(http_client, api_config, exec_config, symbol).await?;
+    let (mut active_positions, active_position_source) =
+        fetch_active_positions_with_source(http_client, api_config, exec_config, symbol).await?;
     let mut open_orders = fetch_open_orders(http_client, api_config, exec_config, symbol).await?;
     let mut open_algo_orders =
         fetch_open_algo_orders(http_client, api_config, exec_config, symbol).await?;
     open_orders.append(&mut open_algo_orders);
+    if should_reconcile_ws_positions_with_rest(
+        active_position_source,
+        &active_positions,
+        &open_orders,
+    ) {
+        let ws_position_count = active_positions.len();
+        let rest_positions =
+            fetch_active_positions_from_rest(http_client, api_config, exec_config, symbol).await?;
+        if rest_positions.len() != ws_position_count {
+            info!(
+                symbol = %symbol,
+                ws_position_count = ws_position_count,
+                rest_position_count = rest_positions.len(),
+                "reconciled account-ws position snapshot against rest because no exit orders were open"
+            );
+        }
+        active_positions = rest_positions;
+    }
     let has_active_positions = !active_positions.is_empty();
     let has_open_orders = !open_orders.is_empty();
     Ok(TradingStateSnapshot {
@@ -2743,12 +2767,12 @@ async fn fetch_account_balance(
     })
 }
 
-async fn fetch_active_positions(
+async fn fetch_active_positions_with_source(
     http_client: &Client,
     api_config: &BinanceApiConfig,
     exec_config: &LlmExecutionConfig,
     symbol: &str,
-) -> Result<Vec<ActivePositionSnapshot>> {
+) -> Result<(Vec<ActivePositionSnapshot>, ActivePositionSource)> {
     ensure_account_ws_listener_started(http_client, api_config, exec_config);
     if let Ok(guard) = account_ws_state().lock() {
         if guard.has_account_update {
@@ -2758,11 +2782,13 @@ async fn fetch_active_positions(
                     out.push(pos.clone());
                 }
             }
-            return Ok(out);
+            return Ok((out, ActivePositionSource::AccountWs));
         }
     }
 
-    fetch_active_positions_from_rest(http_client, api_config, exec_config, symbol).await
+    fetch_active_positions_from_rest(http_client, api_config, exec_config, symbol)
+        .await
+        .map(|positions| (positions, ActivePositionSource::Rest))
 }
 
 async fn fetch_active_positions_from_rest(
@@ -2824,6 +2850,16 @@ fn sync_account_ws_positions_from_rest(symbol: &str, positions: &[ActivePosition
         guard.flattened_at.remove(&key);
         guard.positions.insert(key, position.clone());
     }
+}
+
+fn should_reconcile_ws_positions_with_rest(
+    source: ActivePositionSource,
+    active_positions: &[ActivePositionSnapshot],
+    open_orders: &[OpenOrderSnapshot],
+) -> bool {
+    matches!(source, ActivePositionSource::AccountWs)
+        && !active_positions.is_empty()
+        && open_orders.is_empty()
 }
 
 async fn is_position_side_flat_on_rest(
@@ -4674,6 +4710,47 @@ mod tests {
 
         let orphan_orders = collect_orphan_exit_orders_to_cancel(&state, true);
         assert!(orphan_orders.is_empty());
+    }
+
+    #[test]
+    fn ws_positions_without_open_orders_require_rest_reconciliation() {
+        let active_positions = vec![ActivePositionSnapshot {
+            position_side: "BOTH".to_string(),
+            position_amt: -0.07,
+            entry_price: 2193.07,
+            mark_price: 2161.55,
+            unrealized_pnl: 2.21,
+            leverage: 1,
+        }];
+
+        assert!(should_reconcile_ws_positions_with_rest(
+            ActivePositionSource::AccountWs,
+            &active_positions,
+            &[],
+        ));
+        assert!(!should_reconcile_ws_positions_with_rest(
+            ActivePositionSource::Rest,
+            &active_positions,
+            &[],
+        ));
+        assert!(!should_reconcile_ws_positions_with_rest(
+            ActivePositionSource::AccountWs,
+            &active_positions,
+            &[OpenOrderSnapshot {
+                order_id: 501,
+                side: "BUY".to_string(),
+                position_side: "BOTH".to_string(),
+                order_type: "TAKE_PROFIT_MARKET".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.07,
+                executed_qty: 0.0,
+                price: 0.0,
+                stop_price: 2144.0,
+                close_position: true,
+                reduce_only: true,
+                is_algo_order: true,
+            }],
+        ));
     }
 
     #[test]
