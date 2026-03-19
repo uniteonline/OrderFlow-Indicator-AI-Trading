@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 const ACCOUNT_WS_RECONNECT_DELAY_SECS: u64 = 3;
+const POST_ONLY_MAKER_REPRICE_RETRY_COUNT: usize = 3;
 static ACCOUNT_WS_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
 static ACCOUNT_WS_STATE: OnceLock<Arc<Mutex<AccountWsState>>> = OnceLock::new();
 
@@ -3636,7 +3637,7 @@ async fn place_limit_post_only_order_with_side(
     position_side: &str,
     quantity: &str,
     price: &str,
-    _tick_size: f64,
+    tick_size: f64,
     price_precision: usize,
     allow_taker_fallback: bool,
     order_id_prefix: &str,
@@ -3644,78 +3645,186 @@ async fn place_limit_post_only_order_with_side(
     let current_price = price
         .parse::<f64>()
         .with_context(|| format!("invalid post-only price: {}", price))?;
-    let price_text = format_decimal(current_price, price_precision);
-    let response: Result<FuturesOrderResponse> = signed_post_json(
+    let attempt_prices = build_post_only_attempt_prices(
+        current_price,
+        side,
+        tick_size,
+        price_precision,
+        POST_ONLY_MAKER_REPRICE_RETRY_COUNT,
+    )?;
+    let attempted_prices = attempt_prices
+        .iter()
+        .map(|attempt_price| format_decimal(*attempt_price, price_precision))
+        .collect::<Vec<_>>();
+    let mut last_post_only_reject = None;
+
+    for (attempt_idx, attempt_price) in attempt_prices.iter().enumerate() {
+        let price_text = format_decimal(*attempt_price, price_precision);
+        let response: Result<FuturesOrderResponse> = signed_post_json(
+            http_client,
+            api_config,
+            exec_config,
+            "/fapi/v1/order",
+            vec![
+                ("symbol".to_string(), symbol.to_string()),
+                ("side".to_string(), side.to_string()),
+                ("positionSide".to_string(), position_side.to_string()),
+                ("type".to_string(), "LIMIT".to_string()),
+                ("timeInForce".to_string(), "GTX".to_string()),
+                ("quantity".to_string(), quantity.to_string()),
+                ("price".to_string(), price_text.clone()),
+                (
+                    "newClientOrderId".to_string(),
+                    build_client_order_id(order_id_prefix),
+                ),
+            ],
+        )
+        .await;
+
+        match response {
+            Ok(ok) => {
+                if attempt_idx > 0 {
+                    info!(
+                        symbol = %symbol,
+                        side = %side,
+                        position_side = %position_side,
+                        quantity = %quantity,
+                        price = %price_text,
+                        attempt = attempt_idx + 1,
+                        total_attempts = attempted_prices.len(),
+                        "post-only maker order accepted after repricing retry"
+                    );
+                }
+                return Ok(ok.order_id);
+            }
+            Err(err) => {
+                if !is_post_only_reject_error(&err) {
+                    return Err(err);
+                }
+                last_post_only_reject = Some(err);
+
+                if attempt_idx + 1 < attempt_prices.len() {
+                    let next_price_text = &attempted_prices[attempt_idx + 1];
+                    warn!(
+                        symbol = %symbol,
+                        side = %side,
+                        position_side = %position_side,
+                        quantity = %quantity,
+                        rejected_price = %price_text,
+                        next_price = %next_price_text,
+                        attempt = attempt_idx + 1,
+                        total_attempts = attempted_prices.len(),
+                        "post-only rejected with -5022; repricing maker order by 1 tick away from market"
+                    );
+                    continue;
+                }
+            }
+        }
+    }
+
+    let err = last_post_only_reject
+        .expect("post-only retry loop should return or capture the final -5022 rejection");
+    let latest_book_ticker = fetch_book_ticker(http_client, api_config, symbol)
+        .await
+        .ok();
+    let attempts_context = format!(
+        "attempted_prices=[{}] retries={}",
+        attempted_prices.join(","),
+        POST_ONLY_MAKER_REPRICE_RETRY_COUNT
+    );
+
+    if !allow_taker_fallback {
+        let context = if let Some(book) = latest_book_ticker.as_ref() {
+            format!(
+                "post-only rejected with -5022 after repricing maker {} and taker fallback is disabled while synchronized exits are required. latest bid={} ask={}",
+                attempts_context, book.bid_price, book.ask_price
+            )
+        } else {
+            format!(
+                "post-only rejected with -5022 after repricing maker {} and taker fallback is disabled while synchronized exits are required. latest bookTicker unavailable",
+                attempts_context
+            )
+        };
+        return Err(err).with_context(|| context);
+    }
+
+    let fallback_context = if let Some(book) = latest_book_ticker.as_ref() {
+        format!(
+            "post-only rejected with -5022 after repricing maker {}, fallback to taker. latest bid={} ask={}",
+            attempts_context, book.bid_price, book.ask_price
+        )
+    } else {
+        format!(
+            "post-only rejected with -5022 after repricing maker {}, fallback to taker. latest bookTicker unavailable",
+            attempts_context
+        )
+    };
+    let taker_order_prefix = format!("{}-taker", order_id_prefix);
+    place_market_order_with_side(
         http_client,
         api_config,
         exec_config,
-        "/fapi/v1/order",
-        vec![
-            ("symbol".to_string(), symbol.to_string()),
-            ("side".to_string(), side.to_string()),
-            ("positionSide".to_string(), position_side.to_string()),
-            ("type".to_string(), "LIMIT".to_string()),
-            ("timeInForce".to_string(), "GTX".to_string()),
-            ("quantity".to_string(), quantity.to_string()),
-            ("price".to_string(), price_text),
-            (
-                "newClientOrderId".to_string(),
-                build_client_order_id(order_id_prefix),
-            ),
-        ],
+        symbol,
+        side,
+        position_side,
+        quantity,
+        &taker_order_prefix,
     )
-    .await;
+    .await
+    .with_context(|| fallback_context)
+}
 
-    match response {
-        Ok(ok) => Ok(ok.order_id),
-        Err(err) => {
-            if !is_post_only_reject_error(&err) {
-                return Err(err);
-            }
-
-            if !allow_taker_fallback {
-                let latest_book_ticker = fetch_book_ticker(http_client, api_config, symbol)
-                    .await
-                    .ok();
-                let context = if let Some(book) = latest_book_ticker.as_ref() {
-                    format!(
-                        "post-only rejected with -5022 and taker fallback is disabled while synchronized exits are required. latest bid={} ask={}",
-                        book.bid_price, book.ask_price
-                    )
-                } else {
-                    "post-only rejected with -5022 and taker fallback is disabled while synchronized exits are required. latest bookTicker unavailable"
-                        .to_string()
-                };
-                return Err(err).with_context(|| context);
-            }
-
-            let latest_book_ticker = fetch_book_ticker(http_client, api_config, symbol)
-                .await
-                .ok();
-            let fallback_context = if let Some(book) = latest_book_ticker.as_ref() {
-                format!(
-                    "post-only rejected with -5022, fallback to taker. latest bid={} ask={}",
-                    book.bid_price, book.ask_price
-                )
-            } else {
-                "post-only rejected with -5022, fallback to taker. latest bookTicker unavailable"
-                    .to_string()
-            };
-            let taker_order_prefix = format!("{}-taker", order_id_prefix);
-            place_market_order_with_side(
-                http_client,
-                api_config,
-                exec_config,
-                symbol,
-                side,
-                position_side,
-                quantity,
-                &taker_order_prefix,
-            )
-            .await
-            .with_context(|| fallback_context)
-        }
+fn build_post_only_attempt_prices(
+    initial_price: f64,
+    side: &str,
+    tick_size: f64,
+    price_precision: usize,
+    retry_count: usize,
+) -> Result<Vec<f64>> {
+    if tick_size <= 0.0 {
+        return Err(anyhow!(
+            "tick size must be positive for post-only repricing"
+        ));
     }
+
+    let mut prices = Vec::with_capacity(retry_count + 1);
+    let mut current_price = normalize_post_only_retry_price(initial_price, price_precision)?;
+    prices.push(current_price);
+
+    for _ in 0..retry_count {
+        current_price = shift_post_only_price_away_from_market(
+            current_price,
+            side,
+            tick_size,
+            price_precision,
+        )?;
+        prices.push(current_price);
+    }
+
+    Ok(prices)
+}
+
+fn shift_post_only_price_away_from_market(
+    current_price: f64,
+    side: &str,
+    tick_size: f64,
+    price_precision: usize,
+) -> Result<f64> {
+    let shifted = if side.eq_ignore_ascii_case("SELL") {
+        current_price + tick_size
+    } else if side.eq_ignore_ascii_case("BUY") {
+        (current_price - tick_size).max(tick_size)
+    } else {
+        return Err(anyhow!("unsupported side {} for post-only repricing", side));
+    };
+    normalize_post_only_retry_price(shifted, price_precision)
+}
+
+fn normalize_post_only_retry_price(price: f64, price_precision: usize) -> Result<f64> {
+    let normalized_text = format_decimal(price, price_precision);
+    normalized_text
+        .parse::<f64>()
+        .with_context(|| format!("invalid post-only retry price: {}", normalized_text))
 }
 
 fn is_post_only_reject_error(err: &anyhow::Error) -> bool {
@@ -4940,5 +5049,41 @@ mod tests {
     fn format_exit_quantity_rounds_down_to_step() {
         let qty = format_exit_quantity(0.01234, 0.001, 3).expect("format qty");
         assert_eq!(qty, "0.012");
+    }
+
+    #[test]
+    fn build_post_only_attempt_prices_moves_short_away_from_market_each_retry() {
+        let prices =
+            build_post_only_attempt_prices(2196.31, "SELL", 0.1, 2, 3).expect("short retry prices");
+        let formatted = prices
+            .iter()
+            .map(|price| format_decimal(*price, 2))
+            .collect::<Vec<_>>();
+
+        assert_eq!(formatted, vec!["2196.31", "2196.41", "2196.51", "2196.61"]);
+    }
+
+    #[test]
+    fn build_post_only_attempt_prices_moves_long_away_from_market_each_retry() {
+        let prices =
+            build_post_only_attempt_prices(2196.31, "BUY", 0.1, 2, 3).expect("long retry prices");
+        let formatted = prices
+            .iter()
+            .map(|price| format_decimal(*price, 2))
+            .collect::<Vec<_>>();
+
+        assert_eq!(formatted, vec!["2196.31", "2196.21", "2196.11", "2196.01"]);
+    }
+
+    #[test]
+    fn build_post_only_attempt_prices_clamps_long_retries_at_tick_size_floor() {
+        let prices =
+            build_post_only_attempt_prices(0.15, "BUY", 0.1, 2, 3).expect("clamped long prices");
+        let formatted = prices
+            .iter()
+            .map(|price| format_decimal(*price, 2))
+            .collect::<Vec<_>>();
+
+        assert_eq!(formatted, vec!["0.15", "0.10", "0.10", "0.10"]);
     }
 }
