@@ -1627,49 +1627,73 @@ fn build_pending_order_summary_for_llm(
         }
     };
     let quantity = (order.orig_qty - order.executed_qty).max(0.0);
+    let live_entry_price = if order.price > 0.0 {
+        Some(order.price)
+    } else {
+        position_context.and_then(|ctx| ctx.effective_entry_price)
+    };
+    let live_tp_price = find_live_exit_trigger_price(
+        &state.open_orders,
+        &position_side,
+        live_entry_price,
+        ExitKind::TakeProfit,
+    );
+    let live_sl_price = find_live_exit_trigger_price(
+        &state.open_orders,
+        &position_side,
+        live_entry_price,
+        ExitKind::StopLoss,
+    );
+    let (planned_tp_price, planned_tp_source) =
+        pending_order_shadow_exit_price(position_context, ExitKind::TakeProfit);
+    let (planned_sl_price, planned_sl_source) =
+        pending_order_shadow_exit_price(position_context, ExitKind::StopLoss);
     Some(PendingOrderSummaryForLlm {
         position_side: position_side.clone(),
         direction,
         quantity,
         leverage: position_context.and_then(|ctx| ctx.effective_leverage),
-        entry_price: if order.price > 0.0 {
-            Some(order.price)
-        } else {
-            position_context.and_then(|ctx| ctx.effective_entry_price)
-        },
-        current_tp_price: find_live_exit_trigger_price(
-            &state.open_orders,
-            &position_side,
-            if order.price > 0.0 {
-                Some(order.price)
-            } else {
-                position_context.and_then(|ctx| ctx.effective_entry_price)
-            },
-            ExitKind::TakeProfit,
-        )
-        .or_else(|| position_context.and_then(|ctx| ctx.effective_take_profit))
-        .or_else(|| {
-            position_context
-                .and_then(|ctx| ctx.entry_context.as_ref())
-                .and_then(|ctx| ctx.original_tp)
-        }),
-        current_sl_price: find_live_exit_trigger_price(
-            &state.open_orders,
-            &position_side,
-            if order.price > 0.0 {
-                Some(order.price)
-            } else {
-                position_context.and_then(|ctx| ctx.effective_entry_price)
-            },
-            ExitKind::StopLoss,
-        )
-        .or_else(|| position_context.and_then(|ctx| ctx.effective_stop_loss))
-        .or_else(|| {
-            position_context
-                .and_then(|ctx| ctx.entry_context.as_ref())
-                .and_then(|ctx| ctx.original_sl)
-        }),
+        entry_price: live_entry_price,
+        current_tp_price: live_tp_price,
+        current_sl_price: live_sl_price,
+        planned_tp_price,
+        planned_tp_source: planned_tp_source.map(str::to_string),
+        planned_sl_price,
+        planned_sl_source: planned_sl_source.map(str::to_string),
     })
+}
+
+fn pending_order_shadow_exit_price(
+    position_context: Option<&PositionContextForLlm>,
+    exit_kind: ExitKind,
+) -> (Option<f64>, Option<&'static str>) {
+    let Some(context) = position_context else {
+        return (None, None);
+    };
+    match exit_kind {
+        ExitKind::TakeProfit => context
+            .effective_take_profit
+            .map(|price| (Some(price), Some("effective_context")))
+            .or_else(|| {
+                context
+                    .entry_context
+                    .as_ref()
+                    .and_then(|entry| entry.original_tp)
+                    .map(|price| (Some(price), Some("original_entry_context")))
+            })
+            .unwrap_or((None, None)),
+        ExitKind::StopLoss => context
+            .effective_stop_loss
+            .map(|price| (Some(price), Some("effective_context")))
+            .or_else(|| {
+                context
+                    .entry_context
+                    .as_ref()
+                    .and_then(|entry| entry.original_sl)
+                    .map(|price| (Some(price), Some("original_entry_context")))
+            })
+            .unwrap_or((None, None)),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3939,12 +3963,15 @@ async fn invoke_bundle_models(
                 )
                 .await;
                 println!(
-                    "LLM_PENDING_ORDER_MANAGEMENT ts_bucket={} trigger={} symbol={} model={} action={} new_entry=- new_tp=- new_sl=- dry_run={} open_order_count={} canceled_open_orders=false replacement_order_id=- reason={}",
+                    "LLM_PENDING_ORDER_MANAGEMENT ts_bucket={} trigger={} symbol={} model={} action={} new_entry={} new_tp={} new_sl={} dry_run={} open_order_count={} canceled_open_orders=false replacement_order_id=- reason={}",
                     bundle.raw.ts_bucket,
                     &*trigger,
                     bundle.raw.symbol,
                     out.model_name,
                     intent.decision.as_str(),
+                    format_metric_number(intent.new_entry),
+                    format_metric_number(intent.new_tp),
+                    format_metric_number(intent.new_sl),
                     config.llm.execution.dry_run,
                     open_order_count,
                     intent.reason.replace('\n', " "),
@@ -4098,12 +4125,12 @@ async fn invoke_bundle_models(
                     .management_snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.pending_order.as_ref())
-                    .and_then(|pending| pending.current_tp_price),
+                    .and_then(|pending| pending.planned_tp_price),
                 input
                     .management_snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.pending_order.as_ref())
-                    .and_then(|pending| pending.current_sl_price),
+                    .and_then(|pending| pending.planned_sl_price),
             )
             .await
             {
@@ -7388,9 +7415,91 @@ mod tests {
         assert_eq!(pending.entry_price, Some(1965.5));
         assert_eq!(pending.current_tp_price, Some(1974.0));
         assert_eq!(pending.current_sl_price, Some(1961.2));
+        assert_eq!(pending.planned_tp_price, Some(1974.0));
+        assert_eq!(
+            pending.planned_tp_source.as_deref(),
+            Some("effective_context")
+        );
+        assert_eq!(pending.planned_sl_price, Some(1961.2));
+        assert_eq!(
+            pending.planned_sl_source.as_deref(),
+            Some("effective_context")
+        );
         assert_eq!(pending.leverage, Some(20));
         assert!(snapshot.positions.is_empty());
         assert!(snapshot.position_context.is_some());
+    }
+
+    #[test]
+    fn pending_summary_keeps_live_and_shadow_exit_prices_separate() {
+        let state = TradingStateSnapshot {
+            symbol: "TESTUSDT".to_string(),
+            has_active_context: true,
+            has_active_positions: false,
+            has_open_orders: true,
+            active_positions: vec![],
+            open_orders: vec![OpenOrderSnapshot {
+                order_id: 11,
+                side: "BUY".to_string(),
+                position_side: "LONG".to_string(),
+                order_type: "LIMIT".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.06,
+                executed_qty: 0.0,
+                price: 1965.5,
+                stop_price: 0.0,
+                close_position: false,
+                reduce_only: false,
+                is_algo_order: false,
+            }],
+            total_wallet_balance: 1000.0,
+            available_balance: 800.0,
+        };
+
+        let position_context = PositionContextForLlm {
+            original_qty: 0.06,
+            current_qty: 0.06,
+            current_pct_of_original: 100.0,
+            effective_leverage: Some(20),
+            effective_entry_price: Some(1965.5),
+            effective_take_profit: Some(1974.0),
+            effective_stop_loss: Some(1961.2),
+            reduction_history: vec![],
+            times_reduced_at_current_level: 0,
+            last_management_action: Some("MODIFY_MAKER".to_string()),
+            last_management_reason: Some("same strategy, better maker price".to_string()),
+            entry_context: Some(EntryContextForLlm {
+                entry_strategy: Some("Dual-Market AVWAP Z-Score".to_string()),
+                stop_model: Some("Sweep & Flip Stop".to_string()),
+                entry_mode: Some("limit_below_zone".to_string()),
+                original_tp: Some(1974.0),
+                original_sl: Some(1961.2),
+                sweep_wick_extreme: None,
+                horizon: Some("4h".to_string()),
+                entry_reason: "rvwap extreme, keep pending long".to_string(),
+            }),
+        };
+
+        let snapshot = build_management_snapshot_for_llm(
+            Some(&state),
+            Some("same strategy, better maker price".to_string()),
+            Some(position_context),
+        )
+        .expect("snapshot exists");
+
+        let pending = snapshot.pending_order.expect("pending order exists");
+        assert_eq!(pending.current_tp_price, None);
+        assert_eq!(pending.current_sl_price, None);
+        assert_eq!(pending.planned_tp_price, Some(1974.0));
+        assert_eq!(
+            pending.planned_tp_source.as_deref(),
+            Some("effective_context")
+        );
+        assert_eq!(pending.planned_sl_price, Some(1961.2));
+        assert_eq!(
+            pending.planned_sl_source.as_deref(),
+            Some("effective_context")
+        );
     }
 
     #[test]

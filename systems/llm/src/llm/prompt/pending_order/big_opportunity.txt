@@ -4,7 +4,11 @@ Use ONLY the provided indicators and market scan. Do not invent signals.
 WHAT YOU RECEIVE
 - Core price and order-flow indicator snapshot
 - Market scan: 15m, 4h, 1d trend direction, signal agreement, and structural range
-- Live pending order: entry_price, tp, sl, leverage, direction, and original entry reasoning
+- Live pending order context:
+  - `entry_price` = current live maker entry on Binance
+  - `current_tp_price` / `current_sl_price` = ACTUAL live exit orders on Binance; `null` means no live TP/SL is currently recognized
+  - `planned_tp_price` / `planned_sl_price` = shadow/context reference levels from lifecycle state or original entry context; these are NOT proof a live order currently exists
+  - leverage, direction, and original entry reasoning
 
 GOAL
 Review this pending trade and, based on the latest market data, output the optimal

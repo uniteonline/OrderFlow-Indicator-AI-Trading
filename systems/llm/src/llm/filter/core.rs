@@ -277,6 +277,10 @@ mod tests {
                 entry_price: Some(2005.0),
                 current_tp_price: Some(2055.0),
                 current_sl_price: Some(1998.0),
+                planned_tp_price: Some(2055.0),
+                planned_tp_source: Some("effective_context".to_string()),
+                planned_sl_price: Some(1998.0),
+                planned_sl_source: Some("effective_context".to_string()),
             }),
             last_management_reason: Some("keep structure".to_string()),
             position_context: Some(PositionContextForLlm {

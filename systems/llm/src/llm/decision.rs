@@ -3,6 +3,8 @@ use anyhow::{anyhow, Result};
 use serde::Serialize;
 use serde_json::Value;
 
+const PENDING_LEVEL_EXACT_EPSILON: f64 = 1e-9;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradeDecision {
     Long,
@@ -368,7 +370,11 @@ pub fn pending_order_management_intent_from_value(
 }
 
 /// Compare the model's optimal order against the live order.
-/// If the model's levels match within tolerance → Hold. Otherwise → ModifyMaker (cancel + re-place).
+/// If the model's levels exactly match the live order → Hold. Otherwise → ModifyMaker.
+///
+/// Exchange-step-aware no-op suppression happens later in execution, where we have the
+/// symbol tick size and can safely decide whether a requested reprice would place the
+/// same effective live order.
 pub fn pending_order_management_intent_from_value_with_context(
     value: &Value,
     ctx: &PendingOrderContext,
@@ -402,13 +408,7 @@ fn levels_match(model: Option<f64>, current: Option<f64>) -> bool {
     match (model, current) {
         (None, _) => true,
         (Some(_), None) => false,
-        (Some(m), Some(c)) => {
-            if c == 0.0 {
-                m == 0.0
-            } else {
-                ((m - c) / c).abs() < 0.0005
-            }
-        }
+        (Some(m), Some(c)) => (m - c).abs() <= PENDING_LEVEL_EXACT_EPSILON,
     }
 }
 
@@ -648,6 +648,54 @@ mod tests {
             current_tp: None,
             current_sl: None,
             current_leverage: None,
+        };
+
+        let intent = pending_order_management_intent_from_value_with_context(&value, &ctx)
+            .expect("pending intent parses");
+        assert_eq!(intent.decision, PendingOrderManagementDecision::ModifyMaker);
+    }
+
+    #[test]
+    fn pending_exact_same_levels_collapse_into_hold() {
+        let value = json!({
+            "reason": "keep current pending order",
+            "params": {
+                "entry": 2164.22,
+                "tp": 2141.79,
+                "sl": 2170.21,
+                "leverage": 16.0
+            }
+        });
+        let ctx = PendingOrderContext {
+            has_open_orders: true,
+            current_entry: Some(2164.22),
+            current_tp: Some(2141.79),
+            current_sl: Some(2170.21),
+            current_leverage: Some(16.0),
+        };
+
+        let intent = pending_order_management_intent_from_value_with_context(&value, &ctx)
+            .expect("pending intent parses");
+        assert_eq!(intent.decision, PendingOrderManagementDecision::Hold);
+    }
+
+    #[test]
+    fn pending_entry_change_inside_old_five_bps_keeps_modify_maker() {
+        let value = json!({
+            "reason": "re-anchor higher to 2165",
+            "params": {
+                "entry": 2165.0,
+                "tp": 2141.79,
+                "sl": 2170.21,
+                "leverage": 16.0
+            }
+        });
+        let ctx = PendingOrderContext {
+            has_open_orders: true,
+            current_entry: Some(2164.22),
+            current_tp: Some(2141.79),
+            current_sl: Some(2170.21),
+            current_leverage: Some(16.0),
         };
 
         let intent = pending_order_management_intent_from_value_with_context(&value, &ctx)

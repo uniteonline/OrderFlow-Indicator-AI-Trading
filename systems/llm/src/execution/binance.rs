@@ -23,6 +23,7 @@ use uuid::Uuid;
 type HmacSha256 = Hmac<Sha256>;
 const ACCOUNT_WS_RECONNECT_DELAY_SECS: u64 = 3;
 const ACCOUNT_WS_LOG_VALUE_PREVIEW_CHARS: usize = 240;
+const ACCOUNT_WS_BALANCE_SUMMARY_LIMIT: usize = 4;
 const ACCOUNT_WS_POSITION_SUMMARY_LIMIT: usize = 4;
 const POST_ONLY_MAKER_REPRICE_RETRY_COUNT: usize = 3;
 static ACCOUNT_WS_LISTENER_STARTED: AtomicBool = AtomicBool::new(false);
@@ -728,6 +729,49 @@ fn json_log_value(value: Option<&Value>) -> String {
     }
 }
 
+fn format_log_list(values: &[String]) -> String {
+    format!("[{}]", values.join(","))
+}
+
+fn summarize_account_balance_entries(balances: &[Value]) -> (String, String, String) {
+    let mut balance_assets = Vec::new();
+    let mut balance_summaries = Vec::new();
+    let mut usdt_balance_summary = None;
+    for balance in balances.iter().take(ACCOUNT_WS_BALANCE_SUMMARY_LIMIT) {
+        let asset = balance
+            .get("a")
+            .and_then(Value::as_str)
+            .unwrap_or("-");
+        balance_assets.push(asset.to_string());
+        balance_summaries.push(format!(
+            "{}:wb={}:cw={}:bc={}",
+            asset,
+            json_log_value(balance.get("wb")),
+            json_log_value(balance.get("cw")),
+            json_log_value(balance.get("bc"))
+        ));
+        if asset.eq_ignore_ascii_case("USDT") {
+            usdt_balance_summary = Some(format!(
+                "wb={} cw={} bc={}",
+                json_log_value(balance.get("wb")),
+                json_log_value(balance.get("cw")),
+                json_log_value(balance.get("bc"))
+            ));
+        }
+    }
+    if balances.len() > ACCOUNT_WS_BALANCE_SUMMARY_LIMIT {
+        let remaining = balances.len() - ACCOUNT_WS_BALANCE_SUMMARY_LIMIT;
+        let more_summary = format!("+{} more", remaining);
+        balance_assets.push(more_summary.clone());
+        balance_summaries.push(more_summary);
+    }
+    (
+        format_log_list(&balance_assets),
+        format_log_list(&balance_summaries),
+        usdt_balance_summary.unwrap_or_else(|| "not_present_in_event".to_string()),
+    )
+}
+
 fn summarize_account_update_event(payload: &Value) -> String {
     let Some(account_obj) = payload.get("a").and_then(Value::as_object) else {
         return "missing_account_object=true".to_string();
@@ -736,24 +780,17 @@ fn summarize_account_update_event(payload: &Value) -> String {
         .get("m")
         .and_then(Value::as_str)
         .unwrap_or("-");
-    let usdt_balance_summary = account_obj
+    let (balance_assets, balances_summary, usdt_balance_summary) = account_obj
         .get("B")
         .and_then(Value::as_array)
-        .and_then(|balances| {
-            balances.iter().find_map(|balance| {
-                let asset = balance.get("a").and_then(Value::as_str).unwrap_or_default();
-                if asset.eq_ignore_ascii_case("USDT") {
-                    Some(format!(
-                        "wb={} cw={}",
-                        json_log_value(balance.get("wb")),
-                        json_log_value(balance.get("cw"))
-                    ))
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or_else(|| "-".to_string());
+        .map(|balances| summarize_account_balance_entries(balances))
+        .unwrap_or_else(|| {
+            (
+                "-".to_string(),
+                "-".to_string(),
+                "balances_missing".to_string(),
+            )
+        });
     let positions = account_obj
         .get("P")
         .and_then(Value::as_array)
@@ -782,9 +819,11 @@ fn summarize_account_update_event(payload: &Value) -> String {
         })
         .unwrap_or_else(|| "-".to_string());
     format!(
-        "reason={} event_time={} usdt_balance={} positions=[{}]",
+        "reason={} event_time={} balance_assets={} balances={} usdt_balance={} positions=[{}]",
         reason,
         json_log_value(payload.get("E")),
+        balance_assets,
+        balances_summary,
         usdt_balance_summary,
         positions,
     )
@@ -2041,6 +2080,20 @@ pub async fn execute_pending_order_intent(
                 Some(current_entry),
                 ExitKind::StopLoss,
             );
+            if !pending_modify_maker_requests_effective_change(
+                intent,
+                current_entry,
+                current_tp,
+                current_sl,
+                leverage.map(|value| value as f64),
+                symbol_filters.tick_size,
+            ) {
+                report.action = PendingOrderManagementDecision::Hold.as_str();
+                report.maker_entry_price = Some(current_entry);
+                report.effective_take_profit = current_tp;
+                report.effective_stop_loss = current_sl;
+                return Ok(report);
+            }
             let (effective_tp, effective_sl) = resolve_pending_order_exit_levels(
                 intent,
                 current_tp,
@@ -2205,6 +2258,42 @@ pub async fn execute_pending_order_intent(
     }
 }
 
+fn pending_modify_maker_requests_effective_change(
+    intent: &PendingOrderManagementIntent,
+    current_entry: f64,
+    current_tp: Option<f64>,
+    current_sl: Option<f64>,
+    current_leverage: Option<f64>,
+    tick_size: f64,
+) -> bool {
+    pending_numeric_level_changed(intent.new_entry, Some(current_entry), tick_size)
+        || pending_numeric_level_changed(intent.new_tp, current_tp, tick_size)
+        || pending_numeric_level_changed(intent.new_sl, current_sl, tick_size)
+        || pending_scalar_level_changed(intent.new_leverage, current_leverage)
+}
+
+fn pending_numeric_level_changed(
+    requested: Option<f64>,
+    current: Option<f64>,
+    tick_size: f64,
+) -> bool {
+    match (requested, current) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(requested), Some(current)) => {
+            price_changed_by_at_least_one_tick(requested, current, tick_size)
+        }
+    }
+}
+
+fn pending_scalar_level_changed(requested: Option<f64>, current: Option<f64>) -> bool {
+    match (requested, current) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(requested), Some(current)) => (requested - current).abs() > f64::EPSILON,
+    }
+}
+
 fn resolve_pending_order_exit_levels(
     intent: &PendingOrderManagementIntent,
     current_tp: Option<f64>,
@@ -2287,9 +2376,13 @@ fn validate_reanchor_request(
             ));
         }
         if intent.new_tp.is_some_and(|v| {
-            current_tp.is_some_and(|old| (old - v).abs() < symbol_filters.tick_size)
+            current_tp.is_some_and(|old| {
+                !price_changed_by_at_least_one_tick(v, old, symbol_filters.tick_size)
+            })
         }) && intent.new_sl.is_some_and(|v| {
-            current_sl.is_some_and(|old| (old - v).abs() < symbol_filters.tick_size)
+            current_sl.is_some_and(|old| {
+                !price_changed_by_at_least_one_tick(v, old, symbol_filters.tick_size)
+            })
         }) {
             return Err(anyhow!(
                 "re-anchor request did not change TP/SL for position_side={}",
@@ -2551,6 +2644,13 @@ fn derive_maker_entry_price(
 
 fn parse_book_ticker_price(raw: &str, fallback: f64) -> f64 {
     raw.parse::<f64>().unwrap_or(fallback)
+}
+
+fn price_changed_by_at_least_one_tick(requested: f64, current: f64, tick_size: f64) -> bool {
+    if tick_size <= 0.0 {
+        return (requested - current).abs() > f64::EPSILON;
+    }
+    ((requested - current).abs() / tick_size) + 1e-9 >= 1.0
 }
 
 fn recompute_stop_loss_from_target_rr(
@@ -2947,8 +3047,10 @@ fn resolve_modify_tpsl_targets(
         anyhow!("MODIFY_TPSL missing SL: provide params.new_sl or keep an existing SL order")
     })?;
 
-    let tp_changed = current_tp.is_none_or(|v| (v - new_tp).abs() >= tick_size);
-    let sl_changed = current_sl.is_none_or(|v| (v - new_sl).abs() >= tick_size);
+    let tp_changed =
+        current_tp.is_none_or(|v| price_changed_by_at_least_one_tick(new_tp, v, tick_size));
+    let sl_changed =
+        current_sl.is_none_or(|v| price_changed_by_at_least_one_tick(new_sl, v, tick_size));
     if !tp_changed && !sl_changed {
         return Err(anyhow!(
             "MODIFY_TPSL new_tp/new_sl equal current live exits; no change requested"
@@ -4808,6 +4910,25 @@ mod tests {
     }
 
     #[test]
+    fn account_update_summary_reports_non_usdt_balance_assets() {
+        let payload = json!({
+            "E": 1773910470546u64,
+            "a": {
+                "m": "DEPOSIT",
+                "B": [{"a": "BNB", "wb": "1.5", "cw": "1.4", "bc": "0.1"}],
+                "P": []
+            }
+        });
+
+        let summary = summarize_account_update_event(&payload);
+        assert!(summary.contains("reason=DEPOSIT"));
+        assert!(summary.contains("balance_assets=[BNB]"));
+        assert!(summary.contains("balances=[BNB:wb=1.5:cw=1.4:bc=0.1]"));
+        assert!(summary.contains("usdt_balance=not_present_in_event"));
+        assert!(summary.contains("positions=[]"));
+    }
+
+    #[test]
     fn account_update_clears_flatten_marker_after_position_reopens() {
         let state = Arc::new(Mutex::new(AccountWsState {
             has_account_update: true,
@@ -5317,6 +5438,27 @@ mod tests {
     }
 
     #[test]
+    fn resolve_modify_tpsl_targets_allows_exact_one_tick_change() {
+        let intent = PositionManagementIntent {
+            decision: PositionManagementDecision::ModifyTpSl,
+            qty: None,
+            qty_ratio: None,
+            is_full_exit: Some(false),
+            new_tp: Some(2100.1),
+            new_sl: Some(2047.0),
+            close_price: None,
+            reason: "test".to_string(),
+        };
+
+        let (new_tp, new_sl) =
+            resolve_modify_tpsl_targets(&intent, Some(2100.0), Some(2047.0), 0.1, true)
+                .expect("exact one-tick tp change should be allowed");
+
+        assert_eq!(new_tp, 2100.1);
+        assert_eq!(new_sl, 2047.0);
+    }
+
+    #[test]
     fn recompute_stop_loss_uses_actual_maker_entry_price() {
         let sl = recompute_stop_loss_from_target_rr(
             TradeDecision::Long,
@@ -5358,6 +5500,69 @@ mod tests {
 
         assert_eq!(effective_tp, Some(1969.59));
         assert_eq!(effective_sl, Some(1941.5));
+    }
+
+    #[test]
+    fn pending_modify_maker_detects_entry_change_across_multiple_ticks() {
+        let intent = PendingOrderManagementIntent {
+            decision: PendingOrderManagementDecision::ModifyMaker,
+            new_entry: Some(2165.0),
+            new_tp: Some(2141.79),
+            new_sl: Some(2170.21),
+            new_leverage: Some(16.0),
+            reason: "test".to_string(),
+        };
+
+        assert!(pending_modify_maker_requests_effective_change(
+            &intent,
+            2164.22,
+            Some(2141.79),
+            Some(2170.21),
+            Some(16.0),
+            0.1,
+        ));
+    }
+
+    #[test]
+    fn pending_modify_maker_detects_exact_one_tick_change() {
+        let intent = PendingOrderManagementIntent {
+            decision: PendingOrderManagementDecision::ModifyMaker,
+            new_entry: Some(2164.3),
+            new_tp: Some(2141.79),
+            new_sl: Some(2170.21),
+            new_leverage: Some(16.0),
+            reason: "test".to_string(),
+        };
+
+        assert!(pending_modify_maker_requests_effective_change(
+            &intent,
+            2164.2,
+            Some(2141.79),
+            Some(2170.21),
+            Some(16.0),
+            0.1,
+        ));
+    }
+
+    #[test]
+    fn pending_modify_maker_ignores_sub_tick_tail_differences() {
+        let intent = PendingOrderManagementIntent {
+            decision: PendingOrderManagementDecision::ModifyMaker,
+            new_entry: Some(2164.2200000001),
+            new_tp: Some(2141.7900000001),
+            new_sl: Some(2170.2100000001),
+            new_leverage: Some(16.0),
+            reason: "test".to_string(),
+        };
+
+        assert!(!pending_modify_maker_requests_effective_change(
+            &intent,
+            2164.22,
+            Some(2141.79),
+            Some(2170.21),
+            Some(16.0),
+            0.01,
+        ));
     }
 
     #[test]

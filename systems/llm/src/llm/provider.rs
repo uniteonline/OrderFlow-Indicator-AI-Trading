@@ -71,8 +71,18 @@ pub struct PendingOrderSummaryForLlm {
     pub quantity: f64,
     pub leverage: Option<u32>,
     pub entry_price: Option<f64>,
+    /// Actual live TP order trigger price from Binance open orders (None if no live TP is found).
     pub current_tp_price: Option<f64>,
+    /// Actual live SL order trigger price from Binance open orders (None if no live SL is found).
     pub current_sl_price: Option<f64>,
+    /// Shadow/reference TP from lifecycle context or original entry context. This is not proof
+    /// that a live TP order currently exists on Binance.
+    pub planned_tp_price: Option<f64>,
+    pub planned_tp_source: Option<String>,
+    /// Shadow/reference SL from lifecycle context or original entry context. This is not proof
+    /// that a live SL order currently exists on Binance.
+    pub planned_sl_price: Option<f64>,
+    pub planned_sl_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3677,6 +3687,10 @@ mod tests {
                         entry_price: Some(1999.0),
                         current_tp_price: Some(2028.0),
                         current_sl_price: Some(1988.0),
+                        planned_tp_price: Some(2028.0),
+                        planned_tp_source: Some("effective_context".to_string()),
+                        planned_sl_price: Some(1988.0),
+                        planned_sl_source: Some("effective_context".to_string()),
                     }),
                     last_management_reason: Some("test".to_string()),
                     position_context: Some(PositionContextForLlm {
