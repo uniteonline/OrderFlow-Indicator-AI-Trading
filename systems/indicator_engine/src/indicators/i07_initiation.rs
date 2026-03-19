@@ -499,9 +499,9 @@ mod tests {
             }),
         };
 
-        let (_, payload) = initiation_event_json("ETHUSDT", "initiation", &event);
+        let (_, payload) = initiation_event_json("TESTUSDT", "initiation", &event);
         let expected_event_id = build_initiation_event_id(
-            "ETHUSDT",
+            "TESTUSDT",
             "initiation",
             "bearish_initiation",
             -1,

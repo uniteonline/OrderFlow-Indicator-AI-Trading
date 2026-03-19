@@ -18,7 +18,6 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, sleep, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
-const SYMBOL: &str = "ETHUSDT";
 const SNAPSHOT_DEPTH_LEVELS: u16 = 200;
 const SNAPSHOT_INTERVAL_SECS: u64 = 30;
 const DEPTH_GAP_RECONCILE_REASON: &str = "depth_gap_reconcile";
@@ -89,7 +88,7 @@ impl DepthSyncState {
 }
 
 pub async fn run_depth_snapshot_loop(
-    _ctx: Arc<AppContext>,
+    ctx: Arc<AppContext>,
     rest_client: Arc<BinanceRestClient>,
     db_writer: Arc<MdDbWriter>,
     ops_writer: Arc<OpsDbWriter>,
@@ -97,6 +96,7 @@ pub async fn run_depth_snapshot_loop(
     outbox_writer: Arc<OutboxWriter>,
     metrics: Arc<AppMetrics>,
 ) -> Result<()> {
+    let symbol = ctx.config.market_data.symbol.clone();
     // Prefer queue-path snapshots so orderbook 1s pre-aggregator state is kept in sync.
     // On startup, pipelines register queues quickly; wait briefly to avoid falling back
     // to direct persist path which bypasses queue state.
@@ -120,7 +120,7 @@ pub async fn run_depth_snapshot_loop(
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     info!(
-        symbol = SYMBOL,
+        symbol = symbol,
         depth_levels = SNAPSHOT_DEPTH_LEVELS,
         interval_secs = SNAPSHOT_INTERVAL_SECS,
         "depth snapshot rebuilder started"
@@ -140,6 +140,7 @@ pub async fn run_depth_snapshot_loop(
                     &publisher,
                     &outbox_writer,
                     &metrics,
+                    symbol.as_str(),
                 )
                 .await;
 
@@ -154,6 +155,7 @@ pub async fn run_depth_snapshot_loop(
                     &publisher,
                     &outbox_writer,
                     &metrics,
+                    symbol.as_str(),
                 )
                 .await;
             }
@@ -176,6 +178,7 @@ pub async fn run_depth_snapshot_loop(
                     &publisher,
                     &outbox_writer,
                     &metrics,
+                    symbol.as_str(),
                 )
                 .await;
                 pending_flag_for_market(req.market).store(false, Ordering::Release);
@@ -195,6 +198,7 @@ async fn run_one_market(
     _publisher: &Arc<MqPublisher>,
     _outbox_writer: &Arc<OutboxWriter>,
     _metrics: &Arc<AppMetrics>,
+    symbol: &str,
 ) {
     let prev_state = *state;
     let was_desync = prev_state == DepthSyncState::Desync;
@@ -215,7 +219,7 @@ async fn run_one_market(
     let fetch_result = rest_client
         .fetch_depth_snapshot(
             market.as_str(),
-            SYMBOL,
+            symbol,
             request_depth_limit(market, SNAPSHOT_DEPTH_LEVELS),
         )
         .await;
@@ -241,7 +245,7 @@ async fn run_one_market(
             };
             let metadata = json!({
                 "build_reason": build_reason,
-                "source_depth_stream": format!("{}@depth@100ms", SYMBOL.to_lowercase()),
+                "source_depth_stream": format!("{}@depth@100ms", symbol.to_lowercase()),
                 "snapshot_seq": *snapshot_seq,
                 "state_before_sync": prev_state.as_str(),
                 "request_limit": request_limit,
@@ -252,7 +256,7 @@ async fn run_one_market(
 
             let event = normalize_orderbook_snapshot_l2(
                 market,
-                SYMBOL,
+                symbol,
                 &format!("orderbook_snapshot_l2@derived_{}", SNAPSHOT_DEPTH_LEVELS),
                 now,
                 now,
@@ -275,7 +279,7 @@ async fn run_one_market(
                     error!(
                         error = %err,
                         market = market.as_str(),
-                        symbol = SYMBOL,
+                        symbol = symbol,
                         "orderbook snapshot async enqueue failed"
                     );
                     false
@@ -285,7 +289,7 @@ async fn run_one_market(
             if !enqueued_into_async {
                 warn!(
                     market = market.as_str(),
-                    symbol = SYMBOL,
+                    symbol = symbol,
                     "registered persist queue unavailable; skip direct snapshot persist to avoid duplicate canonical orderbook aggregation"
                 );
                 transition_state(
@@ -301,7 +305,7 @@ async fn run_one_market(
             if let Err(err) = ops_writer
                 .insert_backfill_job_run(
                     Some(market.as_str()),
-                    Some(SYMBOL),
+                    Some(symbol),
                     if market.as_str() == "spot" {
                         "/api/v3/depth"
                     } else {
@@ -341,7 +345,7 @@ async fn run_one_market(
             warn!(
                 error = %err,
                 market = market.as_str(),
-                symbol = SYMBOL,
+                symbol = symbol,
                 "fetch depth snapshot failed"
             );
             transition_state(
@@ -356,7 +360,7 @@ async fn run_one_market(
             if let Err(e) = ops_writer
                 .insert_backfill_job_run(
                     Some(market.as_str()),
-                    Some(SYMBOL),
+                    Some(symbol),
                     if market.as_str() == "spot" {
                         "/api/v3/depth"
                     } else {

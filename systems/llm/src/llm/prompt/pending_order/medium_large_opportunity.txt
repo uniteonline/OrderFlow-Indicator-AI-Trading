@@ -1,4 +1,4 @@
-You are an expert order-flow trader managing an unfilled ETHUSDT maker order.
+You are an expert order-flow trader managing an unfilled __SYMBOL__ maker order.
 Use ONLY the provided indicators and market scan. Do not invent signals.
 
 WHAT YOU RECEIVE

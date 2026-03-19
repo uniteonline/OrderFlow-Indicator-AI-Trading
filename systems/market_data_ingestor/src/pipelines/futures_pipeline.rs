@@ -34,7 +34,6 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{debug, error, info, warn};
 
 const FUTURES_WS_BASE: &str = "wss://fstream.binance.com";
-const SYMBOL: &str = "ETHUSDT";
 const REST_PAGE_LIMIT: u16 = 1000;
 const KLINE_INTERVALS: [&str; 5] = ["1m", "15m", "1h", "4h", "1d"];
 const WS_KEEPALIVE_PING_SECS: u64 = 20;
@@ -317,7 +316,8 @@ pub async fn run(
     ops_writer: Arc<OpsDbWriter>,
     metrics: Arc<AppMetrics>,
 ) -> Result<()> {
-    let streams = futures_streams::required_streams(SYMBOL);
+    let symbol = ctx.config.market_data.symbol.clone();
+    let streams = futures_streams::required_streams(&symbol);
     let mut gap_detector = GapDetector::default();
     let kline_3d_aggregator = Arc::new(Mutex::new(Kline3dAggregator::default()));
     let mut last_closed_kline_open_ms: HashMap<String, i64> = HashMap::new();
@@ -363,11 +363,11 @@ pub async fn run(
         });
     }
 
-    match checkpoints::load_checkpoint_seeds(&ctx.ops_db_pool, "futures", SYMBOL).await {
+    match checkpoints::load_checkpoint_seeds(&ctx.ops_db_pool, "futures", &symbol).await {
         Ok(seeds) => {
             checkpoints::hydrate_runtime_state(
                 "futures",
-                SYMBOL,
+                &symbol,
                 &seeds,
                 &mut gap_detector,
                 &mut last_closed_kline_open_ms,
@@ -384,6 +384,7 @@ pub async fn run(
     }
 
     if let Err(err) = bootstrap_missing_kline_history(
+        &symbol,
         &ctx.md_db_pool,
         &rest_client,
         &db_writer,
@@ -428,7 +429,7 @@ pub async fn run(
         info!(market = "futures", "futures websocket connected");
 
         if was_reconnect {
-            let last_trade_agg_id = gap_detector.last_trade_agg_id("futures", SYMBOL);
+            let last_trade_agg_id = gap_detector.last_trade_agg_id("futures", &symbol);
             let kline_state_snapshot = last_closed_kline_open_ms.clone();
             let kline_state_count = kline_state_snapshot.len();
             let kline_3d_snapshot = {
@@ -447,6 +448,7 @@ pub async fn run(
                 let ops_writer = Arc::clone(&ops_writer);
                 let metrics = Arc::clone(&metrics);
                 let inflight = Arc::clone(&reconnect_reconcile_inflight);
+                let symbol = symbol.clone();
                 tokio::spawn(async move {
                     let started_at = Instant::now();
                     info!(
@@ -456,6 +458,7 @@ pub async fn run(
                         "starting background reconnect reconcile"
                     );
                     let result = reconcile_after_ws_reconnect(
+                        &symbol,
                         &rest_client,
                         &db_writer,
                         &publisher,
@@ -1251,6 +1254,7 @@ async fn replay_kline_gap(
 }
 
 async fn bootstrap_missing_kline_history(
+    symbol: &str,
     md_pool: &sqlx::PgPool,
     rest_client: &Arc<BinanceRestClient>,
     db_writer: &Arc<MdDbWriter>,
@@ -1270,7 +1274,7 @@ async fn bootstrap_missing_kline_history(
               AND is_closed = true
             "#,
         )
-        .bind(SYMBOL)
+        .bind(symbol)
         .bind(interval_code)
         .fetch_one(md_pool)
         .await?;
@@ -1286,7 +1290,7 @@ async fn bootstrap_missing_kline_history(
 
     info!(
         market = "futures",
-        symbol = SYMBOL,
+        symbol = symbol,
         ?bootstrap_intervals,
         bootstrap_bars = KLINE_STARTUP_BOOTSTRAP_BARS,
         "bootstrapping closed kline history into md.kline_bar"
@@ -1302,7 +1306,7 @@ async fn bootstrap_missing_kline_history(
         let rows = rest_client
             .fetch_klines(
                 "futures",
-                SYMBOL,
+                symbol,
                 interval_code,
                 Some(start_ms),
                 Some(end_open_ms),
@@ -1322,7 +1326,7 @@ async fn bootstrap_missing_kline_history(
 
             let event = kline_normalizer::normalize_rest_kline(
                 Market::Futures,
-                SYMBOL,
+                symbol,
                 interval_code,
                 row,
                 "replay",
@@ -1372,7 +1376,7 @@ async fn bootstrap_missing_kline_history(
         ops_writer
             .insert_backfill_job_run(
                 Some("futures"),
-                Some(SYMBOL),
+                Some(symbol),
                 "/fapi/v1/klines",
                 "kline_bootstrap",
                 "startup",
@@ -1394,6 +1398,7 @@ async fn bootstrap_missing_kline_history(
 
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_after_ws_reconnect(
+    symbol: &str,
     rest_client: &Arc<BinanceRestClient>,
     db_writer: &Arc<MdDbWriter>,
     publisher: &Arc<MqPublisher>,
@@ -1411,7 +1416,7 @@ async fn reconcile_after_ws_reconnect(
         let mut trade_throttle = BackfillThrottle::new("futures", BACKFILL_TRADE_THROTTLE);
         loop {
             let rows = rest_client
-                .fetch_agg_trades("futures", SYMBOL, Some(next_id), REST_PAGE_LIMIT)
+                .fetch_agg_trades("futures", symbol, Some(next_id), REST_PAGE_LIMIT)
                 .await?;
             if rows.is_empty() {
                 break;
@@ -1426,7 +1431,7 @@ async fn reconcile_after_ws_reconnect(
                 trade_throttle.before_emit().await;
                 let replay_event = trade_normalizer::normalize_rest_agg_trade(
                     Market::Futures,
-                    SYMBOL,
+                    symbol,
                     row,
                     "replay",
                     true,
@@ -1454,7 +1459,7 @@ async fn reconcile_after_ws_reconnect(
             ops_writer
                 .insert_backfill_job_run(
                     Some("futures"),
-                    Some(SYMBOL),
+                    Some(symbol),
                     "/fapi/v1/aggTrades",
                     "trade_gapfill",
                     "reconnect",
@@ -1488,7 +1493,7 @@ async fn reconcile_after_ws_reconnect(
             let rows = rest_client
                 .fetch_klines(
                     "futures",
-                    SYMBOL,
+                    symbol,
                     interval_code,
                     Some(cursor_ms),
                     Some(end_ms),
@@ -1511,7 +1516,7 @@ async fn reconcile_after_ws_reconnect(
 
                 let replay_event = kline_normalizer::normalize_rest_kline(
                     Market::Futures,
-                    SYMBOL,
+                    symbol,
                     interval_code,
                     row,
                     "replay",
@@ -1556,7 +1561,7 @@ async fn reconcile_after_ws_reconnect(
             ops_writer
                 .insert_backfill_job_run(
                     Some("futures"),
-                    Some(SYMBOL),
+                    Some(symbol),
                     "/fapi/v1/klines",
                     "kline_gapfill",
                     "reconnect",
@@ -1569,10 +1574,10 @@ async fn reconcile_after_ws_reconnect(
         }
     }
 
-    match rest_client.fetch_premium_index(SYMBOL).await {
+    match rest_client.fetch_premium_index(symbol).await {
         Ok(premium) => {
             let event = mark_price_normalizer::normalize_premium_index_rest(
-                SYMBOL, &premium, "rest", false,
+                symbol, &premium, "rest", false,
             )?;
             let mut mark_throttle = BackfillThrottle::new("futures", BACKFILL_KLINE_THROTTLE);
             mark_throttle.before_emit().await;
@@ -1587,7 +1592,7 @@ async fn reconcile_after_ws_reconnect(
             ops_writer
                 .insert_backfill_job_run(
                     Some("futures"),
-                    Some(SYMBOL),
+                    Some(symbol),
                     "/fapi/v1/premiumIndex",
                     "mark_funding_bootstrap",
                     "reconnect",
@@ -1604,7 +1609,7 @@ async fn reconcile_after_ws_reconnect(
             ops_writer
                 .insert_backfill_job_run(
                     Some("futures"),
-                    Some(SYMBOL),
+                    Some(symbol),
                     "/fapi/v1/premiumIndex",
                     "mark_funding_bootstrap",
                     "reconnect",

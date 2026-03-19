@@ -102,11 +102,11 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 CREATE TABLE IF NOT EXISTS cfg.instrument (
     instrument_id      BIGSERIAL PRIMARY KEY,
     venue              TEXT NOT NULL DEFAULT 'binance',
-    symbol             TEXT NOT NULL,                  -- ETHUSDT
+    symbol             TEXT NOT NULL,                  -- e.g. BTCUSDT
     market             cfg.market_type NOT NULL,       -- spot / futures
     contract_type      TEXT,                           -- perpetual for futures
-    quote_asset        TEXT NOT NULL DEFAULT 'USDT',
-    base_asset         TEXT NOT NULL DEFAULT 'ETH',
+    quote_asset        TEXT NOT NULL DEFAULT '',
+    base_asset         TEXT NOT NULL DEFAULT '',
     contract_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1.0,
     tick_size          DOUBLE PRECISION,
     lot_size           DOUBLE PRECISION,
@@ -124,7 +124,7 @@ CREATE TABLE IF NOT EXISTS cfg.ws_stream_catalog (
     venue              TEXT NOT NULL DEFAULT 'binance',
     market             cfg.market_type NOT NULL,
     symbol             TEXT NOT NULL,
-    stream_name        TEXT NOT NULL,     -- e.g. ethusdt@aggTrade
+    stream_name        TEXT NOT NULL,     -- e.g. lower(symbol) || '@aggTrade'
     stream_kind        cfg.stream_kind NOT NULL,
     endpoint_base      TEXT NOT NULL,
     is_required        BOOLEAN NOT NULL DEFAULT TRUE,
@@ -541,7 +541,7 @@ CREATE TABLE IF NOT EXISTS md.trade_event (
     market             cfg.market_type NOT NULL,
     symbol             TEXT NOT NULL,
     source_kind        cfg.source_type NOT NULL DEFAULT 'ws',
-    stream_name        TEXT NOT NULL,         -- ethusdt@aggTrade / ethusdt@trade / rest_backfill
+    stream_name        TEXT NOT NULL,         -- e.g. lower(symbol)||'@aggTrade' / lower(symbol)||'@trade' / rest_backfill
     event_type         TEXT NOT NULL DEFAULT 'agg_trade',
     exchange_trade_id  BIGINT,
     agg_trade_id       BIGINT,
@@ -549,7 +549,7 @@ CREATE TABLE IF NOT EXISTS md.trade_event (
     last_trade_id      BIGINT,
     price              DOUBLE PRECISION NOT NULL,
     qty_raw            DOUBLE PRECISION NOT NULL,
-    qty_eth            DOUBLE PRECISION NOT NULL,
+    qty_eth            DOUBLE PRECISION NOT NULL,      -- legacy field name; stores base-asset quantity
     notional_usdt      DOUBLE PRECISION NOT NULL,
     is_buyer_maker     BOOLEAN,
     aggressor_side     SMALLINT,              -- +1 buy, -1 sell
@@ -891,7 +891,7 @@ CREATE TABLE IF NOT EXISTS feat.trade_flow_feature (
     market             cfg.market_type NOT NULL,
     symbol             TEXT NOT NULL,
     source_trade_stream TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-    qty_mode           TEXT NOT NULL DEFAULT 'qty_eth', -- qty_eth / notional_usdt
+    qty_mode           TEXT NOT NULL DEFAULT 'qty_base', -- qty_base / notional_usdt
     trade_count        BIGINT,
     buy_qty            DOUBLE PRECISION,
     sell_qty           DOUBLE PRECISION,
@@ -1116,7 +1116,7 @@ CREATE TABLE IF NOT EXISTS feat.whale_trade_rollup (
     whale_notional_total DOUBLE PRECISION NOT NULL DEFAULT 0,
     whale_notional_buy   DOUBLE PRECISION NOT NULL DEFAULT 0,
     whale_notional_sell  DOUBLE PRECISION NOT NULL DEFAULT 0,
-    whale_qty_eth_total  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    whale_qty_eth_total  DOUBLE PRECISION NOT NULL DEFAULT 0, -- legacy field name; stores total base-asset whale quantity
     max_single_trade_notional DOUBLE PRECISION,
     extra_json         JSONB NOT NULL DEFAULT '{}'::jsonb,
     param_set_id       UUID,
@@ -1687,11 +1687,7 @@ VALUES
 ('fvg', 'Fair Value Gap', 'structure', 'timeseries+zones', 'futures', FALSE, 'HTF fair value gap structure zones for 1h/4h/1d filtering')
 ON CONFLICT (indicator_code) DO NOTHING;
 
--- 11) Seed instruments (ETH only, per your scope)
-INSERT INTO cfg.instrument (venue, symbol, market, contract_type, quote_asset, base_asset, contract_multiplier, is_active)
-VALUES
-('binance', 'ETHUSDT', 'spot', NULL, 'USDT', 'ETH', 1.0, TRUE),
-('binance', 'ETHUSDT', 'futures', 'perpetual', 'USDT', 'ETH', 1.0, TRUE)
-ON CONFLICT (venue, symbol, market) DO NOTHING;
+-- 11) Instruments are discovered dynamically at runtime and upserted by the
+-- market data ingestor, so no symbol-specific seed rows are inserted here.
 
 COMMIT;

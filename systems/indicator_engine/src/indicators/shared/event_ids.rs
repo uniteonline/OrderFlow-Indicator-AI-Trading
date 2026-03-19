@@ -114,7 +114,7 @@ mod tests {
         let event_available_ts = end_ts;
 
         let left = build_initiation_event_id(
-            "ETHUSDT",
+            "TESTUSDT",
             "initiation",
             "bearish_initiation",
             -1,
@@ -124,7 +124,7 @@ mod tests {
             1950.4,
         );
         let right = build_initiation_event_id(
-            "ethusdt",
+            "testusdt",
             "initiation",
             "bearish_initiation",
             -1,
@@ -144,7 +144,7 @@ mod tests {
         let pivot_ts_2 = Utc.with_ymd_and_hms(2026, 3, 9, 23, 39, 0).unwrap();
 
         let left = build_exhaustion_event_id(
-            "ETHUSDT",
+            "TESTUSDT",
             "buying_exhaustion",
             "buying_exhaustion",
             -1,
@@ -153,7 +153,7 @@ mod tests {
             pivot_ts_2,
         );
         let right = build_exhaustion_event_id(
-            "ETHUSDT",
+            "TESTUSDT",
             "buying_exhaustion",
             "buying_exhaustion",
             -1,

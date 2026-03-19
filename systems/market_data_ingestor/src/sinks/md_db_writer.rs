@@ -123,7 +123,7 @@ impl MdDbWriter {
         .bind(optional_i64(d, "last_trade_id"))
         .bind(required_f64(d, "price")?)
         .bind(required_f64(d, "qty_raw")?)
-        .bind(required_f64(d, "qty_eth")?)
+        .bind(required_f64_alias(d, &["qty_base", "qty_eth"])?)
         .bind(required_f64(d, "notional_usdt")?)
         .bind(optional_bool(d, "is_buyer_maker"))
         .bind(required_i64(d, "aggressor_side")? as i16)
@@ -1271,7 +1271,7 @@ impl TradeBatchRow {
             last_trade_id: optional_i64(d, "last_trade_id"),
             price: required_f64(d, "price")?,
             qty_raw: required_f64(d, "qty_raw")?,
-            qty_eth: required_f64(d, "qty_eth")?,
+            qty_eth: required_f64_alias(d, &["qty_base", "qty_eth"])?,
             notional_usdt: required_f64(d, "notional_usdt")?,
             is_buyer_maker: optional_bool(d, "is_buyer_maker"),
             aggressor_side: required_i64(d, "aggressor_side")? as i16,
@@ -1757,6 +1757,15 @@ fn required_f64(value: &Value, key: &str) -> Result<f64> {
         .get(key)
         .ok_or_else(|| anyhow!("missing decimal field: {}", key))?;
     to_f64(raw).with_context(|| format!("parse decimal field {}", key))
+}
+
+fn required_f64_alias(value: &Value, keys: &[&str]) -> Result<f64> {
+    for key in keys {
+        if let Some(raw) = value.get(*key) {
+            return to_f64(raw).with_context(|| format!("parse decimal field {}", key));
+        }
+    }
+    Err(anyhow!("missing decimal field: {}", keys.join(" | ")))
 }
 
 fn optional_f64(value: &Value, key: &str) -> Option<f64> {

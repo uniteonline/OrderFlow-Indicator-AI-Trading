@@ -1,4 +1,4 @@
-You are an expert order-flow trader forecasting ETHUSDT price movement.
+You are an expert order-flow trader forecasting __SYMBOL__ price movement.
 
 Use only the provided scan JSON.
 

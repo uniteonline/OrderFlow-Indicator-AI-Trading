@@ -1005,7 +1005,7 @@ mod tests {
         let spot = MinuteWindowData::empty(MarketKind::Spot, ts_bucket);
         let ctx = IndicatorContext {
             ts_bucket,
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             futures,
             spot,
             history_futures: Vec::new(),
@@ -1222,7 +1222,7 @@ mod tests {
         let spot = MinuteWindowData::empty(MarketKind::Spot, ts_bucket);
         let ctx = IndicatorContext {
             ts_bucket,
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             futures,
             spot,
             // NOTE: history includes the current minute at the tail.
@@ -1351,7 +1351,7 @@ mod tests {
         let spot = MinuteWindowData::empty(MarketKind::Spot, ts_bucket);
         let ctx = IndicatorContext {
             ts_bucket,
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             futures,
             spot,
             history_futures: Vec::new(),
@@ -1531,7 +1531,7 @@ mod tests {
         let spot = MinuteWindowData::empty(MarketKind::Spot, ts_bucket);
         let ctx = IndicatorContext {
             ts_bucket,
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             futures,
             spot,
             history_futures: vec![

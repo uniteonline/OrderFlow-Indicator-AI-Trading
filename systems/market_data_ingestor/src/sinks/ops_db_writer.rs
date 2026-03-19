@@ -428,7 +428,7 @@ impl OpsDbWriter {
             )
             VALUES (
                 'binance', $1, $2::cfg.market_type, $3,
-                COALESCE($4, 'USDT'), COALESCE($5, 'ETH'),
+                COALESCE($4, ''), COALESCE($5, ''),
                 $6, $7, $8,
                 $9, now()
             )

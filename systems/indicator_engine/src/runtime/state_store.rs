@@ -16,7 +16,7 @@ const MICROPRICE_KAPPA: f64 = 0.35;
 const MICROPRICE_LAMBDA_OBI: f64 = 0.15;
 const SIZE_FLOOR: f64 = 1e-3;
 const TICK_SIZE: f64 = 1.0 / PRICE_SCALE;
-const VPIN_BUCKET_SIZE_ETH: f64 = 50.0;
+const VPIN_BUCKET_SIZE_BASE: f64 = 50.0;
 const VPIN_ROLLING_BUCKETS: usize = 50;
 const VPIN_EPS: f64 = 1e-12;
 // Keep one full day of finalized canonical 1m inputs so late trade corrections
@@ -1133,8 +1133,8 @@ impl StateStore {
             finalized_vpin_spot: VecDeque::new(),
             cvd_futures: 0.0,
             cvd_spot: 0.0,
-            vpin_futures: VpinState::new(VPIN_BUCKET_SIZE_ETH, VPIN_ROLLING_BUCKETS),
-            vpin_spot: VpinState::new(VPIN_BUCKET_SIZE_ETH, VPIN_ROLLING_BUCKETS),
+            vpin_futures: VpinState::new(VPIN_BUCKET_SIZE_BASE, VPIN_ROLLING_BUCKETS),
+            vpin_spot: VpinState::new(VPIN_BUCKET_SIZE_BASE, VPIN_ROLLING_BUCKETS),
             orderbooks,
             depth_conflation: HashMap::new(),
             latest_mark: None,
@@ -1783,12 +1783,12 @@ impl StateStore {
         {
             self.vpin_futures.restore(&snapshot);
         } else {
-            self.vpin_futures = VpinState::new(VPIN_BUCKET_SIZE_ETH, VPIN_ROLLING_BUCKETS);
+            self.vpin_futures = VpinState::new(VPIN_BUCKET_SIZE_BASE, VPIN_ROLLING_BUCKETS);
         }
         if let Some(snapshot) = self.finalized_vpin_spot.back().map(|v| v.snapshot.clone()) {
             self.vpin_spot.restore(&snapshot);
         } else {
-            self.vpin_spot = VpinState::new(VPIN_BUCKET_SIZE_ETH, VPIN_ROLLING_BUCKETS);
+            self.vpin_spot = VpinState::new(VPIN_BUCKET_SIZE_BASE, VPIN_ROLLING_BUCKETS);
         }
 
         while self
@@ -2152,9 +2152,9 @@ mod tests {
             msg_type: "md.agg.trade.1m".to_string(),
             message_id: Uuid::new_v4(),
             trace_id: Uuid::new_v4(),
-            routing_key: "md.agg.futures.trade.1m.ethusdt".to_string(),
+            routing_key: "md.agg.futures.trade.1m.testusdt".to_string(),
             market: MarketKind::Futures,
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "test".to_string(),
             backfill_in_progress: false,
             event_ts: ts_bucket + ChronoDuration::seconds(59),
@@ -2231,9 +2231,9 @@ mod tests {
             msg_type: "md.agg.orderbook.1m".to_string(),
             message_id: Uuid::new_v4(),
             trace_id: Uuid::new_v4(),
-            routing_key: "md.agg.futures.orderbook.1m.ethusdt".to_string(),
+            routing_key: "md.agg.futures.orderbook.1m.testusdt".to_string(),
             market: MarketKind::Futures,
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "test".to_string(),
             backfill_in_progress: false,
             event_ts: ts_bucket + ChronoDuration::seconds(59),
@@ -2280,9 +2280,9 @@ mod tests {
             msg_type: "md.agg.funding_mark.1m".to_string(),
             message_id: Uuid::new_v4(),
             trace_id: Uuid::new_v4(),
-            routing_key: "md.agg.futures.funding_mark.1m.ethusdt".to_string(),
+            routing_key: "md.agg.futures.funding_mark.1m.testusdt".to_string(),
             market: MarketKind::Futures,
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "test".to_string(),
             backfill_in_progress: false,
             event_ts: ts_bucket + ChronoDuration::seconds(59),
@@ -2313,7 +2313,7 @@ mod tests {
 
     #[test]
     fn one_minute_kline_uses_open_time_bucket() {
-        let mut store = StateStore::new("ETHUSDT".to_string(), 1_000.0);
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
         let open_time = Utc.with_ymd_and_hms(2026, 3, 6, 4, 49, 0).single().unwrap();
         let close_event_ts = Utc.with_ymd_and_hms(2026, 3, 6, 4, 50, 0).single().unwrap()
             + chrono::Duration::milliseconds(66);
@@ -2323,9 +2323,9 @@ mod tests {
             msg_type: "md.kline".to_string(),
             message_id: Uuid::new_v4(),
             trace_id: Uuid::new_v4(),
-            routing_key: "md.futures.kline.1m.ethusdt".to_string(),
+            routing_key: "md.futures.kline.1m.testusdt".to_string(),
             market: MarketKind::Futures,
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "test".to_string(),
             backfill_in_progress: false,
             event_ts: close_event_ts,
@@ -2357,7 +2357,7 @@ mod tests {
 
     #[test]
     fn finalize_minute_uses_minute_locked_vpin_not_later_global_state() {
-        let mut store = StateStore::new("ETHUSDT".to_string(), 1_000.0);
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
         let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 5, 49, 0).single().unwrap();
         let ts_2 = Utc.with_ymd_and_hms(2026, 3, 6, 5, 50, 0).single().unwrap();
 
@@ -2366,9 +2366,9 @@ mod tests {
             msg_type: "md.agg.trade.1m".to_string(),
             message_id: Uuid::new_v4(),
             trace_id: Uuid::new_v4(),
-            routing_key: "md.agg.futures.trade.1m.ethusdt".to_string(),
+            routing_key: "md.agg.futures.trade.1m.testusdt".to_string(),
             market: MarketKind::Futures,
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "test".to_string(),
             backfill_in_progress: false,
             event_ts: ts_1 + chrono::Duration::seconds(59),
@@ -2416,9 +2416,9 @@ mod tests {
             msg_type: "md.agg.trade.1m".to_string(),
             message_id: Uuid::new_v4(),
             trace_id: Uuid::new_v4(),
-            routing_key: "md.agg.futures.trade.1m.ethusdt".to_string(),
+            routing_key: "md.agg.futures.trade.1m.testusdt".to_string(),
             market: MarketKind::Futures,
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "test".to_string(),
             backfill_in_progress: false,
             event_ts: ts_2 + chrono::Duration::seconds(59),
@@ -2470,7 +2470,7 @@ mod tests {
 
     #[test]
     fn finalize_minute_without_trades_carries_forward_previous_vpin() {
-        let mut store = StateStore::new("ETHUSDT".to_string(), 1_000.0);
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
         let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 5, 49, 0).single().unwrap();
         let ts_2 = Utc.with_ymd_and_hms(2026, 3, 6, 5, 50, 0).single().unwrap();
         let ts_3 = Utc.with_ymd_and_hms(2026, 3, 6, 5, 51, 0).single().unwrap();
@@ -2480,9 +2480,9 @@ mod tests {
             msg_type: "md.agg.trade.1m".to_string(),
             message_id: Uuid::new_v4(),
             trace_id: Uuid::new_v4(),
-            routing_key: "md.agg.futures.trade.1m.ethusdt".to_string(),
+            routing_key: "md.agg.futures.trade.1m.testusdt".to_string(),
             market: MarketKind::Futures,
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "test".to_string(),
             backfill_in_progress: false,
             event_ts: ts_1 + chrono::Duration::seconds(59),
@@ -2535,9 +2535,9 @@ mod tests {
             msg_type: "md.bbo".to_string(),
             message_id: Uuid::new_v4(),
             trace_id: Uuid::new_v4(),
-            routing_key: "md.futures.bbo.ethusdt".to_string(),
+            routing_key: "md.futures.bbo.testusdt".to_string(),
             market: MarketKind::Futures,
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "test".to_string(),
             backfill_in_progress: false,
             event_ts: ts_2 + chrono::Duration::seconds(10),
@@ -2556,9 +2556,9 @@ mod tests {
             msg_type: "md.agg.trade.1m".to_string(),
             message_id: Uuid::new_v4(),
             trace_id: Uuid::new_v4(),
-            routing_key: "md.agg.futures.trade.1m.ethusdt".to_string(),
+            routing_key: "md.agg.futures.trade.1m.testusdt".to_string(),
             market: MarketKind::Futures,
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "test".to_string(),
             backfill_in_progress: false,
             event_ts: ts_3 + chrono::Duration::seconds(59),
@@ -2610,7 +2610,7 @@ mod tests {
 
     #[test]
     fn canonical_trade_correction_recomputes_finalized_suffix() {
-        let mut store = StateStore::new("ETHUSDT".to_string(), 1_000.0);
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
         let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 6, 0, 0).single().unwrap();
         let ts_2 = ts_1 + ChronoDuration::minutes(1);
 
@@ -2646,7 +2646,7 @@ mod tests {
 
     #[test]
     fn canonical_trade_correction_beyond_15m_still_recomputes_suffix() {
-        let mut store = StateStore::new("ETHUSDT".to_string(), 1_000.0);
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
         let start = Utc.with_ymd_and_hms(2026, 3, 6, 7, 0, 0).single().unwrap();
 
         for minute_offset in 0..20 {
@@ -2691,7 +2691,7 @@ mod tests {
 
     #[test]
     fn build_window_bundle_backfills_missing_trade_minute_from_canonical_history() {
-        let mut store = StateStore::new("ETHUSDT".to_string(), 1_000.0);
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
         let ts_0 = Utc.with_ymd_and_hms(2026, 3, 7, 4, 16, 0).single().unwrap();
         let ts_1 = ts_0 + ChronoDuration::minutes(1);
         let ts_2 = ts_1 + ChronoDuration::minutes(1);
@@ -2727,7 +2727,7 @@ mod tests {
 
     #[test]
     fn canonical_orderbook_correction_replaces_instead_of_accumulating() {
-        let mut store = StateStore::new("ETHUSDT".to_string(), 1_000.0);
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
         let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 6, 10, 0).single().unwrap();
 
         store.ingest(agg_orderbook_event(ts_1, 2, 4, 1.0));
@@ -2745,7 +2745,7 @@ mod tests {
 
     #[test]
     fn canonical_funding_correction_recomputes_recent_timeline() {
-        let mut store = StateStore::new("ETHUSDT".to_string(), 1_000.0);
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
         let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 6, 20, 0).single().unwrap();
         let ts_2 = ts_1 + ChronoDuration::minutes(1);
 

@@ -525,7 +525,7 @@ mod tests {
             }),
         };
 
-        let (_, payload) = absorption_event_json("ETHUSDT", "absorption", &event);
+        let (_, payload) = absorption_event_json("TESTUSDT", "absorption", &event);
         assert_eq!(
             payload.get("trigger_side").and_then(|v| v.as_str()),
             Some("sell")

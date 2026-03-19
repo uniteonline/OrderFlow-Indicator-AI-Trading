@@ -3842,6 +3842,7 @@ fn filter_vpin(payload: &Value) -> Value {
         &mut result,
         payload,
         &[
+            "vpin_bucket_size_base",
             "vpin_bucket_size_eth",
             "vpin_model",
             "vpin_unit",
@@ -5214,7 +5215,7 @@ mod tests {
 
     fn sample_input(indicators: Value, ts_bucket: DateTime<Utc>) -> ModelInvocationInput {
         ModelInvocationInput {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             ts_bucket,
             window_code: "15m".to_string(),
             indicator_count: indicators.as_object().map(|obj| obj.len()).unwrap_or(0),
@@ -5238,7 +5239,7 @@ mod tests {
                 path.file_name()
                     .and_then(|name| name.to_str())
                     .map(|name| {
-                        name.ends_with("_ETHUSDT.json")
+                        name.ends_with("_TESTUSDT.json")
                             && name.chars().next().is_some_and(|ch| ch.is_ascii_digit())
                     })
                     .unwrap_or(false)

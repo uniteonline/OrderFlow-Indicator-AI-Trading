@@ -6284,7 +6284,7 @@ mod tests {
 
     fn sample_model_input(indicators: Value) -> ModelInvocationInput {
         ModelInvocationInput {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             ts_bucket: Utc::now(),
             window_code: "1m".to_string(),
             indicator_count: indicators.as_object().map(|obj| obj.len()).unwrap_or(0),
@@ -6334,7 +6334,7 @@ mod tests {
 
     fn sample_trading_state() -> TradingStateSnapshot {
         TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: true,
             has_open_orders: true,
@@ -6520,7 +6520,7 @@ mod tests {
 
     #[test]
     fn compact_sample_input_size_snapshot() {
-        let path = Path::new("/data/systems/llm/temp_indicator/20260304T055500Z_ETHUSDT.json");
+        let path = Path::new("/data/systems/llm/temp_indicator/20260304T055500Z_TESTUSDT.json");
         if !path.exists() {
             return;
         }
@@ -6578,7 +6578,7 @@ mod tests {
             let bundle = MinuteBundleEnvelope {
                 msg_type: "indicator_bundle".to_string(),
                 routing_key: "test.route".to_string(),
-                symbol: "ETHUSDT".to_string(),
+                symbol: "TESTUSDT".to_string(),
                 ts_bucket,
                 window_code: "15m".to_string(),
                 indicator_count: indicators.as_object().map(|obj| obj.len()).unwrap_or(0),
@@ -6745,7 +6745,7 @@ mod tests {
             let bundle = MinuteBundleEnvelope {
                 msg_type: "indicator_bundle".to_string(),
                 routing_key: "test.route".to_string(),
-                symbol: "ETHUSDT".to_string(),
+                symbol: "TESTUSDT".to_string(),
                 ts_bucket,
                 window_code: "15m".to_string(),
                 indicator_count: 1,
@@ -6769,12 +6769,12 @@ mod tests {
             let captures = vec![
                 EntryStagePromptInputCapture {
                     stage: "scan".to_string(),
-                    prompt_input: json!({"symbol": "ETHUSDT", "stage": "scan"}),
+                    prompt_input: json!({"symbol": "TESTUSDT", "stage": "scan"}),
                     stage_1_setup_scan_json: None,
                 },
                 EntryStagePromptInputCapture {
                     stage: "finalize".to_string(),
-                    prompt_input: json!({"symbol": "ETHUSDT", "stage": "finalize"}),
+                    prompt_input: json!({"symbol": "TESTUSDT", "stage": "finalize"}),
                     stage_1_setup_scan_json: Some(json!({"scan_bias": "bullish"})),
                 },
             ];
@@ -6821,7 +6821,7 @@ mod tests {
     #[test]
     fn hold_telegram_fields_use_live_position_and_exit_orders() {
         let state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: true,
             has_open_orders: true,
@@ -6878,7 +6878,7 @@ mod tests {
     #[test]
     fn hold_telegram_fields_use_conditional_live_exit_orders() {
         let state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: true,
             has_open_orders: true,
@@ -6938,7 +6938,7 @@ mod tests {
     #[test]
     fn hold_telegram_fields_use_both_side_limit_tp_and_conditional_sl() {
         let state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: true,
             has_open_orders: true,
@@ -6998,7 +6998,7 @@ mod tests {
     #[test]
     fn hold_telegram_fields_are_empty_without_active_position() {
         let state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: false,
             has_active_positions: false,
             has_open_orders: true,
@@ -7126,7 +7126,7 @@ mod tests {
     #[test]
     fn management_snapshot_uses_live_binance_entry_and_exit_levels() {
         let state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: true,
             has_open_orders: true,
@@ -7185,7 +7185,7 @@ mod tests {
     #[test]
     fn management_snapshot_uses_conditional_live_binance_exit_levels() {
         let state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: true,
             has_open_orders: true,
@@ -7242,7 +7242,7 @@ mod tests {
     #[test]
     fn management_snapshot_uses_both_side_limit_tp_and_conditional_sl() {
         let state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: true,
             has_open_orders: true,
@@ -7299,7 +7299,7 @@ mod tests {
     #[test]
     fn management_snapshot_includes_pending_order_context_for_open_orders_only() {
         let state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: false,
             has_open_orders: true,
@@ -7396,7 +7396,7 @@ mod tests {
     #[test]
     fn pending_order_mode_requires_entry_like_open_order() {
         let state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: false,
             has_open_orders: true,
@@ -7441,7 +7441,7 @@ mod tests {
     #[test]
     fn pending_order_mode_detects_entry_like_open_order() {
         let state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: false,
             has_open_orders: true,
@@ -7485,10 +7485,10 @@ mod tests {
 
     #[test]
     fn execution_context_keys_for_report_include_directional_alias_for_both() {
-        let keys = execution_context_keys_for_report("ETHUSDT", "BOTH", TradeDecision::Long);
+        let keys = execution_context_keys_for_report("TESTUSDT", "BOTH", TradeDecision::Long);
         assert_eq!(
             keys,
-            vec!["ETHUSDT:BOTH".to_string(), "ETHUSDT:LONG".to_string()]
+            vec!["TESTUSDT:BOTH".to_string(), "TESTUSDT:LONG".to_string()]
         );
     }
 
@@ -7766,7 +7766,7 @@ mod tests {
             raw: MinuteBundleEnvelope {
                 msg_type: "bundle".to_string(),
                 routing_key: "test.route".to_string(),
-                symbol: "ETHUSDT".to_string(),
+                symbol: "TESTUSDT".to_string(),
                 ts_bucket: Utc::now(),
                 window_code: "1m".to_string(),
                 indicator_count: 1,
@@ -7815,7 +7815,7 @@ mod tests {
             raw: MinuteBundleEnvelope {
                 msg_type: "bundle".to_string(),
                 routing_key: "test.route".to_string(),
-                symbol: "ETHUSDT".to_string(),
+                symbol: "TESTUSDT".to_string(),
                 ts_bucket: Utc::now(),
                 window_code: "1m".to_string(),
                 indicator_count: 3,
@@ -8043,7 +8043,7 @@ mod tests {
             .expect("build tokio runtime");
         runtime.block_on(async {
             let state = TradingStateSnapshot {
-                symbol: "ETHUSDT".to_string(),
+                symbol: "TESTUSDT".to_string(),
                 has_active_context: false,
                 has_active_positions: false,
                 has_open_orders: true,
@@ -8069,10 +8069,10 @@ mod tests {
             let runtime_lifecycle_state = Arc::new(Mutex::new(RuntimeLifecycleStore::default()));
             {
                 let mut guard = runtime_lifecycle_state.lock().await;
-                let symbol_state = guard.symbol_state_mut("ETHUSDT");
+                let symbol_state = guard.symbol_state_mut("TESTUSDT");
                 symbol_state.last_management_reason = Some("keep pending".to_string());
                 symbol_state.contexts.insert(
-                    "ETHUSDT:BOTH".to_string(),
+                    "TESTUSDT:BOTH".to_string(),
                     PositionContextState {
                         original_qty: 0.05,
                         last_management_action: None,
@@ -8120,9 +8120,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("llm-temp-indicator-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).expect("create temp indicator dir");
         fs::write(dir.join(".gitignore"), "").expect("write .gitignore");
-        fs::write(dir.join("20260307T105900Z_ETHUSDT.json"), "{}").expect("write old file");
-        fs::write(dir.join("20260307T110000Z_ETHUSDT.json"), "{}").expect("write edge file");
-        fs::write(dir.join("20260307T111500Z_ETHUSDT.json"), "{}").expect("write fresh file");
+        fs::write(dir.join("20260307T105900Z_TESTUSDT.json"), "{}").expect("write old file");
+        fs::write(dir.join("20260307T110000Z_TESTUSDT.json"), "{}").expect("write edge file");
+        fs::write(dir.join("20260307T111500Z_TESTUSDT.json"), "{}").expect("write fresh file");
         fs::write(dir.join("not_a_bundle.json"), "{}").expect("write invalid file");
 
         let removed = prune_expired_temp_indicator_files(
@@ -8135,9 +8135,9 @@ mod tests {
         .expect("prune temp indicator dir");
 
         assert_eq!(removed, 1);
-        assert!(!dir.join("20260307T105900Z_ETHUSDT.json").exists());
-        assert!(dir.join("20260307T110000Z_ETHUSDT.json").exists());
-        assert!(dir.join("20260307T111500Z_ETHUSDT.json").exists());
+        assert!(!dir.join("20260307T105900Z_TESTUSDT.json").exists());
+        assert!(dir.join("20260307T110000Z_TESTUSDT.json").exists());
+        assert!(dir.join("20260307T111500Z_TESTUSDT.json").exists());
         assert!(dir.join("not_a_bundle.json").exists());
         assert!(dir.join(".gitignore").exists());
 
@@ -8214,17 +8214,17 @@ mod tests {
         fs::create_dir_all(&dir).expect("create temp model input dir");
         fs::write(dir.join(".gitignore"), "").expect("write .gitignore");
         fs::write(
-            dir.join("20260307T105900Z_ETHUSDT_entry_20260307T110001000Z.json"),
+            dir.join("20260307T105900Z_TESTUSDT_entry_20260307T110001000Z.json"),
             "{}",
         )
         .expect("write old file");
         fs::write(
-            dir.join("20260307T110000Z_ETHUSDT_management_20260307T110101000Z.json"),
+            dir.join("20260307T110000Z_TESTUSDT_management_20260307T110101000Z.json"),
             "{}",
         )
         .expect("write edge file");
         fs::write(
-            dir.join("20260307T111500Z_ETHUSDT_pending_management_20260307T111601000Z.json"),
+            dir.join("20260307T111500Z_TESTUSDT_pending_management_20260307T111601000Z.json"),
             "{}",
         )
         .expect("write fresh file");
@@ -8241,13 +8241,13 @@ mod tests {
 
         assert_eq!(removed, 1);
         assert!(!dir
-            .join("20260307T105900Z_ETHUSDT_entry_20260307T110001000Z.json")
+            .join("20260307T105900Z_TESTUSDT_entry_20260307T110001000Z.json")
             .exists());
         assert!(dir
-            .join("20260307T110000Z_ETHUSDT_management_20260307T110101000Z.json")
+            .join("20260307T110000Z_TESTUSDT_management_20260307T110101000Z.json")
             .exists());
         assert!(dir
-            .join("20260307T111500Z_ETHUSDT_pending_management_20260307T111601000Z.json")
+            .join("20260307T111500Z_TESTUSDT_pending_management_20260307T111601000Z.json")
             .exists());
         assert!(dir.join("not_a_model_input.json").exists());
         assert!(dir.join(".gitignore").exists());

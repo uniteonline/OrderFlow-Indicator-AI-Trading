@@ -8,6 +8,8 @@ pub struct RootConfig {
     pub database: DatabaseConfig,
     pub api: ApiConfig,
     #[serde(default)]
+    pub market_data: MarketDataConfig,
+    #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
     pub parquet: ParquetConfig,
@@ -19,6 +21,20 @@ pub struct AppSection {
     pub name: String,
     pub env: String,
     pub timezone: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketDataConfig {
+    #[serde(default = "default_market_data_symbol")]
+    pub symbol: String,
+}
+
+impl Default for MarketDataConfig {
+    fn default() -> Self {
+        Self {
+            symbol: default_market_data_symbol(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -443,10 +459,90 @@ pub struct MqBinding {
 }
 
 pub fn load_config(path: &str) -> Result<RootConfig> {
-    let text = std::fs::read_to_string(path)?;
-    let cfg: RootConfig = serde_yaml::from_str(&text)?;
+    let mut doc = load_config_document(path)?;
+    let symbol = extract_global_symbol(&doc)
+        .ok_or_else(|| anyhow!("config.instrument.symbol or market_data.symbol is required"))?;
+    ensure_yaml_string_path(&mut doc, &["market_data", "symbol"], &symbol);
+    let symbol_lower = symbol.to_ascii_lowercase();
+    apply_symbol_placeholders(&mut doc, &symbol, &symbol_lower);
+    let cfg: RootConfig = serde_yaml::from_value(doc)?;
     validate_config(&cfg)?;
     Ok(cfg)
+}
+
+fn load_config_document(path: &str) -> Result<serde_yaml::Value> {
+    let text = std::fs::read_to_string(path)?;
+    Ok(serde_yaml::from_str(&text)?)
+}
+
+fn extract_global_symbol(doc: &serde_yaml::Value) -> Option<String> {
+    for path in [
+        &["instrument", "symbol"][..],
+        &["market_data", "symbol"][..],
+        &["indicator", "symbol"][..],
+        &["llm", "symbol"][..],
+        &["replayer", "symbol"][..],
+    ] {
+        let Some(value) = lookup_yaml_string(doc, path) else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && !trimmed.contains("{symbol") {
+            return Some(trimmed.to_ascii_uppercase());
+        }
+    }
+    None
+}
+
+fn lookup_yaml_string(doc: &serde_yaml::Value, path: &[&str]) -> Option<String> {
+    let mut node = doc;
+    for segment in path {
+        let map = node.as_mapping()?;
+        node = map.get(serde_yaml::Value::String((*segment).to_string()))?;
+    }
+    node.as_str().map(ToOwned::to_owned)
+}
+
+fn ensure_yaml_string_path(doc: &mut serde_yaml::Value, path: &[&str], value: &str) {
+    if path.is_empty() {
+        return;
+    }
+
+    let mut node = doc;
+    for segment in &path[..path.len() - 1] {
+        let Some(map) = node.as_mapping_mut() else {
+            return;
+        };
+        node = map
+            .entry(serde_yaml::Value::String((*segment).to_string()))
+            .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+    }
+
+    if let Some(map) = node.as_mapping_mut() {
+        map.entry(serde_yaml::Value::String(path[path.len() - 1].to_string()))
+            .or_insert_with(|| serde_yaml::Value::String(value.to_string()));
+    }
+}
+
+fn apply_symbol_placeholders(node: &mut serde_yaml::Value, symbol: &str, symbol_lower: &str) {
+    match node {
+        serde_yaml::Value::String(text) => {
+            *text = text
+                .replace("{symbol_lower}", symbol_lower)
+                .replace("{symbol}", symbol);
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for item in items {
+                apply_symbol_placeholders(item, symbol, symbol_lower);
+            }
+        }
+        serde_yaml::Value::Mapping(map) => {
+            for value in map.values_mut() {
+                apply_symbol_placeholders(value, symbol, symbol_lower);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn validate_config(cfg: &RootConfig) -> Result<()> {
@@ -480,6 +576,9 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     if cfg.network.http.timeout_secs == 0 {
         return Err(anyhow!("config.network.http.timeout_secs must be > 0"));
     }
+    if cfg.market_data.symbol.trim().is_empty() {
+        return Err(anyhow!("config.market_data.symbol is empty"));
+    }
     if cfg.network.http.retry.enabled {
         if cfg.network.http.retry.base_backoff_ms == 0 {
             return Err(anyhow!(
@@ -498,6 +597,10 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn default_market_data_symbol() -> String {
+    String::new()
 }
 
 fn resolve_secret(raw: &str) -> String {

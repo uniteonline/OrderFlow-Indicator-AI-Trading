@@ -39,7 +39,7 @@ fn entry_system_prompt_medium_large() -> String {
 }
 
 fn entry_system_prompt_flexible() -> String {
-    r#"You are a discretionary order-flow swing trader for ETHUSDT.
+    r#"You are a discretionary order-flow swing trader for TESTUSDT.
 Use ONLY the provided JSON indicators. Do not invent data.
 
 CORE GOAL
@@ -118,7 +118,7 @@ fn management_system_prompt(template: &str) -> String {
 }
 
 fn management_system_prompt_big() -> String {
-    r#"You are managing an EXISTING futures exposure on ETHUSDT in hedge mode.
+    r#"You are managing an EXISTING futures exposure on TESTUSDT in hedge mode.
 Your style is BIG OPPORTUNITY management — institutional-grade expansions targeting daily / multi-session moves.
 You prioritize structural integrity and patience over micro-management. Noise tolerance is HIGH.
 
@@ -284,7 +284,7 @@ HC-11 SL ANCHOR: SL must remain beyond the defense model anchor (sweep_wick_extr
     .replace("__MODIFY_TPSL__", DECISION_MODIFY_TPSL)
 }
 fn management_system_prompt_medium_large() -> String {
-    r#"You are managing an EXISTING ETHUSDT futures position (hedge mode).
+    r#"You are managing an EXISTING TESTUSDT futures position (hedge mode).
 Choose exactly ONE action: __CLOSE__ | __ADD__ | __REDUCE__ | __HOLD__ | __MODIFY_TPSL__.
 
 ══════════════════════════════════════════

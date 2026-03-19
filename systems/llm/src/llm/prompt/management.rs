@@ -6,7 +6,7 @@ use super::{
 const BIG_PROMPT: &str = include_str!("management/big_opportunity.txt");
 const MEDIUM_PROMPT: &str = include_str!("management/medium_large_opportunity.txt");
 
-pub(super) fn system_prompt(template: &str) -> String {
+pub(super) fn system_prompt(template: &str, symbol: &str) -> String {
     let asset = match template {
         "medium_large_opportunity" => MEDIUM_PROMPT,
         _ => BIG_PROMPT,
@@ -19,6 +19,7 @@ pub(super) fn system_prompt(template: &str) -> String {
             ("__REDUCE__", DECISION_REDUCE),
             ("__HOLD__", DECISION_HOLD),
             ("__MODIFY_TPSL__", DECISION_MODIFY_TPSL),
+            ("__SYMBOL__", symbol),
         ],
     )
 }

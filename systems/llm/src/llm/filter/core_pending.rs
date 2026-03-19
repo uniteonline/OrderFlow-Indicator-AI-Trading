@@ -247,6 +247,7 @@ fn filter_vpin_pending_v1(payload: &Value) -> Value {
         &mut result,
         payload,
         &[
+            "vpin_bucket_size_base",
             "vpin_bucket_size_eth",
             "vpin_fut",
             "vpin_model",

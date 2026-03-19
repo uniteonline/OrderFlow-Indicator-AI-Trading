@@ -725,7 +725,7 @@ mod tests {
             }),
         };
 
-        let (_, payload) = exhaustion_event_json("ETHUSDT", "buying_exhaustion", &event);
+        let (_, payload) = exhaustion_event_json("TESTUSDT", "buying_exhaustion", &event);
         assert_eq!(
             payload.get("pivot_price").and_then(|v| v.as_f64()),
             Some(2069.37)
@@ -777,7 +777,7 @@ mod tests {
             }),
         };
 
-        let (_, payload) = exhaustion_event_json("ETHUSDT", "selling_exhaustion", &event);
+        let (_, payload) = exhaustion_event_json("TESTUSDT", "selling_exhaustion", &event);
         assert_eq!(
             payload.get("delta_lift").and_then(|v| v.as_f64()),
             Some(248.556)

@@ -307,10 +307,8 @@ pub fn decode_contract_body(payload: &[u8]) -> Result<EngineEvent> {
 
 fn parse_trade(data: &Value) -> Result<TradeEvent> {
     let price = required_f64(data, "price")?;
-    let qty_eth = data
-        .get("qty_eth")
-        .map(to_f64)
-        .transpose()?
+    let qty_eth = optional_f64(data, "qty_base")?
+        .or(optional_f64(data, "qty_eth")?)
         .unwrap_or_else(|| required_f64(data, "qty_raw").unwrap_or(0.0));
     let notional_usdt = data
         .get("notional_usdt")
@@ -411,10 +409,15 @@ fn parse_force_order(data: &Value) -> Result<ForceOrderEvent> {
 
 fn parse_agg_trade_1m(data: &Value) -> Result<AggTrade1mEvent> {
     let whale = required_value(data, "whale")?;
-    let qty_eth_total = optional_f64(&whale, "qty_eth_total")?.unwrap_or(0.0);
-    let qty_eth_buy_opt = optional_f64(&whale, "qty_eth_buy")?;
-    let qty_eth_sell_opt = optional_f64(&whale, "qty_eth_sell")?;
-    let delta_qty_opt = optional_f64(&whale, "delta_qty_eth")?;
+    let qty_eth_total = optional_f64(&whale, "qty_base_total")?
+        .or(optional_f64(&whale, "qty_eth_total")?)
+        .unwrap_or(0.0);
+    let qty_eth_buy_opt =
+        optional_f64(&whale, "qty_base_buy")?.or(optional_f64(&whale, "qty_eth_buy")?);
+    let qty_eth_sell_opt =
+        optional_f64(&whale, "qty_base_sell")?.or(optional_f64(&whale, "qty_eth_sell")?);
+    let delta_qty_opt =
+        optional_f64(&whale, "delta_qty_base")?.or(optional_f64(&whale, "delta_qty_eth")?);
     let (qty_eth_buy, qty_eth_sell, _delta_qty_eth) = match (qty_eth_buy_opt, qty_eth_sell_opt) {
         (Some(buy), Some(sell)) => (buy, sell, buy - sell),
         _ => {

@@ -590,7 +590,7 @@ fn parse_args() -> Result<CliArgs> {
 fn print_usage() {
     eprintln!(
         "compact_non_trade_1m_history \\
-  --symbol ETHUSDT --from 2026-03-05T02:52:00Z --to 2026-03-06T04:26:00Z \\
+  --symbol TESTUSDT --from 2026-03-05T02:52:00Z --to 2026-03-06T04:26:00Z \\
   [--market all|spot|futures] [--tables all|orderbook|liq|funding_mark|orderbook,liq] \\
   [--batch-size 256] [--apply] [--config config/config.yaml]"
     );

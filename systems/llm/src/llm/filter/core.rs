@@ -214,7 +214,7 @@ mod tests {
     ) -> ModelInvocationInput {
         let now = Utc::now();
         ModelInvocationInput {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             ts_bucket: now,
             window_code: "15m".to_string(),
             indicator_count: indicators.as_object().map(|obj| obj.len()).unwrap_or(0),
@@ -313,7 +313,7 @@ mod tests {
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .map(|name| name.ends_with("_ETHUSDT.json"))
+                    .map(|name| name.ends_with("_TESTUSDT.json"))
                     .unwrap_or(false)
             })
             .collect::<Vec<_>>();
@@ -401,7 +401,7 @@ mod tests {
 
     fn sample_trading_state() -> TradingStateSnapshot {
         TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: true,
             has_open_orders: true,

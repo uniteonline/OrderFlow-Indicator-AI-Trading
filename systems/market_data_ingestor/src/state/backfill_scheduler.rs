@@ -15,7 +15,6 @@ use std::time::Duration;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info, warn};
 
-const SYMBOL: &str = "ETHUSDT";
 const FUNDING_BACKFILL_INTERVAL_SECS: u64 = 60;
 const PREMIUM_INDEX_BOOTSTRAP_INTERVAL_SECS: u64 = 20;
 const EXCHANGE_INFO_REFRESH_INTERVAL_SECS: u64 = 86_400;
@@ -29,11 +28,12 @@ pub async fn run_funding_rate_backfill_loop(
     outbox_writer: Arc<OutboxWriter>,
     metrics: Arc<AppMetrics>,
 ) -> Result<()> {
+    let symbol = ctx.config.market_data.symbol.as_str();
     let mut last_funding_time: Option<i64> = None;
     let mut last_premium_time: Option<i64> = None;
     let mut spot_exchange_info_bootstrapped = false;
     let mut futures_exchange_info_bootstrapped = false;
-    match checkpoints::load_checkpoint_seeds(&ctx.ops_db_pool, "futures", SYMBOL).await {
+    match checkpoints::load_checkpoint_seeds(&ctx.ops_db_pool, "futures", symbol).await {
         Ok(seeds) => {
             for seed in &seeds {
                 let Some(last_ts) = seed.last_event_ts else {
@@ -58,7 +58,7 @@ pub async fn run_funding_rate_backfill_loop(
             }
             info!(
                 market = "futures",
-                symbol = SYMBOL,
+                symbol = symbol,
                 seed_count = seeds.len(),
                 last_funding_time = ?last_funding_time,
                 last_premium_time = ?last_premium_time,
@@ -66,7 +66,7 @@ pub async fn run_funding_rate_backfill_loop(
             );
         }
         Err(err) => {
-            warn!(error = %err, market = "futures", symbol = SYMBOL, "load checkpoint seeds for scheduler failed");
+            warn!(error = %err, market = "futures", symbol = symbol, "load checkpoint seeds for scheduler failed");
         }
     }
 
@@ -79,7 +79,7 @@ pub async fn run_funding_rate_backfill_loop(
     exchange_info_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     info!(
-        symbol = SYMBOL,
+        symbol = symbol,
         funding_interval_secs = FUNDING_BACKFILL_INTERVAL_SECS,
         premium_interval_secs = PREMIUM_INDEX_BOOTSTRAP_INTERVAL_SECS,
         exchange_info_interval_secs = EXCHANGE_INFO_REFRESH_INTERVAL_SECS,
@@ -96,6 +96,7 @@ pub async fn run_funding_rate_backfill_loop(
                     &publisher,
                     &outbox_writer,
                     &metrics,
+                    symbol,
                     &mut last_funding_time,
                 ).await;
             }
@@ -107,6 +108,7 @@ pub async fn run_funding_rate_backfill_loop(
                     &publisher,
                     &outbox_writer,
                     &metrics,
+                    symbol,
                     &mut last_premium_time,
                     ctx.rest_proxy_url.is_some(),
                 ).await;
@@ -128,12 +130,14 @@ pub async fn run_funding_rate_backfill_loop(
                     spot_trigger,
                     &rest_client,
                     &ops_writer,
+                    symbol,
                 ).await;
                 handle_exchange_info(
                     "futures",
                     futures_trigger,
                     &rest_client,
                     &ops_writer,
+                    symbol,
                 ).await;
 
                 spot_exchange_info_bootstrapped = true;
@@ -150,18 +154,19 @@ async fn handle_funding_rate(
     publisher: &Arc<MqPublisher>,
     outbox_writer: &Arc<OutboxWriter>,
     metrics: &Arc<AppMetrics>,
+    symbol: &str,
     last_funding_time: &mut Option<i64>,
 ) {
-    let row = match rest_client.fetch_latest_funding_rate(SYMBOL).await {
+    let row = match rest_client.fetch_latest_funding_rate(symbol).await {
         Ok(row) => row,
         Err(err) => {
-            warn!(error = %err, symbol = SYMBOL, "fetch funding rate failed");
+            warn!(error = %err, symbol = symbol, "fetch funding rate failed");
             return;
         }
     };
 
     let Some(record) = row else {
-        warn!(symbol = SYMBOL, "funding rate api returned empty result");
+        warn!(symbol = symbol, "funding rate api returned empty result");
         return;
     };
 
@@ -174,7 +179,7 @@ async fn handle_funding_rate(
         Err(err) => {
             warn!(
                 error = %err,
-                symbol = SYMBOL,
+                symbol = symbol,
                 funding_time = record.funding_time,
                 "normalize funding rate failed"
             );
@@ -195,7 +200,7 @@ async fn handle_funding_rate(
     {
         error!(
             error = %err,
-            symbol = SYMBOL,
+            symbol = symbol,
             funding_time = record.funding_time,
             "persist funding rate event failed"
         );
@@ -205,7 +210,7 @@ async fn handle_funding_rate(
     if let Err(err) = ops_writer
         .insert_backfill_job_run(
             Some("futures"),
-            Some(SYMBOL),
+            Some(symbol),
             "/fapi/v1/fundingRate",
             "funding_history_backfill",
             "reconcile",
@@ -229,15 +234,16 @@ async fn handle_premium_index(
     publisher: &Arc<MqPublisher>,
     outbox_writer: &Arc<OutboxWriter>,
     metrics: &Arc<AppMetrics>,
+    symbol: &str,
     last_premium_time: &mut Option<i64>,
     proxy_enabled: bool,
 ) {
-    let premium = match rest_client.fetch_premium_index(SYMBOL).await {
+    let premium = match rest_client.fetch_premium_index(symbol).await {
         Ok(v) => v,
         Err(err) => {
             warn!(
                 error = %err,
-                symbol = SYMBOL,
+                symbol = symbol,
                 proxy_enabled = proxy_enabled,
                 interval_secs = PREMIUM_INDEX_BOOTSTRAP_INTERVAL_SECS,
                 "fetch premium index failed"
@@ -252,12 +258,12 @@ async fn handle_premium_index(
     }
 
     let event = match mark_price_normalizer::normalize_premium_index_rest(
-        SYMBOL, &premium, "rest", false,
+        symbol, &premium, "rest", false,
     ) {
         Ok(event) => event,
         Err(err) => {
             metrics.inc_normalize_error();
-            warn!(error = %err, symbol = SYMBOL, "normalize premium index failed");
+            warn!(error = %err, symbol = symbol, "normalize premium index failed");
             return;
         }
     };
@@ -272,14 +278,14 @@ async fn handle_premium_index(
     )
     .await
     {
-        error!(error = %err, symbol = SYMBOL, "persist premium index mark price failed");
+        error!(error = %err, symbol = symbol, "persist premium index mark price failed");
         return;
     }
 
     if let Err(err) = ops_writer
         .insert_backfill_job_run(
             Some("futures"),
-            Some(SYMBOL),
+            Some(symbol),
             "/fapi/v1/premiumIndex",
             "mark_funding_bootstrap",
             "reconcile",
@@ -325,6 +331,7 @@ async fn handle_exchange_info(
     trigger_type: &str,
     rest_client: &Arc<BinanceRestClient>,
     ops_writer: &Arc<OpsDbWriter>,
+    symbol: &str,
 ) {
     let endpoint = if market == "spot" {
         "/api/v3/exchangeInfo"
@@ -332,19 +339,19 @@ async fn handle_exchange_info(
         "/fapi/v1/exchangeInfo"
     };
 
-    let info = match rest_client.fetch_exchange_info(market, Some(SYMBOL)).await {
+    let info = match rest_client.fetch_exchange_info(market, Some(symbol)).await {
         Ok(v) => v,
         Err(err) => {
-            warn!(error = %err, market, symbol = SYMBOL, "fetch exchange info failed");
+            warn!(error = %err, market, symbol = symbol, "fetch exchange info failed");
             let err_message = err.to_string();
             if let Err(e) = ops_writer
                 .insert_backfill_job_run(
                     Some(market),
-                    Some(SYMBOL),
+                    Some(symbol),
                     endpoint,
                     "bootstrap_metadata",
                     trigger_type,
-                    json!({ "symbol": SYMBOL }),
+                    json!({ "symbol": symbol }),
                     Some(0),
                     "failed",
                     Some(err_message.as_str()),
@@ -359,7 +366,7 @@ async fn handle_exchange_info(
 
     let mut rows = 0i64;
     for symbol_info in &info.symbols {
-        if !symbol_info.symbol.eq_ignore_ascii_case(SYMBOL) {
+        if !symbol_info.symbol.eq_ignore_ascii_case(symbol) {
             continue;
         }
 
@@ -402,11 +409,11 @@ async fn handle_exchange_info(
     if let Err(err) = ops_writer
         .insert_backfill_job_run(
             Some(market),
-            Some(SYMBOL),
+            Some(symbol),
             endpoint,
             "bootstrap_metadata",
             trigger_type,
-            json!({ "symbol": SYMBOL }),
+            json!({ "symbol": symbol }),
             Some(rows),
             "success",
             None,

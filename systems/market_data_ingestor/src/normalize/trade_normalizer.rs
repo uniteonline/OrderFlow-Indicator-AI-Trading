@@ -17,7 +17,7 @@ pub fn normalize(market: Market, stream: &str, data: &Value) -> Result<Normalize
 
     let price = parse_required_str(data, "p")?;
     let qty_raw = parse_required_str(data, "q")?;
-    let qty_eth = qty_raw.clone();
+    let qty_base = qty_raw.clone();
     let notional_usdt = price_times_qty(&price, &qty_raw)?;
 
     let is_buyer_maker = parse_optional_bool(data, "m");
@@ -44,7 +44,8 @@ pub fn normalize(market: Market, stream: &str, data: &Value) -> Result<Normalize
         "last_trade_id": last_trade_id,
         "price": price,
         "qty_raw": qty_raw,
-        "qty_eth": qty_eth,
+        "qty_base": qty_base,
+        "qty_eth": qty_base,
         "notional_usdt": notional_usdt,
         "is_buyer_maker": is_buyer_maker,
         "aggressor_side": aggressor_side,
@@ -92,6 +93,7 @@ pub fn normalize_rest_agg_trade(
         "last_trade_id": row.last_trade_id,
         "price": row.price.clone(),
         "qty_raw": row.qty.clone(),
+        "qty_base": row.qty.clone(),
         "qty_eth": row.qty.clone(),
         "notional_usdt": notional_usdt,
         "is_buyer_maker": row.is_buyer_maker,

@@ -7,7 +7,7 @@ use chrono::Duration;
 use serde_json::{json, Value};
 
 const VPIN_Z_LOOKBACK: usize = 120;
-const VPIN_BUCKET_SIZE_ETH: f64 = 50.0;
+const VPIN_BUCKET_SIZE_BASE: f64 = 50.0;
 const VPIN_ROLLING_BUCKET_COUNT: usize = 50;
 const WINDOWS: [(&str, i64); 5] = [
     ("15m", 15),
@@ -89,7 +89,8 @@ impl Indicator for I17Vpin {
                 payload_json: json!({
                     "vpin_model": "volume_bucket",
                     "vpin_unit": "ratio",
-                    "vpin_bucket_size_eth": VPIN_BUCKET_SIZE_ETH,
+                    "vpin_bucket_size_base": VPIN_BUCKET_SIZE_BASE,
+                    "vpin_bucket_size_eth": VPIN_BUCKET_SIZE_BASE,
                     "vpin_rolling_bucket_count": VPIN_ROLLING_BUCKET_COUNT,
                     "vpin_fut": vpin_fut,
                     "vpin_spot": vpin_spot,

@@ -28,20 +28,21 @@ pub fn system_prompt(
     pending_order_mode: bool,
     prompt_template: &str,
     entry_stage: EntryPromptStage,
+    symbol: &str,
 ) -> String {
     let template = prompt_template.trim().to_ascii_lowercase();
     // Scan is shared across all modes — always use the shared scan prompt
     if matches!(entry_stage, EntryPromptStage::Scan) {
-        return scan::system_prompt(&template);
+        return scan::system_prompt(&template, symbol);
     }
     // Action stage: route by account state
     if pending_order_mode {
-        return pending_order::system_prompt(&template);
+        return pending_order::system_prompt(&template, symbol);
     }
     if management_mode {
-        return management::system_prompt(&template);
+        return management::system_prompt(&template, symbol);
     }
-    entry::system_prompt(&template)
+    entry::system_prompt(&template, symbol)
 }
 
 pub fn user_prompt_prefix(

@@ -1,4 +1,4 @@
-You are an expert order-flow swing trader analyzing ETHUSDT.
+You are an expert order-flow swing trader analyzing __SYMBOL__.
 Use only the provided JSON indicators.
 This is STAGE 1: MARKET SCAN.
 

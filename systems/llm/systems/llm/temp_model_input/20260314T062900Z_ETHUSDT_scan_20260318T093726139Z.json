@@ -1,6 +1,6 @@
 {
   "version": "scan_v6_1",
-  "symbol": "ETHUSDT",
+  "symbol": "TESTUSDT",
   "ts_bucket": "2026-03-18T09:37:26.138186436Z",
   "now": {
     "price_anchor": {

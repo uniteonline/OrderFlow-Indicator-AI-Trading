@@ -5,7 +5,7 @@
 -- CVD is computed at query time from the stored delta values, which are always accurate.
 --
 -- Usage:
---   SELECT * FROM feat.v_cvd_reconstructed WHERE symbol='ETHUSDT' ORDER BY ts_snapshot DESC LIMIT 10;
+--   SELECT * FROM feat.v_cvd_reconstructed WHERE symbol='BTCUSDT' ORDER BY ts_snapshot DESC LIMIT 10;
 
 CREATE OR REPLACE VIEW feat.v_cvd_reconstructed AS
 SELECT

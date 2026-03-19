@@ -11,7 +11,7 @@ const MICROPRICE_LAMBDA_OBI: f64 = 0.15;
 const SIZE_FLOOR: f64 = 1e-3;
 const TICK_SIZE: f64 = 1.0 / PRICE_SCALE;
 const EMITTED_CHUNK_RETENTION_MINUTES: i64 = 5;
-const VPIN_BUCKET_SIZE_ETH: f64 = 50.0;
+const VPIN_BUCKET_SIZE_BASE: f64 = 50.0;
 const VPIN_ROLLING_BUCKETS: usize = 50;
 const VPIN_EPS: f64 = 1e-12;
 
@@ -113,7 +113,7 @@ struct VpinState {
 
 impl Default for VpinState {
     fn default() -> Self {
-        Self::new(VPIN_BUCKET_SIZE_ETH, VPIN_ROLLING_BUCKETS)
+        Self::new(VPIN_BUCKET_SIZE_BASE, VPIN_ROLLING_BUCKETS)
     }
 }
 
@@ -861,10 +861,11 @@ impl MinuteBatchAggregator {
         let Some(price) = value_f64(&event.data, "price") else {
             return;
         };
-        let qty_eth = value_f64(&event.data, "qty_eth")
+        let qty_base = value_f64(&event.data, "qty_base")
+            .or_else(|| value_f64(&event.data, "qty_eth"))
             .or_else(|| value_f64(&event.data, "qty_raw"))
             .unwrap_or(0.0);
-        let notional_usdt = value_f64(&event.data, "notional_usdt").unwrap_or(price * qty_eth);
+        let notional_usdt = value_f64(&event.data, "notional_usdt").unwrap_or(price * qty_base);
         let aggressor_side = value_i64(&event.data, "aggressor_side")
             .map(|v| if v >= 0 { 1 } else { -1 })
             .or_else(|| {
@@ -883,7 +884,7 @@ impl MinuteBatchAggregator {
         chunk.apply_trade(
             event,
             price,
-            qty_eth,
+            qty_base,
             notional_usdt,
             aggressor_side,
             self.whale_threshold_usdt,
@@ -894,9 +895,9 @@ impl MinuteBatchAggregator {
             .entry(state_key)
             .or_insert_with(VpinState::default);
         if aggressor_side >= 0 {
-            vpin_state.ingest_flow(qty_eth, 0.0);
+            vpin_state.ingest_flow(qty_base, 0.0);
         } else {
-            vpin_state.ingest_flow(0.0, qty_eth);
+            vpin_state.ingest_flow(0.0, qty_base);
         }
         chunk.vpin_snapshot = Some(vpin_state.snapshot());
     }
@@ -1009,16 +1010,22 @@ impl MinuteBatchAggregator {
         }
 
         if let Some(whale) = event.data.get("whale") {
-            let qty_eth_total = value_f64(whale, "qty_eth_total").unwrap_or(0.0);
-            let qty_eth_buy = value_f64(whale, "qty_eth_buy")
+            let qty_eth_total = value_f64(whale, "qty_base_total")
+                .or_else(|| value_f64(whale, "qty_eth_total"))
+                .unwrap_or(0.0);
+            let qty_eth_buy = value_f64(whale, "qty_base_buy")
+                .or_else(|| value_f64(whale, "qty_eth_buy"))
                 .or_else(|| {
-                    value_f64(whale, "delta_qty_eth")
+                    value_f64(whale, "delta_qty_base")
+                        .or_else(|| value_f64(whale, "delta_qty_eth"))
                         .map(|delta| ((qty_eth_total + delta) / 2.0).max(0.0))
                 })
                 .unwrap_or(0.0);
-            let qty_eth_sell = value_f64(whale, "qty_eth_sell")
+            let qty_eth_sell = value_f64(whale, "qty_base_sell")
+                .or_else(|| value_f64(whale, "qty_eth_sell"))
                 .or_else(|| {
-                    value_f64(whale, "delta_qty_eth")
+                    value_f64(whale, "delta_qty_base")
+                        .or_else(|| value_f64(whale, "delta_qty_eth"))
                         .map(|delta| ((qty_eth_total - delta) / 2.0).max(0.0))
                 })
                 .unwrap_or(0.0);
@@ -1301,6 +1308,10 @@ fn build_trade_event(key: MinuteKey, chunk: TradeChunk) -> NormalizedMdEvent {
             "notional_total": chunk.whale.notional_total,
             "notional_buy": chunk.whale.notional_buy,
             "notional_sell": chunk.whale.notional_sell,
+            "qty_base_total": chunk.whale.qty_eth_total,
+            "qty_base_buy": chunk.whale.qty_eth_buy,
+            "qty_base_sell": chunk.whale.qty_eth_sell,
+            "delta_qty_base": chunk.whale.qty_eth_buy - chunk.whale.qty_eth_sell,
             "qty_eth_total": chunk.whale.qty_eth_total,
             "qty_eth_buy": chunk.whale.qty_eth_buy,
             "qty_eth_sell": chunk.whale.qty_eth_sell,
@@ -1936,10 +1947,10 @@ mod tests {
         NormalizedMdEvent {
             msg_type: "md.trade".to_string(),
             market: "futures".to_string(),
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "ws".to_string(),
             backfill_in_progress: false,
-            routing_key: "md.futures.trade.ethusdt".to_string(),
+            routing_key: "md.futures.trade.testusdt".to_string(),
             stream_name: "trade".to_string(),
             event_ts: ts,
             data: json!({
@@ -1961,10 +1972,10 @@ mod tests {
         NormalizedMdEvent {
             msg_type: "md.bbo".to_string(),
             market: "futures".to_string(),
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "ws".to_string(),
             backfill_in_progress: false,
-            routing_key: "md.futures.bbo.ethusdt".to_string(),
+            routing_key: "md.futures.bbo.testusdt".to_string(),
             stream_name: "bbo".to_string(),
             event_ts: ts,
             data: json!({
@@ -1986,10 +1997,10 @@ mod tests {
         NormalizedMdEvent {
             msg_type: "md.agg.trade.1s".to_string(),
             market: "futures".to_string(),
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "derived".to_string(),
             backfill_in_progress: false,
-            routing_key: "md.agg.futures.trade.1s.ethusdt".to_string(),
+            routing_key: "md.agg.futures.trade.1s.testusdt".to_string(),
             stream_name: "agg.trade.1s".to_string(),
             event_ts: ts,
             data: json!({
@@ -2040,11 +2051,11 @@ mod tests {
         NormalizedMdEvent {
             msg_type: "md.kline".to_string(),
             market: "futures".to_string(),
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "ws".to_string(),
             backfill_in_progress: false,
-            routing_key: "md.futures.kline.1m.ethusdt".to_string(),
-            stream_name: "ethusdt@kline_1m".to_string(),
+            routing_key: "md.futures.kline.1m.testusdt".to_string(),
+            stream_name: "testusdt@kline_1m".to_string(),
             event_ts: ts,
             data: json!({
                 "interval_code": "1m",

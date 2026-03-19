@@ -310,6 +310,7 @@ fn build_prompt_pair(
         input.pending_order_mode,
         prompt_template,
         entry_stage,
+        &input.symbol,
     );
     let mut user = format!(
         "{}{}",
@@ -3548,7 +3549,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         ModelInvocationInput {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             ts_bucket: now,
             window_code: "15m".to_string(),
             indicator_count: 4,
@@ -4061,7 +4062,7 @@ mod tests {
     #[test]
     fn medium_large_finalize_trace_keeps_new_scan_fields() {
         let input = ModelInvocationInput {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             ts_bucket: Utc::now(),
             window_code: "15m".to_string(),
             indicator_count: 2,
@@ -4126,7 +4127,7 @@ mod tests {
     fn serialize_entry_finalize_input_uses_strategy_focused_indicator_subset() {
         let now = Utc::now();
         let input = ModelInvocationInput {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             ts_bucket: now,
             window_code: "15m".to_string(),
             indicator_count: 11,
@@ -4185,7 +4186,7 @@ mod tests {
     fn serialize_entry_finalize_input_keeps_scan_referenced_supporting_indicators() {
         let now = Utc::now();
         let input = ModelInvocationInput {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             ts_bucket: now,
             window_code: "15m".to_string(),
             indicator_count: 14,
@@ -4252,7 +4253,7 @@ mod tests {
     fn serialize_entry_finalize_input_keeps_tp_relevant_htf_indicators_for_value_area_refill() {
         let now = Utc::now();
         let input = ModelInvocationInput {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             ts_bucket: now,
             window_code: "15m".to_string(),
             indicator_count: 12,
@@ -4350,7 +4351,7 @@ mod tests {
     fn build_prompt_pair_captures_finalize_prompt_input_and_stage1_scan() {
         let now = Utc::now();
         let input = ModelInvocationInput {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             ts_bucket: now,
             window_code: "15m".to_string(),
             indicator_count: 3,
@@ -4421,7 +4422,7 @@ mod tests {
         let now = Utc::now();
 
         let input = ModelInvocationInput {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             ts_bucket: now,
             window_code: "15m".to_string(),
             indicator_count: 5,
@@ -4532,7 +4533,7 @@ mod tests {
     fn serialize_management_scan_stage_uses_shared_scan_filter() {
         let now = Utc::now();
         let input = ModelInvocationInput {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             ts_bucket: now,
             window_code: "15m".to_string(),
             indicator_count: 1,
@@ -4596,7 +4597,7 @@ mod tests {
     fn serialize_pending_order_scan_stage_uses_shared_scan_filter() {
         let now = Utc::now();
         let input = ModelInvocationInput {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             ts_bucket: now,
             window_code: "15m".to_string(),
             indicator_count: 1,
@@ -4872,7 +4873,7 @@ mod tests {
     fn serialize_management_input_omits_entry_v_and_v_derived_management_fields() {
         let now = Utc::now();
         let input = ModelInvocationInput {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             ts_bucket: now,
             window_code: "15m".to_string(),
             indicator_count: 2,

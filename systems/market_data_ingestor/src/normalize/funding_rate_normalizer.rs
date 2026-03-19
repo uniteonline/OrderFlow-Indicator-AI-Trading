@@ -28,7 +28,7 @@ mod tests {
     #[test]
     fn normalize_rest_record_respects_backfill_flag() {
         let record = BinanceFundingRateRecord {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             funding_rate: "-0.0001".to_string(),
             funding_time: 1_700_000_000_000,
             mark_price: Some("2000.0".to_string()),

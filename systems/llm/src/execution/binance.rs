@@ -4075,7 +4075,7 @@ mod tests {
     #[test]
     fn has_active_position_for_side_respects_hedge_mode() {
         let state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: true,
             has_open_orders: true,
@@ -4110,7 +4110,7 @@ mod tests {
     #[test]
     fn active_position_abs_qty_for_side_respects_mode() {
         let state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: true,
             has_open_orders: false,
@@ -4145,7 +4145,7 @@ mod tests {
     #[test]
     fn staged_exit_cleanup_only_runs_when_entry_gone_and_flat() {
         let state_with_entry = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: false,
             has_open_orders: true,
@@ -4175,7 +4175,7 @@ mod tests {
         ));
 
         let state_with_position = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: true,
             has_open_orders: false,
@@ -4199,7 +4199,7 @@ mod tests {
         ));
 
         let flat_state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: false,
             has_active_positions: false,
             has_open_orders: false,
@@ -4222,14 +4222,14 @@ mod tests {
         let mut state = AccountWsState::default();
         state
             .flattened_at
-            .insert(("ETHUSDT".to_string(), "LONG".to_string()), flatten_at);
+            .insert(("TESTUSDT".to_string(), "LONG".to_string()), flatten_at);
 
         assert!(ws_state_has_recent_flatten_event(
-            &state, "ETHUSDT", "LONG", flatten_at
+            &state, "TESTUSDT", "LONG", flatten_at
         ));
         assert!(!ws_state_has_recent_flatten_event(
             &state,
-            "ETHUSDT",
+            "TESTUSDT",
             "LONG",
             flatten_at.checked_add(Duration::from_secs(1)).unwrap()
         ));
@@ -4238,7 +4238,7 @@ mod tests {
     #[test]
     fn orphan_exit_cleanup_requires_flat_exit_only_state() {
         let flat_exit_only_state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: false,
             has_open_orders: true,
@@ -4281,7 +4281,7 @@ mod tests {
         ));
 
         let state_with_entry = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: false,
             has_open_orders: true,
@@ -4315,7 +4315,7 @@ mod tests {
             total_wallet_balance: Some(100.0),
             available_balance: Some(90.0),
             positions: HashMap::from([(
-                ("ETHUSDT".to_string(), "BOTH".to_string()),
+                ("TESTUSDT".to_string(), "BOTH".to_string()),
                 ActivePositionSnapshot {
                     position_side: "BOTH".to_string(),
                     position_amt: -0.25,
@@ -4331,22 +4331,22 @@ mod tests {
             "e": "ACCOUNT_UPDATE",
             "a": {
                 "B": [{"a": "USDT", "wb": "100.0", "cw": "95.0"}],
-                "P": [{"s": "ETHUSDT", "ps": "BOTH", "pa": "0", "ep": "0", "up": "0"}]
+                "P": [{"s": "TESTUSDT", "ps": "BOTH", "pa": "0", "ep": "0", "up": "0"}]
             }
         });
 
         let flattened = apply_account_update_event(&payload, &state);
-        assert_eq!(flattened, vec!["ETHUSDT".to_string()]);
+        assert_eq!(flattened, vec!["TESTUSDT".to_string()]);
 
         let guard = state.lock().expect("lock state");
         assert!(guard
             .positions
-            .get(&("ETHUSDT".to_string(), "BOTH".to_string()))
+            .get(&("TESTUSDT".to_string(), "BOTH".to_string()))
             .is_none());
         assert_eq!(guard.available_balance, Some(95.0));
         assert!(guard
             .flattened_at
-            .contains_key(&("ETHUSDT".to_string(), "BOTH".to_string())));
+            .contains_key(&("TESTUSDT".to_string(), "BOTH".to_string())));
     }
 
     #[test]
@@ -4356,7 +4356,7 @@ mod tests {
             total_wallet_balance: Some(100.0),
             available_balance: Some(90.0),
             positions: HashMap::from([(
-                ("ETHUSDT".to_string(), "LONG".to_string()),
+                ("TESTUSDT".to_string(), "LONG".to_string()),
                 ActivePositionSnapshot {
                     position_side: "LONG".to_string(),
                     position_amt: 0.25,
@@ -4371,29 +4371,29 @@ mod tests {
         let flatten_payload = json!({
             "e": "ACCOUNT_UPDATE",
             "a": {
-                "P": [{"s": "ETHUSDT", "ps": "LONG", "pa": "0", "ep": "0", "up": "0"}]
+                "P": [{"s": "TESTUSDT", "ps": "LONG", "pa": "0", "ep": "0", "up": "0"}]
             }
         });
         let reopen_payload = json!({
             "e": "ACCOUNT_UPDATE",
             "a": {
-                "P": [{"s": "ETHUSDT", "ps": "LONG", "pa": "0.30", "ep": "2210", "up": "3.0"}]
+                "P": [{"s": "TESTUSDT", "ps": "LONG", "pa": "0.30", "ep": "2210", "up": "3.0"}]
             }
         });
 
         let flattened = apply_account_update_event(&flatten_payload, &state);
-        assert_eq!(flattened, vec!["ETHUSDT".to_string()]);
+        assert_eq!(flattened, vec!["TESTUSDT".to_string()]);
         let reopened = apply_account_update_event(&reopen_payload, &state);
         assert!(reopened.is_empty());
 
         let guard = state.lock().expect("lock state");
         assert!(!guard
             .flattened_at
-            .contains_key(&("ETHUSDT".to_string(), "LONG".to_string())));
+            .contains_key(&("TESTUSDT".to_string(), "LONG".to_string())));
         assert_eq!(
             guard
                 .positions
-                .get(&("ETHUSDT".to_string(), "LONG".to_string()))
+                .get(&("TESTUSDT".to_string(), "LONG".to_string()))
                 .map(|position| position.position_amt),
             Some(0.30)
         );
@@ -4402,7 +4402,7 @@ mod tests {
     #[test]
     fn orphan_exit_cleanup_collects_only_flattened_hedge_side_orders() {
         let state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: true,
             has_open_orders: true,
@@ -4501,7 +4501,7 @@ mod tests {
     #[test]
     fn orphan_exit_cleanup_skips_side_when_pending_entry_still_exists() {
         let state = TradingStateSnapshot {
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             has_active_context: true,
             has_active_positions: true,
             has_open_orders: true,
@@ -4864,7 +4864,7 @@ mod tests {
     #[test]
     fn build_close_order_params_use_reduce_only_in_one_way_mode() {
         let params = build_close_order_params(
-            "ETHUSDT",
+            "TESTUSDT",
             "SELL",
             "BOTH",
             "TAKE_PROFIT_MARKET",
@@ -4877,7 +4877,7 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(
             params_map.get("symbol").map(String::as_str),
-            Some("ETHUSDT")
+            Some("TESTUSDT")
         );
         assert_eq!(params_map.get("side").map(String::as_str), Some("SELL"));
         assert_eq!(
@@ -4899,7 +4899,7 @@ mod tests {
     #[test]
     fn build_close_order_params_omit_reduce_only_in_hedge_mode() {
         let params =
-            build_close_order_params("ETHUSDT", "SELL", "LONG", "STOP_MARKET", "0.01", "2078.77");
+            build_close_order_params("TESTUSDT", "SELL", "LONG", "STOP_MARKET", "0.01", "2078.77");
         let params_map = params
             .into_iter()
             .collect::<std::collections::HashMap<_, _>>();
@@ -4909,7 +4909,7 @@ mod tests {
     #[test]
     fn build_limit_algo_close_order_params_include_limit_fields_for_one_way_mode() {
         let params = build_limit_algo_close_order_params(
-            "ETHUSDT", "SELL", "BOTH", "STOP", "0.01", "2305.00", "2345.34", "GTC", "tp_maker",
+            "TESTUSDT", "SELL", "BOTH", "STOP", "0.01", "2305.00", "2345.34", "GTC", "tp_maker",
         );
 
         let params_map = params

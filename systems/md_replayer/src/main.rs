@@ -175,7 +175,7 @@ impl Default for ReplayerConfig {
 }
 
 fn default_replay_symbol() -> String {
-    "ETHUSDT".to_string()
+    String::new()
 }
 
 fn default_replay_market() -> String {
@@ -331,8 +331,88 @@ fn init_tracing() {
 }
 
 fn load_config(path: &str) -> Result<RootConfig> {
+    let mut doc = load_config_document(path)?;
+    let symbol = extract_global_symbol(&doc)
+        .ok_or_else(|| anyhow!("config.instrument.symbol or replayer.symbol is required"))?;
+    ensure_yaml_string_path(&mut doc, &["replayer", "symbol"], &symbol);
+    let symbol_lower = symbol.to_ascii_lowercase();
+    apply_symbol_placeholders(&mut doc, &symbol, &symbol_lower);
+    Ok(serde_yaml::from_value(doc)?)
+}
+
+fn load_config_document(path: &str) -> Result<serde_yaml::Value> {
     let text = std::fs::read_to_string(path)?;
     Ok(serde_yaml::from_str(&text)?)
+}
+
+fn extract_global_symbol(doc: &serde_yaml::Value) -> Option<String> {
+    for path in [
+        &["instrument", "symbol"][..],
+        &["replayer", "symbol"][..],
+        &["indicator", "symbol"][..],
+        &["llm", "symbol"][..],
+        &["market_data", "symbol"][..],
+    ] {
+        let Some(value) = lookup_yaml_string(doc, path) else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && !trimmed.contains("{symbol") {
+            return Some(trimmed.to_ascii_uppercase());
+        }
+    }
+    None
+}
+
+fn lookup_yaml_string(doc: &serde_yaml::Value, path: &[&str]) -> Option<String> {
+    let mut node = doc;
+    for segment in path {
+        let map = node.as_mapping()?;
+        node = map.get(serde_yaml::Value::String((*segment).to_string()))?;
+    }
+    node.as_str().map(ToOwned::to_owned)
+}
+
+fn ensure_yaml_string_path(doc: &mut serde_yaml::Value, path: &[&str], value: &str) {
+    if path.is_empty() {
+        return;
+    }
+
+    let mut node = doc;
+    for segment in &path[..path.len() - 1] {
+        let Some(map) = node.as_mapping_mut() else {
+            return;
+        };
+        node = map
+            .entry(serde_yaml::Value::String((*segment).to_string()))
+            .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+    }
+
+    if let Some(map) = node.as_mapping_mut() {
+        map.entry(serde_yaml::Value::String(path[path.len() - 1].to_string()))
+            .or_insert_with(|| serde_yaml::Value::String(value.to_string()));
+    }
+}
+
+fn apply_symbol_placeholders(node: &mut serde_yaml::Value, symbol: &str, symbol_lower: &str) {
+    match node {
+        serde_yaml::Value::String(text) => {
+            *text = text
+                .replace("{symbol_lower}", symbol_lower)
+                .replace("{symbol}", symbol);
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for item in items {
+                apply_symbol_placeholders(item, symbol, symbol_lower);
+            }
+        }
+        serde_yaml::Value::Mapping(map) => {
+            for value in map.values_mut() {
+                apply_symbol_placeholders(value, symbol, symbol_lower);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn validate_config(cfg: &RootConfig) -> Result<()> {
@@ -341,6 +421,9 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
     }
     if cfg.mq.exchanges.md_replay.name.trim().is_empty() {
         return Err(anyhow!("mq.exchanges.md_replay.name is empty"));
+    }
+    if cfg.replayer.symbol.trim().is_empty() {
+        return Err(anyhow!("replayer.symbol is empty"));
     }
     match cfg.replayer.market.as_str() {
         "all" | "spot" | "futures" => {}
@@ -409,6 +492,7 @@ async fn fetch_batch(
             format('md.%s.trade.%s', t.market::text, lower(t.symbol)) AS routing_key,
             jsonb_build_object(
                 'price', t.price,
+                'qty_base', t.qty_eth,
                 'qty_eth', t.qty_eth,
                 'notional_usdt', t.notional_usdt,
                 'aggressor_side', t.aggressor_side

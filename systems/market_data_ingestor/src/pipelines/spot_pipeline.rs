@@ -32,7 +32,6 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{debug, error, info, warn};
 
 const SPOT_WS_BASE: &str = "wss://stream.binance.com:443";
-const SYMBOL: &str = "ETHUSDT";
 const REST_PAGE_LIMIT: u16 = 1000;
 const KLINE_INTERVALS: [&str; 5] = ["1m", "15m", "1h", "4h", "1d"];
 const WS_KEEPALIVE_PING_SECS: u64 = 20;
@@ -307,7 +306,8 @@ pub async fn run(
     ops_writer: Arc<OpsDbWriter>,
     metrics: Arc<AppMetrics>,
 ) -> Result<()> {
-    let streams = spot_streams::required_streams(SYMBOL);
+    let symbol = ctx.config.market_data.symbol.clone();
+    let streams = spot_streams::required_streams(&symbol);
     let mut gap_detector = GapDetector::default();
     let kline_3d_aggregator = Arc::new(Mutex::new(Kline3dAggregator::default()));
     let mut last_closed_kline_open_ms: HashMap<String, i64> = HashMap::new();
@@ -353,11 +353,11 @@ pub async fn run(
         });
     }
 
-    match checkpoints::load_checkpoint_seeds(&ctx.ops_db_pool, "spot", SYMBOL).await {
+    match checkpoints::load_checkpoint_seeds(&ctx.ops_db_pool, "spot", &symbol).await {
         Ok(seeds) => {
             checkpoints::hydrate_runtime_state(
                 "spot",
-                SYMBOL,
+                &symbol,
                 &seeds,
                 &mut gap_detector,
                 &mut last_closed_kline_open_ms,
@@ -408,7 +408,7 @@ pub async fn run(
         info!(market = "spot", "spot websocket connected");
 
         if was_reconnect {
-            let last_trade_agg_id = gap_detector.last_trade_agg_id("spot", SYMBOL);
+            let last_trade_agg_id = gap_detector.last_trade_agg_id("spot", &symbol);
             let kline_state_snapshot = last_closed_kline_open_ms.clone();
             let kline_state_count = kline_state_snapshot.len();
             let kline_3d_snapshot = {
@@ -427,6 +427,7 @@ pub async fn run(
                 let ops_writer = Arc::clone(&ops_writer);
                 let metrics = Arc::clone(&metrics);
                 let inflight = Arc::clone(&reconnect_reconcile_inflight);
+                let symbol = symbol.clone();
                 tokio::spawn(async move {
                     let started_at = Instant::now();
                     info!(
@@ -436,6 +437,7 @@ pub async fn run(
                         "starting background reconnect reconcile"
                     );
                     let result = reconcile_after_ws_reconnect(
+                        &symbol,
                         &rest_client,
                         &db_writer,
                         &publisher,
@@ -1234,6 +1236,7 @@ async fn replay_kline_gap(
 
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_after_ws_reconnect(
+    symbol: &str,
     rest_client: &Arc<BinanceRestClient>,
     db_writer: &Arc<MdDbWriter>,
     publisher: &Arc<MqPublisher>,
@@ -1251,7 +1254,7 @@ async fn reconcile_after_ws_reconnect(
         let mut trade_throttle = BackfillThrottle::new("spot", BACKFILL_TRADE_THROTTLE);
         loop {
             let rows = rest_client
-                .fetch_agg_trades("spot", SYMBOL, Some(next_id), REST_PAGE_LIMIT)
+                .fetch_agg_trades("spot", symbol, Some(next_id), REST_PAGE_LIMIT)
                 .await?;
             if rows.is_empty() {
                 break;
@@ -1266,7 +1269,7 @@ async fn reconcile_after_ws_reconnect(
                 trade_throttle.before_emit().await;
                 let replay_event = trade_normalizer::normalize_rest_agg_trade(
                     Market::Spot,
-                    SYMBOL,
+                    symbol,
                     row,
                     "replay",
                     true,
@@ -1294,7 +1297,7 @@ async fn reconcile_after_ws_reconnect(
             ops_writer
                 .insert_backfill_job_run(
                     Some("spot"),
-                    Some(SYMBOL),
+                    Some(symbol),
                     "/api/v3/aggTrades",
                     "trade_gapfill",
                     "reconnect",
@@ -1327,7 +1330,7 @@ async fn reconcile_after_ws_reconnect(
             let rows = rest_client
                 .fetch_klines(
                     "spot",
-                    SYMBOL,
+                    symbol,
                     interval_code,
                     Some(cursor_ms),
                     Some(end_ms),
@@ -1350,7 +1353,7 @@ async fn reconcile_after_ws_reconnect(
 
                 let replay_event = kline_normalizer::normalize_rest_kline(
                     Market::Spot,
-                    SYMBOL,
+                    symbol,
                     interval_code,
                     row,
                     "replay",
@@ -1395,7 +1398,7 @@ async fn reconcile_after_ws_reconnect(
             ops_writer
                 .insert_backfill_job_run(
                     Some("spot"),
-                    Some(SYMBOL),
+                    Some(symbol),
                     "/api/v3/klines",
                     "kline_gapfill",
                     "reconnect",

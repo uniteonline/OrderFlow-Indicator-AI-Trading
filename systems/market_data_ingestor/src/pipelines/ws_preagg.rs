@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 const ORDERBOOK_PREBATCH_MAX_EVENTS: usize = 20_000;
 const TRADE_PREBATCH_MAX_EVENTS: usize = 20_000;
 const TRADE_PREAGG_PRICE_SCALE: f64 = 100.0;
-const TRADE_VPIN_BUCKET_SIZE_ETH: f64 = 50.0;
+const TRADE_VPIN_BUCKET_SIZE_BASE: f64 = 50.0;
 const TRADE_VPIN_ROLLING_BUCKETS: usize = 50;
 const TRADE_VPIN_EPS: f64 = 1e-12;
 const OB_PREAGG_PRICE_SCALE: f64 = 100.0;
@@ -49,7 +49,7 @@ struct TradeVpinState {
 impl Default for TradeVpinState {
     fn default() -> Self {
         Self {
-            bucket_size: TRADE_VPIN_BUCKET_SIZE_ETH,
+            bucket_size: TRADE_VPIN_BUCKET_SIZE_BASE,
             rolling_bucket_count: TRADE_VPIN_ROLLING_BUCKETS,
             current_buy: 0.0,
             current_sell: 0.0,
@@ -685,6 +685,10 @@ impl TradeSecondChunk {
                 "notional_total": self.whale.notional_total,
                 "notional_buy": self.whale.notional_buy,
                 "notional_sell": self.whale.notional_sell,
+                "qty_base_total": self.whale.qty_eth_total,
+                "qty_base_buy": self.whale.qty_eth_buy,
+                "qty_base_sell": self.whale.qty_eth_sell,
+                "delta_qty_base": self.whale.qty_eth_buy - self.whale.qty_eth_sell,
                 "qty_eth_total": self.whale.qty_eth_total,
                 "qty_eth_buy": self.whale.qty_eth_buy,
                 "qty_eth_sell": self.whale.qty_eth_sell,
@@ -892,10 +896,11 @@ fn apply_trade_raw_event(
     let Some(price) = value_f64(&event.data, "price") else {
         return;
     };
-    let qty_eth = value_f64(&event.data, "qty_eth")
+    let qty_base = value_f64(&event.data, "qty_base")
+        .or_else(|| value_f64(&event.data, "qty_eth"))
         .or_else(|| value_f64(&event.data, "qty_raw"))
         .unwrap_or(0.0);
-    let notional_usdt = value_f64(&event.data, "notional_usdt").unwrap_or(price * qty_eth);
+    let notional_usdt = value_f64(&event.data, "notional_usdt").unwrap_or(price * qty_base);
     let aggressor_side = value_i64(&event.data, "aggressor_side")
         .map(|v| if v >= 0 { 1 } else { -1 })
         .or_else(|| {
@@ -910,15 +915,15 @@ fn apply_trade_raw_event(
     chunk.apply_trade(
         event,
         price,
-        qty_eth,
+        qty_base,
         notional_usdt,
         aggressor_side,
         whale_threshold_usdt,
     );
     if aggressor_side >= 0 {
-        preagg_state.ingest_flow(qty_eth, 0.0);
+        preagg_state.ingest_flow(qty_base, 0.0);
     } else {
-        preagg_state.ingest_flow(0.0, qty_eth);
+        preagg_state.ingest_flow(0.0, qty_base);
     }
     chunk.vpin_snapshot = Some(preagg_state.snapshot());
 }
@@ -1110,10 +1115,10 @@ mod tests {
         let event = NormalizedMdEvent {
             msg_type: "md.trade".to_string(),
             market: "futures".to_string(),
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "ws".to_string(),
             backfill_in_progress: false,
-            routing_key: "md.futures.trade.ethusdt".to_string(),
+            routing_key: "md.futures.trade.testusdt".to_string(),
             stream_name: "trade".to_string(),
             event_ts: Utc
                 .timestamp_millis_opt(1_700_000_000_250)
@@ -1150,10 +1155,10 @@ mod tests {
         let snapshot = NormalizedMdEvent {
             msg_type: "md.orderbook_snapshot_l2".to_string(),
             market: "futures".to_string(),
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "ws".to_string(),
             backfill_in_progress: false,
-            routing_key: "md.futures.orderbook_snapshot_l2.ethusdt".to_string(),
+            routing_key: "md.futures.orderbook_snapshot_l2.testusdt".to_string(),
             stream_name: "orderbook_snapshot_l2".to_string(),
             event_ts: base_ts,
             data: json!({
@@ -1203,10 +1208,10 @@ mod tests {
         let snapshot = NormalizedMdEvent {
             msg_type: "md.orderbook_snapshot_l2".to_string(),
             market: "futures".to_string(),
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "ws".to_string(),
             backfill_in_progress: false,
-            routing_key: "md.futures.orderbook_snapshot_l2.ethusdt".to_string(),
+            routing_key: "md.futures.orderbook_snapshot_l2.testusdt".to_string(),
             stream_name: "orderbook_snapshot_l2".to_string(),
             event_ts: first_ts,
             data: json!({
@@ -1218,10 +1223,10 @@ mod tests {
         let depth = NormalizedMdEvent {
             msg_type: "md.depth".to_string(),
             market: "futures".to_string(),
-            symbol: "ETHUSDT".to_string(),
+            symbol: "TESTUSDT".to_string(),
             source_kind: "ws".to_string(),
             backfill_in_progress: false,
-            routing_key: "md.futures.depth.ethusdt".to_string(),
+            routing_key: "md.futures.depth.testusdt".to_string(),
             stream_name: "depth".to_string(),
             event_ts: second_ts,
             data: json!({

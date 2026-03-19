@@ -9,7 +9,7 @@ use sqlx::PgPool;
 const CVD_BURST_EMA_FAST: usize = 5;
 const CVD_BURST_EMA_SLOW: usize = 20;
 const CVD_BURST_Z_LOOKBACK: usize = 60;
-const VPIN_BUCKET_ETH: f64 = 50.0;
+const VPIN_BUCKET_BASE: f64 = 50.0;
 
 #[derive(Clone)]
 pub struct FeatureWriter {
@@ -140,7 +140,7 @@ impl FeatureWriter {
             CVD_BURST_EMA_SLOW,
             CVD_BURST_Z_LOOKBACK,
         );
-        let vpin_bucket_fill = Some((agg.total_qty / VPIN_BUCKET_ETH).clamp(0.0, 1.0));
+        let vpin_bucket_fill = Some((agg.total_qty / VPIN_BUCKET_BASE).clamp(0.0, 1.0));
         let bar_interval = interval_text(mins);
         let anchor_ts = Some(ts_bucket - Duration::days(7));
 
