@@ -4047,7 +4047,9 @@ fn build_client_order_id(prefix: &str) -> String {
 }
 
 fn round_down_to_step(value: f64, step: f64) -> f64 {
-    (value / step).floor() * step
+    // Binary floating-point can turn exact step multiples like 0.071 / 0.001
+    // into 70.99999999999999, which would incorrectly floor to the next-lower step.
+    ((value / step) + 1e-9).floor() * step
 }
 
 fn precision_from_step(step: f64) -> usize {
@@ -5049,6 +5051,12 @@ mod tests {
     fn format_exit_quantity_rounds_down_to_step() {
         let qty = format_exit_quantity(0.01234, 0.001, 3).expect("format qty");
         assert_eq!(qty, "0.012");
+    }
+
+    #[test]
+    fn format_exit_quantity_preserves_exact_step_multiple() {
+        let qty = format_exit_quantity(0.071, 0.001, 3).expect("format qty");
+        assert_eq!(qty, "0.071");
     }
 
     #[test]
