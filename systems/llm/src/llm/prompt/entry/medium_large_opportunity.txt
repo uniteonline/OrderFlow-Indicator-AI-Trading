@@ -31,6 +31,7 @@ Decision context
 Always return `decision_context` with:
 - `thesis_flow_alignment`: whether the 4h to 1d thesis and the current 1h/15m flow are aligned, mixed, or opposed
 - `entry_readiness`: whether this setup is ready, still developing, or not ready
+- `entry_exposure`: whether the current entry location is favorable, vulnerable, or poor
 - `key_condition`: the single most important condition that makes this trade valid now, or keeps it from being valid now
 
 How to think about the timeframes:

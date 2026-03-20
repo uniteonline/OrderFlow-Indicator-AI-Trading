@@ -1516,7 +1516,7 @@ fn qwen_output_contract(
     } else if management_mode {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `decision`, `reason`, and `params`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- Allowed decisions: VALID, INVALID, ADJUST.\n- `params` must always be present.\n- For VALID: keep `params` present; action fields may be null.\n- For INVALID: set `params.close_price` to a number or null.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], [\"tp\",\"sl\"], [\"add\"], or [\"reduce\"]), and corresponding values: `new_tp`/`new_sl` for tp/sl adjustments, `qty_ratio` (number 0-1) for add/reduce.\n".to_string()
     } else {
-        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must be `decision`, `reason`, `decision_context`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- `decision_context` must include `thesis_flow_alignment`, `entry_readiness`, and `key_condition`.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, and `params.horizon` to null.\n".to_string()
+        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must be `decision`, `reason`, `decision_context`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- `decision_context` must include `thesis_flow_alignment`, `entry_readiness`, `entry_exposure`, and `key_condition`.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, and `params.horizon` to null.\n".to_string()
     }
 }
 
@@ -1670,7 +1670,7 @@ fn qwen_entry_response_schema() -> Value {
             "decision_context": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"],
+                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"],
                 "properties": {
                     "thesis_flow_alignment": {
                         "type": "string",
@@ -1679,6 +1679,10 @@ fn qwen_entry_response_schema() -> Value {
                     "entry_readiness": {
                         "type": "string",
                         "enum": ["ready", "developing", "not_ready"]
+                    },
+                    "entry_exposure": {
+                        "type": "string",
+                        "enum": ["favorable", "vulnerable", "poor"]
                     },
                     "key_condition": {
                         "type": "string",
@@ -1732,7 +1736,7 @@ fn custom_llm_entry_response_schema() -> Value {
             "decision_context": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"],
+                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"],
                 "properties": {
                     "thesis_flow_alignment": {
                         "type": "string",
@@ -1741,6 +1745,10 @@ fn custom_llm_entry_response_schema() -> Value {
                     "entry_readiness": {
                         "type": "string",
                         "enum": ["ready", "developing", "not_ready"]
+                    },
+                    "entry_exposure": {
+                        "type": "string",
+                        "enum": ["favorable", "vulnerable", "poor"]
                     },
                     "key_condition": {
                         "type": "string",
@@ -2294,10 +2302,11 @@ fn grok_entry_response_schema() -> Value {
             "decision_context": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"],
+                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"],
                 "properties": {
                     "thesis_flow_alignment": { "type": "string", "enum": ["aligned", "mixed", "opposed"] },
                     "entry_readiness": { "type": "string", "enum": ["ready", "developing", "not_ready"] },
+                    "entry_exposure": { "type": "string", "enum": ["favorable", "vulnerable", "poor"] },
                     "key_condition": { "type": "string" }
                 }
             },
@@ -2516,10 +2525,11 @@ fn ml_grok_entry_schema() -> Value {
             "decision_context": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"],
+                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"],
                 "properties": {
                     "thesis_flow_alignment": { "type": "string", "enum": ["aligned", "mixed", "opposed"] },
                     "entry_readiness": { "type": "string", "enum": ["ready", "developing", "not_ready"] },
+                    "entry_exposure": { "type": "string", "enum": ["favorable", "vulnerable", "poor"] },
                     "key_condition": { "type": "string" }
                 }
             },
@@ -2600,9 +2610,13 @@ fn ml_gemini_entry_schema() -> Value {
                         "type": "STRING",
                         "enum": ["ready", "developing", "not_ready"]
                     },
+                    "entry_exposure": {
+                        "type": "STRING",
+                        "enum": ["favorable", "vulnerable", "poor"]
+                    },
                     "key_condition": { "type": "STRING" }
                 },
-                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"]
+                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"]
             },
             "params": {
                 "type": "OBJECT",
@@ -2667,7 +2681,7 @@ fn ml_qwen_entry_schema() -> Value {
             "decision_context": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"],
+                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"],
                 "properties": {
                     "thesis_flow_alignment": {
                         "type": "string",
@@ -2676,6 +2690,10 @@ fn ml_qwen_entry_schema() -> Value {
                     "entry_readiness": {
                         "type": "string",
                         "enum": ["ready", "developing", "not_ready"]
+                    },
+                    "entry_exposure": {
+                        "type": "string",
+                        "enum": ["favorable", "vulnerable", "poor"]
                     },
                     "key_condition": {
                         "type": "string",
@@ -2727,7 +2745,7 @@ fn ml_custom_llm_entry_schema() -> Value {
             "decision_context": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"],
+                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"],
                 "properties": {
                     "thesis_flow_alignment": {
                         "type": "string",
@@ -2736,6 +2754,10 @@ fn ml_custom_llm_entry_schema() -> Value {
                     "entry_readiness": {
                         "type": "string",
                         "enum": ["ready", "developing", "not_ready"]
+                    },
+                    "entry_exposure": {
+                        "type": "string",
+                        "enum": ["favorable", "vulnerable", "poor"]
                     },
                     "key_condition": {
                         "type": "string",
@@ -2851,9 +2873,13 @@ fn gemini_entry_response_schema() -> Value {
                         "type": "STRING",
                         "enum": ["ready", "developing", "not_ready"]
                     },
+                    "entry_exposure": {
+                        "type": "STRING",
+                        "enum": ["favorable", "vulnerable", "poor"]
+                    },
                     "key_condition": { "type": "STRING" }
                 },
-                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"]
+                "required": ["thesis_flow_alignment", "entry_readiness", "entry_exposure", "key_condition"]
             },
             "params": {
                 "type": "OBJECT",
@@ -4221,6 +4247,7 @@ mod tests {
         assert!(contract.contains("decision_context"));
         assert!(contract.contains("thesis_flow_alignment"));
         assert!(contract.contains("entry_readiness"));
+        assert!(contract.contains("entry_exposure"));
         assert!(contract.contains("key_condition"));
     }
 
