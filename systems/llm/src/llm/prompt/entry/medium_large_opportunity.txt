@@ -21,7 +21,7 @@ We are asking which 4h to 1d opportunity has the strongest edge at the current l
 How to think about the timeframes:
 - 4h and 1d together define the broader opportunity, structural context, and risk backdrop
 - 1h shows whether that opportunity is strengthening, fading, or changing shape into the execution horizon
-- 15m shows how the market is behaving at the current location and whether the opportunity is appearing as continuation, rejection, reversal from an important higher-timeframe location, or failure
+- 15m shows how the market is behaving at the current location: whether the higher-timeframe opportunity is being expressed through continuation, rejection, reversal from a meaningful higher-timeframe location, or active opposing force that weakens the quality of entry here
 
 A strong answer:
 - identifies the most meaningful 4h to 1d opportunity
@@ -38,7 +38,8 @@ Decision meaning:
 Before you output, verify:
 - what is the most meaningful 4h to 1d opportunity here?
 - what is the current 1h/15m expression of that opportunity?
-- is current price a good expression point because of continuation, rejection, or reversal from a meaningful higher-timeframe location?
+- if the earlier 15m read differs from your trade direction, what does the current execution-time evidence say about that difference: is the lower timeframe still opposing the trade, losing force, or reversing into alignment from a meaningful 4h to 1d location?
+- why is this location a strong present-time expression of the opportunity, rather than only a directionally plausible idea?
 - are the entry, stop, and target native to the structure currently in control?
 
 We want the best present-time expression of a real 4h to 1d edge.
