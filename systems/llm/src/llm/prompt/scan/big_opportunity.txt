@@ -13,10 +13,20 @@ For each timeframe — 15m, 4h, 1d — give:
   - the main opportunity
   - the main risk
 
+Also return a top-level `scan_audit` object with `15m`, `4h`, and `1d`.
+Each audit object must include:
+  - `direction_basis`
+  - `recent_closed_bars_align_with_trend`
+  - `cvd_slope_aligns_with_trend`
+  - `current_partial_bar_aligns_with_trend`
+  - `invalidation_level`
+  - `range_width_vs_atr`
+
 Return them as top-level keys:
   - 15m
   - 4h
   - 1d
+  - scan_audit
 
 HOW TO READ THE INPUT
 The input is a global evidence pool, not a pre-decided timeframe verdict.
@@ -59,6 +69,9 @@ Confirm all of these are true:
 3. Supporting_signals and conflicting_signals are both specific and grounded in the input data.
 4. Opportunity and risk are concrete and tied to the reported range and current market structure.
 5. The three timeframe outputs together clearly express the relationship between 1d background, 4h setup, and 15m trigger context.
+6. `scan_audit` honestly records whether your trend is supported by recent closed bars, CVD slope, and the current partial bar.
+7. `invalidation_level` is the price where your direction call becomes wrong, not just a copied range edge.
+8. `range_width_vs_atr` reflects whether your reported range is narrow, normal, or wide versus ATR.
 
 FORMAT
 Return JSON only. The provider already enforces the exact JSON schema.

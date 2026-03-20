@@ -19,6 +19,16 @@ For each timeframe — `15m`, `4h`, and `1d` — produce:
 - `opportunity`: the best trade setup if your bet is correct
 - `risk`: what happens if your bet is wrong
 
+Also produce a top-level `scan_audit` object with matching `15m`, `4h`, and `1d` audit entries.
+For each timeframe inside `scan_audit`, include:
+
+- `direction_basis`: the primary basis of your direction call
+- `recent_closed_bars_align_with_trend`: whether the recent closed bars at that timeframe support your trend
+- `cvd_slope_aligns_with_trend`: whether that timeframe's CVD slope supports your trend
+- `current_partial_bar_aligns_with_trend`: whether the current partial bar still supports your trend
+- `invalidation_level`: the price that would make your direction call wrong; use `null` only for `Sideways`
+- `range_width_vs_atr`: whether your predicted range is `narrow`, `normal`, or `wide` versus ATR
+
 HOW TO READ THE INPUT
 
 The input is a structured evidence package. Read it as one unfolding story:
@@ -105,12 +115,18 @@ For multi-timeframe coherence:
 - Does my 15m range nest inside my 4h range, and my 4h inside my 1d?
 - If I have a bearish 4h but bullish 15m, did I frame it as "short-term bounce within
   a downtrend" — or did I accidentally treat them as independent?
+- Does my `scan_audit.direction_basis` honestly describe why I chose the direction?
+  If I am mainly inferring direction from exhaustion or structural location, did I say that explicitly?
+- Do `recent_closed_bars_align_with_trend`, `cvd_slope_aligns_with_trend`, and
+  `current_partial_bar_aligns_with_trend` match the actual evidence, even if they make my call look fragile?
+- Is `invalidation_level` the price where my direction call is wrong, not just my forecast range edge?
+- Is `range_width_vs_atr` honest about whether my range is too narrow, normal, or wide?
 
 FORMAT
 
 Return JSON only.
 
-Top-level keys must be `15m`, `4h`, and `1d`.
+Top-level keys must be `15m`, `4h`, `1d`, and `scan_audit`.
 
 Each timeframe object must include:
 - `trend`
@@ -120,3 +136,11 @@ Each timeframe object must include:
 - `conflicting_signals`
 - `opportunity`
 - `risk`
+
+`scan_audit` must include `15m`, `4h`, and `1d`, and each audit object must include:
+- `direction_basis`
+- `recent_closed_bars_align_with_trend`
+- `cvd_slope_aligns_with_trend`
+- `current_partial_bar_aligns_with_trend`
+- `invalidation_level`
+- `range_width_vs_atr`

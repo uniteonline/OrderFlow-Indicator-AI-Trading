@@ -470,6 +470,79 @@ fn validate_scan_output(value: &Value) -> Result<()> {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow!("scan {}.risk is missing", tf))?;
     }
+    let scan_audit = value
+        .get("scan_audit")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("scan scan_audit is missing or not an object"))?;
+    for tf in ["15m", "4h", "1d"] {
+        let tf_audit = scan_audit
+            .get(tf)
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("scan scan_audit.{} is missing or not an object", tf))?;
+        let direction_basis = tf_audit
+            .get("direction_basis")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("scan scan_audit.{}.direction_basis is missing", tf))?;
+        if !matches!(
+            direction_basis,
+            "closed_bar_continuation"
+                | "live_flow_reversal"
+                | "exhaustion_inference"
+                | "structural_inference"
+                | "mixed"
+        ) {
+            return Err(anyhow!(
+                "scan scan_audit.{}.direction_basis must be closed_bar_continuation/live_flow_reversal/exhaustion_inference/structural_inference/mixed",
+                tf
+            ));
+        }
+        tf_audit
+            .get("recent_closed_bars_align_with_trend")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                anyhow!(
+                    "scan scan_audit.{}.recent_closed_bars_align_with_trend is missing",
+                    tf
+                )
+            })?;
+        tf_audit
+            .get("cvd_slope_aligns_with_trend")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                anyhow!(
+                    "scan scan_audit.{}.cvd_slope_aligns_with_trend is missing",
+                    tf
+                )
+            })?;
+        tf_audit
+            .get("current_partial_bar_aligns_with_trend")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                anyhow!(
+                    "scan scan_audit.{}.current_partial_bar_aligns_with_trend is missing",
+                    tf
+                )
+            })?;
+        match tf_audit.get("invalidation_level") {
+            Some(Value::Number(_)) | Some(Value::Null) => {}
+            _ => {
+                return Err(anyhow!(
+                    "scan scan_audit.{}.invalidation_level must be a number or null",
+                    tf
+                ));
+            }
+        }
+        let range_width_vs_atr = tf_audit
+            .get("range_width_vs_atr")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("scan scan_audit.{}.range_width_vs_atr is missing", tf))?;
+        if !matches!(range_width_vs_atr, "narrow" | "normal" | "wide") {
+            return Err(anyhow!(
+                "scan scan_audit.{}.range_width_vs_atr must be narrow/normal/wide",
+                tf
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -477,6 +550,7 @@ fn sanitize_scan_for_stage2(value: &Value) -> Value {
     let mut sanitized = value.clone();
     if let Some(root) = sanitized.as_object_mut() {
         root.remove("market_narrative");
+        root.remove("scan_audit");
     }
     for tf in ["15m", "4h", "1d"] {
         if let Some(tf_obj) = sanitized.get_mut(tf).and_then(Value::as_object_mut) {
@@ -1507,9 +1581,9 @@ fn qwen_output_contract(
 ) -> String {
     if matches!(entry_stage, prompt::EntryPromptStage::Scan) {
         if is_medium_large(prompt_template) {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, and `1d`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, `1d`, and `scan_audit`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n- `scan_audit` must include `15m`, `4h`, and `1d`, and each audit object must include `direction_basis`, `recent_closed_bars_align_with_trend`, `cvd_slope_aligns_with_trend`, `current_partial_bar_aligns_with_trend`, `invalidation_level`, and `range_width_vs_atr`.\n".to_string()
         } else {
-            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, and `1d`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n".to_string()
+            "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- No extra top-level keys.\n- Top-level keys must be `15m`, `4h`, `1d`, and `scan_audit`.\n- Each timeframe key must include `trend`, `signal_agreement`, `range`, `supporting_signals`, `conflicting_signals`, `opportunity`, and `risk`.\n- `scan_audit` must include `15m`, `4h`, and `1d`, and each audit object must include `direction_basis`, `recent_closed_bars_align_with_trend`, `cvd_slope_aligns_with_trend`, `current_partial_bar_aligns_with_trend`, `invalidation_level`, and `range_width_vs_atr`.\n".to_string()
         }
     } else if pending_order_mode {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `reason` and `params`. `analysis` and `self_check` may be present as extra objects.\n- `reason` must be a non-empty top-level string. Do not place `reason` inside `analysis`.\n- `params` must contain exactly: `entry`, `tp`, `sl`, `leverage` — each a number or null.\n- Set all params to null if there is no valid setup.\n".to_string()
@@ -1644,11 +1718,12 @@ fn qwen_entry_scan_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["15m", "4h", "1d"],
+        "required": ["15m", "4h", "1d", "scan_audit"],
         "properties": {
             "15m": scan_timeframe_schema_openai(),
             "4h": scan_timeframe_schema_openai(),
-            "1d": scan_timeframe_schema_openai()
+            "1d": scan_timeframe_schema_openai(),
+            "scan_audit": scan_audit_schema_openai()
         }
     })
 }
@@ -1710,11 +1785,12 @@ fn custom_llm_entry_scan_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["15m", "4h", "1d"],
+        "required": ["15m", "4h", "1d", "scan_audit"],
         "properties": {
             "15m": scan_timeframe_schema_openai(),
             "4h": scan_timeframe_schema_openai(),
-            "1d": scan_timeframe_schema_openai()
+            "1d": scan_timeframe_schema_openai(),
+            "scan_audit": scan_audit_schema_openai()
         }
     })
 }
@@ -2271,11 +2347,12 @@ fn grok_entry_scan_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["15m", "4h", "1d"],
+        "required": ["15m", "4h", "1d", "scan_audit"],
         "properties": {
             "15m": scan_timeframe_schema_grok(),
             "4h": scan_timeframe_schema_grok(),
-            "1d": scan_timeframe_schema_grok()
+            "1d": scan_timeframe_schema_grok(),
+            "scan_audit": scan_audit_schema_openai()
         }
     })
 }
@@ -2417,6 +2494,54 @@ fn scan_timeframe_schema_grok() -> Value {
     })
 }
 
+fn scan_audit_timeframe_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "direction_basis",
+            "recent_closed_bars_align_with_trend",
+            "cvd_slope_aligns_with_trend",
+            "current_partial_bar_aligns_with_trend",
+            "invalidation_level",
+            "range_width_vs_atr"
+        ],
+        "properties": {
+            "direction_basis": {
+                "type": "string",
+                "enum": [
+                    "closed_bar_continuation",
+                    "live_flow_reversal",
+                    "exhaustion_inference",
+                    "structural_inference",
+                    "mixed"
+                ]
+            },
+            "recent_closed_bars_align_with_trend": { "type": "boolean" },
+            "cvd_slope_aligns_with_trend": { "type": "boolean" },
+            "current_partial_bar_aligns_with_trend": { "type": "boolean" },
+            "invalidation_level": { "type": ["number", "null"] },
+            "range_width_vs_atr": {
+                "type": "string",
+                "enum": ["narrow", "normal", "wide"]
+            }
+        }
+    })
+}
+
+fn scan_audit_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["15m", "4h", "1d"],
+        "properties": {
+            "15m": scan_audit_timeframe_schema_openai(),
+            "4h": scan_audit_timeframe_schema_openai(),
+            "1d": scan_audit_timeframe_schema_openai()
+        }
+    })
+}
+
 fn scan_timeframe_schema_openai() -> Value {
     json!({
         "type": "object",
@@ -2453,6 +2578,52 @@ fn scan_timeframe_schema_openai() -> Value {
             "opportunity": { "type": "string" },
             "risk": { "type": "string" }
         }
+    })
+}
+
+fn scan_audit_timeframe_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "direction_basis": {
+                "type": "STRING",
+                "enum": [
+                    "closed_bar_continuation",
+                    "live_flow_reversal",
+                    "exhaustion_inference",
+                    "structural_inference",
+                    "mixed"
+                ]
+            },
+            "recent_closed_bars_align_with_trend": { "type": "BOOLEAN" },
+            "cvd_slope_aligns_with_trend": { "type": "BOOLEAN" },
+            "current_partial_bar_aligns_with_trend": { "type": "BOOLEAN" },
+            "invalidation_level": { "type": "NUMBER", "nullable": true },
+            "range_width_vs_atr": {
+                "type": "STRING",
+                "enum": ["narrow", "normal", "wide"]
+            }
+        },
+        "required": [
+            "direction_basis",
+            "recent_closed_bars_align_with_trend",
+            "cvd_slope_aligns_with_trend",
+            "current_partial_bar_aligns_with_trend",
+            "invalidation_level",
+            "range_width_vs_atr"
+        ]
+    })
+}
+
+fn scan_audit_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "15m": scan_audit_timeframe_schema_gemini(),
+            "4h": scan_audit_timeframe_schema_gemini(),
+            "1d": scan_audit_timeframe_schema_gemini()
+        },
+        "required": ["15m", "4h", "1d"]
     })
 }
 
@@ -2497,11 +2668,12 @@ fn ml_grok_entry_scan_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["15m", "4h", "1d"],
+        "required": ["15m", "4h", "1d", "scan_audit"],
         "properties": {
             "15m": scan_timeframe_schema_grok(),
             "4h": scan_timeframe_schema_grok(),
-            "1d": scan_timeframe_schema_grok()
+            "1d": scan_timeframe_schema_grok(),
+            "scan_audit": scan_audit_schema_openai()
         }
     })
 }
@@ -2580,9 +2752,10 @@ fn ml_gemini_entry_scan_schema() -> Value {
         "properties": {
             "15m": scan_timeframe_schema_gemini(),
             "4h": scan_timeframe_schema_gemini(),
-            "1d": scan_timeframe_schema_gemini()
+            "1d": scan_timeframe_schema_gemini(),
+            "scan_audit": scan_audit_schema_gemini()
         },
-        "required": ["15m", "4h", "1d"]
+        "required": ["15m", "4h", "1d", "scan_audit"]
     })
 }
 
@@ -2661,11 +2834,12 @@ fn ml_qwen_entry_scan_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["15m", "4h", "1d"],
+        "required": ["15m", "4h", "1d", "scan_audit"],
         "properties": {
             "15m": scan_timeframe_schema_openai(),
             "4h": scan_timeframe_schema_openai(),
-            "1d": scan_timeframe_schema_openai()
+            "1d": scan_timeframe_schema_openai(),
+            "scan_audit": scan_audit_schema_openai()
         }
     })
 }
@@ -2725,11 +2899,12 @@ fn ml_custom_llm_entry_scan_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["15m", "4h", "1d"],
+        "required": ["15m", "4h", "1d", "scan_audit"],
         "properties": {
             "15m": scan_timeframe_schema_openai(),
             "4h": scan_timeframe_schema_openai(),
-            "1d": scan_timeframe_schema_openai()
+            "1d": scan_timeframe_schema_openai(),
+            "scan_audit": scan_audit_schema_openai()
         }
     })
 }
@@ -2840,9 +3015,10 @@ fn gemini_entry_scan_response_schema() -> Value {
         "properties": {
             "15m": scan_timeframe_schema_gemini(),
             "4h": scan_timeframe_schema_gemini(),
-            "1d": scan_timeframe_schema_gemini()
+            "1d": scan_timeframe_schema_gemini(),
+            "scan_audit": scan_audit_schema_gemini()
         },
-        "required": ["15m", "4h", "1d"]
+        "required": ["15m", "4h", "1d", "scan_audit"]
     })
 }
 
@@ -3617,6 +3793,24 @@ mod tests {
         })
     }
 
+    fn sample_scan_audit_tf(
+        direction_basis: &str,
+        recent_closed_bars_align_with_trend: bool,
+        cvd_slope_aligns_with_trend: bool,
+        current_partial_bar_aligns_with_trend: bool,
+        invalidation_level: Option<f64>,
+        range_width_vs_atr: &str,
+    ) -> Value {
+        json!({
+            "direction_basis": direction_basis,
+            "recent_closed_bars_align_with_trend": recent_closed_bars_align_with_trend,
+            "cvd_slope_aligns_with_trend": cvd_slope_aligns_with_trend,
+            "current_partial_bar_aligns_with_trend": current_partial_bar_aligns_with_trend,
+            "invalidation_level": invalidation_level,
+            "range_width_vs_atr": range_width_vs_atr
+        })
+    }
+
     fn sample_stage_1_scan() -> Value {
         json!({
             "15m": sample_scan_tf(
@@ -3649,6 +3843,32 @@ mod tests {
                 "Breakout above 2050 improves macro structure",
                 "Loss of 1960 reopens downside auction"
             ),
+            "scan_audit": {
+                "15m": sample_scan_audit_tf(
+                    "closed_bar_continuation",
+                    true,
+                    true,
+                    false,
+                    Some(1994.0),
+                    "normal"
+                ),
+                "4h": sample_scan_audit_tf(
+                    "mixed",
+                    true,
+                    true,
+                    true,
+                    Some(1988.0),
+                    "normal"
+                ),
+                "1d": sample_scan_audit_tf(
+                    "structural_inference",
+                    false,
+                    false,
+                    true,
+                    None,
+                    "wide"
+                )
+            }
         })
     }
 
@@ -4176,7 +4396,9 @@ mod tests {
         assert!(schema
             .get("required")
             .and_then(Value::as_array)
-            .map(|required| required.iter().any(|v| v.as_str() == Some("decision_context")))
+            .map(|required| required
+                .iter()
+                .any(|v| v.as_str() == Some("decision_context")))
             .unwrap_or(false));
     }
 
@@ -4215,6 +4437,22 @@ mod tests {
                 Some("array"),
                 "supporting_signals should exist for {prompt_template}"
             );
+            assert_eq!(
+                schema
+                    .pointer("/properties/scan_audit/additionalProperties")
+                    .and_then(|v| v.as_bool()),
+                Some(false),
+                "scan_audit should be strict for {prompt_template}"
+            );
+            assert_eq!(
+                schema
+                    .pointer(
+                        "/properties/scan_audit/properties/15m/properties/direction_basis/type"
+                    )
+                    .and_then(|v| v.as_str()),
+                Some("string"),
+                "scan_audit.direction_basis should exist for {prompt_template}"
+            );
         }
     }
 
@@ -4227,8 +4465,9 @@ mod tests {
                 super::prompt::EntryPromptStage::Scan,
                 prompt_template,
             );
-            assert!(contract.contains("`15m`, `4h`, and `1d`"));
+            assert!(contract.contains("`15m`, `4h`, `1d`, and `scan_audit`"));
             assert!(contract.contains("`supporting_signals`"));
+            assert!(contract.contains("direction_basis"));
             assert!(!contract.contains("`range_basis`"));
             assert!(!contract.contains("`range_role_used`"));
             assert!(!contract.contains("`decision`, `reason`, and `scan`"));
@@ -4600,6 +4839,11 @@ mod tests {
             .as_ref()
             .and_then(|value| value.pointer("/15m/story"))
             .is_none());
+        assert!(capture
+            .stage_1_setup_scan_json
+            .as_ref()
+            .and_then(|value| value.get("scan_audit"))
+            .is_none());
         assert_eq!(
             capture
                 .prompt_input
@@ -4942,6 +5186,11 @@ mod tests {
                 .and_then(Value::as_str),
             Some("2026-03-18T07:05:00+00:00")
         );
+        assert!(capture
+            .stage_1_setup_scan_json
+            .as_ref()
+            .and_then(|value| value.get("scan_audit"))
+            .is_none());
     }
 
     #[test]
