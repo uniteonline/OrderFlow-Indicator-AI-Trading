@@ -91,6 +91,8 @@ For each timeframe's trend:
 - What closed-bar evidence at THIS timeframe's scale supports the direction I chose?
   If the last 3 closed bars point the other way, what bar-level confirmation do I have
   that the trend has actually reversed, not just that real-time flow is temporarily opposing it?
+- Can you identify a specific initiation event or structural break in the direction
+  you are calling — or are you inferring direction only from exhaustion of the other side?
 
 For each timeframe's range:
 

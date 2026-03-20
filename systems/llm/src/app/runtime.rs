@@ -5,6 +5,7 @@ use crate::app::x::XOperator;
 use crate::execution::binance::{
     execute_management_intent, execute_pending_order_intent, execute_trade_intent,
     fetch_pending_order_leverage, fetch_symbol_trading_state,
+    TradeExecutionBlockedByCurrentPriceBeyondStopLoss,
 };
 use crate::llm::decision::{
     pending_order_management_intent_from_value_with_context,
@@ -180,6 +181,16 @@ struct EntryVGateResult {
     take_profit_distance_v: f64,
     min_distance_v: f64,
     passed: bool,
+}
+
+impl EntryVGateResult {
+    fn required_take_profit_distance(&self) -> f64 {
+        self.resolved_v.value * self.min_distance_v
+    }
+
+    fn take_profit_distance_shortfall(&self) -> f64 {
+        (self.required_take_profit_distance() - self.take_profit_distance).max(0.0)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4218,6 +4229,58 @@ async fn invoke_bundle_models(
                     .await;
                 }
                 Err(err) => {
+                    if let Some(blocked) =
+                        err.downcast_ref::<TradeExecutionBlockedByCurrentPriceBeyondStopLoss>()
+                    {
+                        warn!(
+                            model_name = %out.model_name,
+                            symbol = %bundle.raw.symbol,
+                            decision = intent.decision.as_str(),
+                            current_reference_price = blocked.current_reference_price,
+                            current_price_source = blocked.current_price_source,
+                            entry_price = blocked.entry_price,
+                            stop_loss = blocked.stop_loss,
+                            best_bid_price = blocked.best_bid_price,
+                            best_ask_price = blocked.best_ask_price,
+                            reason = %intent.reason,
+                            "llm trade execution blocked: current price already beyond stop loss"
+                        );
+                        println!(
+                            "LLM_ORDER_EXECUTION_BLOCKED_STOP_CROSSED ts_bucket={} trigger={} symbol={} model={} decision={} current_price={} current_price_source={} entry={} sl={} best_bid_price={} best_ask_price={} reason={}",
+                            bundle.raw.ts_bucket,
+                            &*trigger,
+                            bundle.raw.symbol,
+                            out.model_name,
+                            intent.decision.as_str(),
+                            blocked.current_reference_price,
+                            blocked.current_price_source,
+                            blocked.entry_price,
+                            blocked.stop_loss,
+                            blocked.best_bid_price,
+                            blocked.best_ask_price,
+                            intent.reason.replace('\n', " "),
+                        );
+                        let event = json!({
+                            "event_type": "llm_order_execution_blocked_stop_crossed",
+                            "event_ts": Utc::now().to_rfc3339(),
+                            "ts_bucket": bundle.raw.ts_bucket.to_rfc3339(),
+                            "trigger": &*trigger,
+                            "symbol": bundle.raw.symbol,
+                            "model_name": out.model_name.clone(),
+                            "decision": intent.decision.as_str(),
+                            "current_price": blocked.current_reference_price,
+                            "current_price_source": blocked.current_price_source,
+                            "entry_price": blocked.entry_price,
+                            "stop_loss": blocked.stop_loss,
+                            "best_bid_price": blocked.best_bid_price,
+                            "best_ask_price": blocked.best_ask_price,
+                            "reason": intent.reason.clone(),
+                        });
+                        if let Err(err) = append_journal_event(event) {
+                            warn!(error = %err, "append llm_order_execution_blocked_stop_crossed journal failed");
+                        }
+                        continue;
+                    }
                     execution_done = true;
                     error!(
                         model_name = %out.model_name,
@@ -5016,6 +5079,8 @@ async fn invoke_bundle_models(
             };
             if let Some(gate) = entry_v_gate.as_ref() {
                 if !gate.passed {
+                    let required_take_profit_distance = gate.required_take_profit_distance();
+                    let take_profit_distance_shortfall = gate.take_profit_distance_shortfall();
                     warn!(
                         model_name = %out.model_name,
                         symbol = %bundle.raw.symbol,
@@ -5024,16 +5089,20 @@ async fn invoke_bundle_models(
                         take_profit = execution_intent.take_profit.unwrap_or_default(),
                         stop_loss = execution_intent.stop_loss.unwrap_or_default(),
                         selected_v = gate.resolved_v.value,
+                        computed_v = gate.resolved_v.value,
                         v_timeframe = gate.resolved_v.timeframe,
                         v_basis = %gate.resolved_v.basis,
                         take_profit_distance = gate.take_profit_distance,
                         take_profit_distance_v = gate.take_profit_distance_v,
                         min_distance_v = gate.min_distance_v,
+                        config_min_distance_v = gate.min_distance_v,
+                        required_take_profit_distance,
+                        take_profit_distance_shortfall,
                         reason = %intent.reason,
                         "llm trade execution blocked by entry V gate"
                     );
                     println!(
-                        "LLM_ORDER_V_GATE_FAILED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} selected_v={} v_timeframe={} v_basis={} tp_distance={} tp_in_v={} min_distance_v={} gate_passed=false reason={}",
+                        "LLM_ORDER_V_GATE_FAILED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} selected_v={} computed_v={} v_timeframe={} v_basis={} tp_distance={} tp_in_v={} min_distance_v={} config_min_distance_v={} required_tp_distance={} tp_distance_shortfall={} gate_passed=false reason={}",
                         bundle.raw.ts_bucket,
                         &*trigger,
                         bundle.raw.symbol,
@@ -5043,11 +5112,15 @@ async fn invoke_bundle_models(
                         format_metric_number(execution_intent.take_profit),
                         format_metric_number(execution_intent.stop_loss),
                         gate.resolved_v.value,
+                        gate.resolved_v.value,
                         gate.resolved_v.timeframe,
                         gate.resolved_v.basis,
                         gate.take_profit_distance,
                         gate.take_profit_distance_v,
                         gate.min_distance_v,
+                        gate.min_distance_v,
+                        required_take_profit_distance,
+                        take_profit_distance_shortfall,
                         intent.reason.replace('\n', " "),
                     );
                     let event = json!({
@@ -5062,11 +5135,15 @@ async fn invoke_bundle_models(
                         "take_profit": execution_intent.take_profit,
                         "stop_loss": execution_intent.stop_loss,
                         "selected_v": gate.resolved_v.value,
+                        "computed_v": gate.resolved_v.value,
                         "v_timeframe": gate.resolved_v.timeframe,
                         "v_basis": gate.resolved_v.basis.clone(),
                         "take_profit_distance": gate.take_profit_distance,
                         "take_profit_distance_v": gate.take_profit_distance_v,
                         "min_distance_v": gate.min_distance_v,
+                        "config_min_distance_v": gate.min_distance_v,
+                        "required_take_profit_distance": required_take_profit_distance,
+                        "take_profit_distance_shortfall": take_profit_distance_shortfall,
                         "gate_passed": false,
                         "reason": intent.reason.clone(),
                     });
@@ -5075,20 +5152,26 @@ async fn invoke_bundle_models(
                     }
                     continue;
                 }
+                let required_take_profit_distance = gate.required_take_profit_distance();
+                let take_profit_distance_shortfall = gate.take_profit_distance_shortfall();
                 info!(
                     model_name = %out.model_name,
                     symbol = %bundle.raw.symbol,
                     decision = execution_intent.decision.as_str(),
                     selected_v = gate.resolved_v.value,
+                    computed_v = gate.resolved_v.value,
                     v_timeframe = gate.resolved_v.timeframe,
                     v_basis = %gate.resolved_v.basis,
                     take_profit_distance = gate.take_profit_distance,
                     take_profit_distance_v = gate.take_profit_distance_v,
                     min_distance_v = gate.min_distance_v,
+                    config_min_distance_v = gate.min_distance_v,
+                    required_take_profit_distance,
+                    take_profit_distance_shortfall,
                     "llm trade entry V gate passed"
                 );
                 println!(
-                    "LLM_ORDER_V_GATE_PASSED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} selected_v={} v_timeframe={} v_basis={} tp_distance={} tp_in_v={} min_distance_v={} gate_passed=true",
+                    "LLM_ORDER_V_GATE_PASSED ts_bucket={} trigger={} symbol={} model={} decision={} entry={} tp={} sl={} selected_v={} computed_v={} v_timeframe={} v_basis={} tp_distance={} tp_in_v={} min_distance_v={} config_min_distance_v={} required_tp_distance={} tp_distance_shortfall={} gate_passed=true",
                     bundle.raw.ts_bucket,
                     &*trigger,
                     bundle.raw.symbol,
@@ -5098,11 +5181,15 @@ async fn invoke_bundle_models(
                     format_metric_number(execution_intent.take_profit),
                     format_metric_number(execution_intent.stop_loss),
                     gate.resolved_v.value,
+                    gate.resolved_v.value,
                     gate.resolved_v.timeframe,
                     gate.resolved_v.basis,
                     gate.take_profit_distance,
                     gate.take_profit_distance_v,
                     gate.min_distance_v,
+                    gate.min_distance_v,
+                    required_take_profit_distance,
+                    take_profit_distance_shortfall,
                 );
             }
             let entry_rr_gate = match evaluate_trade_rr_gate(

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -52,6 +53,35 @@ pub struct ExecutionReport {
     pub best_bid_price: f64,
     pub best_ask_price: f64,
 }
+
+#[derive(Debug, Clone)]
+pub struct TradeExecutionBlockedByCurrentPriceBeyondStopLoss {
+    pub decision: TradeDecision,
+    pub current_reference_price: f64,
+    pub current_price_source: &'static str,
+    pub entry_price: f64,
+    pub stop_loss: f64,
+    pub best_bid_price: f64,
+    pub best_ask_price: f64,
+}
+
+impl fmt::Display for TradeExecutionBlockedByCurrentPriceBeyondStopLoss {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "trade entry blocked: current {}={} already beyond stop_loss={} for decision={} entry_price={} best_bid_price={} best_ask_price={}",
+            self.current_price_source,
+            self.current_reference_price,
+            self.stop_loss,
+            self.decision.as_str(),
+            self.entry_price,
+            self.best_bid_price,
+            self.best_ask_price,
+        )
+    }
+}
+
+impl std::error::Error for TradeExecutionBlockedByCurrentPriceBeyondStopLoss {}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TradingStateSnapshot {
@@ -698,7 +728,9 @@ fn redact_secret_for_log(value: &str) -> String {
         return "*".repeat(chars.len().max(1));
     }
     let head = chars.iter().take(4).collect::<String>();
-    let tail = chars[chars.len().saturating_sub(4)..].iter().collect::<String>();
+    let tail = chars[chars.len().saturating_sub(4)..]
+        .iter()
+        .collect::<String>();
     format!("{head}...{tail}")
 }
 
@@ -738,10 +770,7 @@ fn summarize_account_balance_entries(balances: &[Value]) -> (String, String, Str
     let mut balance_summaries = Vec::new();
     let mut usdt_balance_summary = None;
     for balance in balances.iter().take(ACCOUNT_WS_BALANCE_SUMMARY_LIMIT) {
-        let asset = balance
-            .get("a")
-            .and_then(Value::as_str)
-            .unwrap_or("-");
+        let asset = balance.get("a").and_then(Value::as_str).unwrap_or("-");
         balance_assets.push(asset.to_string());
         balance_summaries.push(format!(
             "{}:wb={}:cw={}:bc={}",
@@ -776,10 +805,7 @@ fn summarize_account_update_event(payload: &Value) -> String {
     let Some(account_obj) = payload.get("a").and_then(Value::as_object) else {
         return "missing_account_object=true".to_string();
     };
-    let reason = account_obj
-        .get("m")
-        .and_then(Value::as_str)
-        .unwrap_or("-");
+    let reason = account_obj.get("m").and_then(Value::as_str).unwrap_or("-");
     let (balance_assets, balances_summary, usdt_balance_summary) = account_obj
         .get("B")
         .and_then(Value::as_array)
@@ -854,11 +880,7 @@ fn summarize_order_trade_update_event(payload: &Value) -> String {
     )
 }
 
-fn log_listen_key_delete_result(
-    connection_attempt: u64,
-    listen_key: &str,
-    result: Result<()>,
-) {
+fn log_listen_key_delete_result(connection_attempt: u64, listen_key: &str, result: Result<()>) {
     match result {
         Ok(()) => info!(
             connection_attempt = connection_attempt,
@@ -993,6 +1015,15 @@ pub async fn execute_trade_intent(
     let book_ticker = fetch_book_ticker(http_client, api_config, symbol).await?;
     let best_bid_price = parse_book_ticker_price(&book_ticker.bid_price, entry_price);
     let best_ask_price = parse_book_ticker_price(&book_ticker.ask_price, entry_price);
+    if let Some(blocked) = build_trade_blocked_by_current_price_beyond_stop_loss(
+        intent.decision,
+        entry_price,
+        stop_loss,
+        best_bid_price,
+        best_ask_price,
+    ) {
+        return Err(blocked.into());
+    }
     let maker_entry_price =
         derive_maker_entry_price(intent.decision, entry_price, &book_ticker, &symbol_filters);
     let quantity = compute_order_quantity(
@@ -2644,6 +2675,42 @@ fn derive_maker_entry_price(
 
 fn parse_book_ticker_price(raw: &str, fallback: f64) -> f64 {
     raw.parse::<f64>().unwrap_or(fallback)
+}
+
+fn build_trade_blocked_by_current_price_beyond_stop_loss(
+    decision: TradeDecision,
+    entry_price: f64,
+    stop_loss: f64,
+    best_bid_price: f64,
+    best_ask_price: f64,
+) -> Option<TradeExecutionBlockedByCurrentPriceBeyondStopLoss> {
+    let (current_reference_price, current_price_source, crossed_stop_loss) = match decision {
+        TradeDecision::Long => (
+            best_bid_price,
+            "best_bid_price",
+            best_bid_price <= stop_loss + f64::EPSILON,
+        ),
+        TradeDecision::Short => (
+            best_ask_price,
+            "best_ask_price",
+            best_ask_price >= stop_loss - f64::EPSILON,
+        ),
+        TradeDecision::NoTrade => return None,
+    };
+
+    if !crossed_stop_loss {
+        return None;
+    }
+
+    Some(TradeExecutionBlockedByCurrentPriceBeyondStopLoss {
+        decision,
+        current_reference_price,
+        current_price_source,
+        entry_price,
+        stop_loss,
+        best_bid_price,
+        best_ask_price,
+    })
 }
 
 fn price_changed_by_at_least_one_tick(requested: f64, current: f64, tick_size: f64) -> bool {
@@ -5474,6 +5541,49 @@ mod tests {
 
         assert!((sl - 1958.23).abs() < 1e-9);
         assert!((rr - 2.3340163934425556).abs() < 1e-9);
+    }
+
+    #[test]
+    fn blocks_long_when_current_bid_is_already_below_stop_loss() {
+        let blocked = build_trade_blocked_by_current_price_beyond_stop_loss(
+            TradeDecision::Long,
+            2000.0,
+            1990.0,
+            1989.5,
+            1990.2,
+        )
+        .expect("long should be blocked");
+
+        assert_eq!(blocked.current_price_source, "best_bid_price");
+        assert!((blocked.current_reference_price - 1989.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn blocks_short_when_current_ask_is_already_above_stop_loss() {
+        let blocked = build_trade_blocked_by_current_price_beyond_stop_loss(
+            TradeDecision::Short,
+            2000.0,
+            2010.0,
+            2009.8,
+            2010.4,
+        )
+        .expect("short should be blocked");
+
+        assert_eq!(blocked.current_price_source, "best_ask_price");
+        assert!((blocked.current_reference_price - 2010.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn allows_trade_when_current_price_remains_between_entry_and_stop_loss() {
+        let blocked = build_trade_blocked_by_current_price_beyond_stop_loss(
+            TradeDecision::Long,
+            2000.0,
+            1990.0,
+            1994.0,
+            1994.2,
+        );
+
+        assert!(blocked.is_none());
     }
 
     #[test]
