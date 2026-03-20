@@ -1516,7 +1516,7 @@ fn qwen_output_contract(
     } else if management_mode {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `decision`, `reason`, and `params`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- Allowed decisions: VALID, INVALID, ADJUST.\n- `params` must always be present.\n- For VALID: keep `params` present; action fields may be null.\n- For INVALID: set `params.close_price` to a number or null.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], [\"tp\",\"sl\"], [\"add\"], or [\"reduce\"]), and corresponding values: `new_tp`/`new_sl` for tp/sl adjustments, `qty_ratio` (number 0-1) for add/reduce.\n".to_string()
     } else {
-        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must be `decision`, `reason`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, and `params.horizon` to null.\n".to_string()
+        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must be `decision`, `reason`, `decision_context`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- `decision_context` must include `thesis_flow_alignment`, `entry_readiness`, and `key_condition`.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, and `params.horizon` to null.\n".to_string()
     }
 }
 
@@ -1657,7 +1657,7 @@ fn qwen_entry_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["decision", "reason", "params"],
+        "required": ["decision", "reason", "decision_context", "params"],
         "properties": {
             "decision": {
                 "type": "string",
@@ -1666,6 +1666,25 @@ fn qwen_entry_response_schema() -> Value {
             "reason": {
                 "type": "string",
                 "minLength": 1
+            },
+            "decision_context": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"],
+                "properties": {
+                    "thesis_flow_alignment": {
+                        "type": "string",
+                        "enum": ["aligned", "mixed", "opposed"]
+                    },
+                    "entry_readiness": {
+                        "type": "string",
+                        "enum": ["ready", "developing", "not_ready"]
+                    },
+                    "key_condition": {
+                        "type": "string",
+                        "minLength": 1
+                    }
+                }
             },
             "params": {
                 "type": "object",
@@ -1700,7 +1719,7 @@ fn custom_llm_entry_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "reason", "params"],
+        "required": ["decision", "reason", "decision_context", "params"],
         "properties": {
             "decision": {
                 "type": "string",
@@ -1709,6 +1728,25 @@ fn custom_llm_entry_response_schema() -> Value {
             "reason": {
                 "type": "string",
                 "minLength": 1
+            },
+            "decision_context": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"],
+                "properties": {
+                    "thesis_flow_alignment": {
+                        "type": "string",
+                        "enum": ["aligned", "mixed", "opposed"]
+                    },
+                    "entry_readiness": {
+                        "type": "string",
+                        "enum": ["ready", "developing", "not_ready"]
+                    },
+                    "key_condition": {
+                        "type": "string",
+                        "minLength": 1
+                    }
+                }
             },
             "params": {
                 "type": "object",
@@ -2238,7 +2276,7 @@ fn grok_entry_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["analysis", "decision", "params", "reason"],
+        "required": ["analysis", "decision", "decision_context", "params", "reason"],
         "properties": {
             "analysis": {
                 "type": "object",
@@ -2252,6 +2290,16 @@ fn grok_entry_response_schema() -> Value {
             "decision": {
                 "type": "string",
                 "enum": ["LONG", "SHORT", "NO_TRADE"]
+            },
+            "decision_context": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"],
+                "properties": {
+                    "thesis_flow_alignment": { "type": "string", "enum": ["aligned", "mixed", "opposed"] },
+                    "entry_readiness": { "type": "string", "enum": ["ready", "developing", "not_ready"] },
+                    "key_condition": { "type": "string" }
+                }
             },
             "params": {
                 "type": "object",
@@ -2453,7 +2501,7 @@ fn ml_grok_entry_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["analysis", "decision", "params", "reason"],
+        "required": ["analysis", "decision", "decision_context", "params", "reason"],
         "properties": {
             "analysis": {
                 "type": "object",
@@ -2465,6 +2513,16 @@ fn ml_grok_entry_schema() -> Value {
                 }
             },
             "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
+            "decision_context": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"],
+                "properties": {
+                    "thesis_flow_alignment": { "type": "string", "enum": ["aligned", "mixed", "opposed"] },
+                    "entry_readiness": { "type": "string", "enum": ["ready", "developing", "not_ready"] },
+                    "key_condition": { "type": "string" }
+                }
+            },
             "params": {
                 "type": "object",
                 "additionalProperties": false,
@@ -2531,6 +2589,21 @@ fn ml_gemini_entry_schema() -> Value {
                 "required": ["market_thesis", "trade_logic"]
             },
             "decision": { "type": "STRING", "enum": ["LONG", "SHORT", "NO_TRADE"] },
+            "decision_context": {
+                "type": "OBJECT",
+                "properties": {
+                    "thesis_flow_alignment": {
+                        "type": "STRING",
+                        "enum": ["aligned", "mixed", "opposed"]
+                    },
+                    "entry_readiness": {
+                        "type": "STRING",
+                        "enum": ["ready", "developing", "not_ready"]
+                    },
+                    "key_condition": { "type": "STRING" }
+                },
+                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"]
+            },
             "params": {
                 "type": "OBJECT",
                 "properties": {
@@ -2544,7 +2617,7 @@ fn ml_gemini_entry_schema() -> Value {
             },
             "reason": { "type": "STRING" }
         },
-        "required": ["analysis", "decision", "params", "reason"]
+        "required": ["analysis", "decision", "decision_context", "params", "reason"]
     })
 }
 
@@ -2587,10 +2660,29 @@ fn ml_qwen_entry_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["decision", "reason", "params"],
+        "required": ["decision", "reason", "decision_context", "params"],
         "properties": {
             "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
             "reason": { "type": "string", "minLength": 1 },
+            "decision_context": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"],
+                "properties": {
+                    "thesis_flow_alignment": {
+                        "type": "string",
+                        "enum": ["aligned", "mixed", "opposed"]
+                    },
+                    "entry_readiness": {
+                        "type": "string",
+                        "enum": ["ready", "developing", "not_ready"]
+                    },
+                    "key_condition": {
+                        "type": "string",
+                        "minLength": 1
+                    }
+                }
+            },
             "params": { "type": "object", "additionalProperties": true },
             "analysis": { "type": ["object", "null"], "additionalProperties": true }
         }
@@ -2628,10 +2720,29 @@ fn ml_custom_llm_entry_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "reason", "params"],
+        "required": ["decision", "reason", "decision_context", "params"],
         "properties": {
             "decision": { "type": "string", "enum": ["LONG", "SHORT", "NO_TRADE"] },
             "reason": { "type": "string", "minLength": 1 },
+            "decision_context": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"],
+                "properties": {
+                    "thesis_flow_alignment": {
+                        "type": "string",
+                        "enum": ["aligned", "mixed", "opposed"]
+                    },
+                    "entry_readiness": {
+                        "type": "string",
+                        "enum": ["ready", "developing", "not_ready"]
+                    },
+                    "key_condition": {
+                        "type": "string",
+                        "minLength": 1
+                    }
+                }
+            },
             "params": {
                 "type": "object",
                 "additionalProperties": false,
@@ -2729,6 +2840,21 @@ fn gemini_entry_response_schema() -> Value {
                 "type": "STRING",
                 "enum": ["LONG", "SHORT", "NO_TRADE"]
             },
+            "decision_context": {
+                "type": "OBJECT",
+                "properties": {
+                    "thesis_flow_alignment": {
+                        "type": "STRING",
+                        "enum": ["aligned", "mixed", "opposed"]
+                    },
+                    "entry_readiness": {
+                        "type": "STRING",
+                        "enum": ["ready", "developing", "not_ready"]
+                    },
+                    "key_condition": { "type": "STRING" }
+                },
+                "required": ["thesis_flow_alignment", "entry_readiness", "key_condition"]
+            },
             "params": {
                 "type": "OBJECT",
                 "properties": {
@@ -2742,7 +2868,7 @@ fn gemini_entry_response_schema() -> Value {
             },
             "reason": { "type": "STRING" }
         },
-        "required": ["analysis", "decision", "params", "reason"]
+        "required": ["analysis", "decision", "decision_context", "params", "reason"]
     })
 }
 
@@ -4015,6 +4141,17 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(false)
         );
+        assert_eq!(
+            schema
+                .pointer("/properties/decision_context/additionalProperties")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|required| required.iter().any(|v| v.as_str() == Some("decision_context")))
+            .unwrap_or(false));
     }
 
     #[test]
@@ -4071,6 +4208,20 @@ mod tests {
             assert!(!contract.contains("`decision`, `reason`, and `scan`"));
             assert!(!contract.contains("story"));
         }
+    }
+
+    #[test]
+    fn qwen_entry_output_contract_mentions_decision_context() {
+        let contract = super::qwen_output_contract(
+            false,
+            false,
+            super::prompt::EntryPromptStage::Finalize,
+            "medium_large_opportunity",
+        );
+        assert!(contract.contains("decision_context"));
+        assert!(contract.contains("thesis_flow_alignment"));
+        assert!(contract.contains("entry_readiness"));
+        assert!(contract.contains("key_condition"));
     }
 
     #[test]

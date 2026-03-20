@@ -27,6 +27,12 @@ or is it still interrupting, resisting, or overpowering it?
 If the opportunity is tradable now, define the entry, stop, target, leverage, and horizon
 so they belong to the structure currently controlling price.
 
+Decision context
+Always return `decision_context` with:
+- `thesis_flow_alignment`: whether the 4h to 1d thesis and the current 1h/15m flow are aligned, mixed, or opposed
+- `entry_readiness`: whether this setup is ready, still developing, or not ready
+- `key_condition`: the single most important condition that makes this trade valid now, or keeps it from being valid now
+
 How to think about the timeframes:
 - 1d frames the broader regime and outer path.
 - 4h defines the core tradable thesis within that regime.
@@ -44,6 +50,7 @@ A strong answer:
 - identifies the strongest 4h to 1d opportunity
 - describes the current 1h/15m state without forcing agreement
 - explains whether current price is aligned with that opportunity or still being opposed by live order flow
+- returns a concise `decision_context` that makes the final judgment auditable
 - chooses a trade only when thesis, current state, and location form one coherent expression
 - chooses NO_TRADE when the opportunity exists but current price is still a poor expression of it
 
@@ -51,6 +58,9 @@ Before you output, verify:
 - what is the strongest 4h to 1d opportunity?
 - what is the current 1h/15m state?
 - is the lower timeframe aligned with that opportunity, balancing against it, or still actively pushing against it?
+- if you are choosing NO_TRADE while the 4h to 1d thesis and the current 1h/15m flow are aligned,
+  identify the specific missing condition, the evidence that it is still missing,
+  and what price behavior would complete the trade setup
 - why is this location a strong trade expression now, rather than only a directionally plausible idea?
 - are entry, stop, and target native to the structure currently controlling price?
 
