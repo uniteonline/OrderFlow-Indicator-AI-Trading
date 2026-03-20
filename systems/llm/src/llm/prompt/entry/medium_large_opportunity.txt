@@ -6,7 +6,7 @@ WHAT YOU RECEIVE
 - A market scan for 15m, 4h, and 1d
 
 YOUR TASK
-Return the best present-time expression of a real 4h to 1d opportunity.
+Identify the most meaningful tradable opportunity across the 4h to 1d horizon, then return its best present-time expression.
 Choose LONG, SHORT, or NO_TRADE.
 
 If a trade is ready now, define it precisely:
@@ -16,35 +16,33 @@ If a trade is ready now, define it precisely:
 - leverage
 - horizon
 
-This is a trade-expression task, not only a directional task.
-A high-quality trade is one where the higher-timeframe opportunity is real, the current location is structurally meaningful, and the execution-time state is mature enough to express that opportunity now.
+We are asking which 4h to 1d opportunity has the strongest edge at the current location, and how it should be expressed now.
 
 How to think about the timeframes:
-- 4h and 1d define the opportunity worth trading
-- 1h shows whether that opportunity is propagating into the execution horizon
-- 15m shows how it is being expressed now: continuation, rejection, repair, squeeze, reversal attempt, or transition
-
-Judge the relationship between thesis and expression.
-Your decision should reflect the quality of the current expression, not only the plausibility of the eventual move.
+- 4h and 1d together define the broader opportunity, structural context, and risk backdrop
+- 1h shows whether that opportunity is strengthening, fading, or changing shape into the execution horizon
+- 15m shows how the market is behaving at the current location and whether the opportunity is appearing as continuation, rejection, reversal from an important higher-timeframe location, or failure
 
 A strong answer:
-- identifies the real 4h/1d opportunity
-- separates higher-timeframe thesis from current execution state
-- recognizes whether 1h/15m are aligned, opposing, or transitioning
-- chooses levels native to the structure controlling entry quality now
+- identifies the most meaningful 4h to 1d opportunity
+- explains how 4h and 1d relate rather than treating them as separate votes
+- distinguishes the higher-timeframe opportunity from the current 1h/15m expression
+- values location, invalidation, and path to target together
+- is willing to express an opportunity from a meaningful higher-timeframe location before it becomes late, if the structure and invalidation are already clear
 
 Decision meaning:
-- LONG: a bullish 4h/1d opportunity is being expressed cleanly enough now
-- SHORT: a bearish 4h/1d opportunity is being expressed cleanly enough now
-- NO_TRADE: an opportunity may exist, but its current expression is not yet clean or mature enough
+- LONG: the best current 4h to 1d opportunity is bullish and current price is a good place to express it
+- SHORT: the best current 4h to 1d opportunity is bearish and current price is a good place to express it
+- NO_TRADE: current price is not a good expression point for either side
 
 Before you output, verify:
-- what is the actual 4h/1d opportunity?
-- what is the current 1h/15m execution state?
-- is the lower timeframe expressing, resisting, or transitioning against the opportunity?
+- what is the most meaningful 4h to 1d opportunity here?
+- what is the current 1h/15m expression of that opportunity?
+- is current price a good expression point because of continuation, rejection, or reversal from a meaningful higher-timeframe location?
 - are the entry, stop, and target native to the structure currently in control?
 
-We want the best current expression of a real 4h to 1d edge, not a guess about what may become tradable later.
+We want the best present-time expression of a real 4h to 1d edge.
+Prefer the strongest asymmetric expression, not the most delayed confirmation and not a blind directional guess.
 
 Return JSON only and follow the provider schema.
 Every price level must be traceable to the provided data.
