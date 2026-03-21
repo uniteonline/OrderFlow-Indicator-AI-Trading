@@ -39,6 +39,9 @@ const STARTUP_BACKFILL_MARKET: &str = "all";
 const STALE_DROP_REPORT_INTERVAL_SECS: u64 = 10;
 const INGEST_TRADE_CHANNEL_CAPACITY: usize = 50_000;
 const INGEST_NON_TRADE_CHANNEL_CAPACITY: usize = 100_000;
+const INGEST_DRAIN_PER_TICK_LIMIT: usize = 25_000;
+const DIRTY_RECOMPUTE_BATCH_SIZE: usize = 5;
+const DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK: usize = 50;
 
 #[derive(Debug, Clone)]
 pub struct ReplayRow {
@@ -57,6 +60,42 @@ pub struct BackfillCursor {
     pub market: String,
     pub symbol: String,
     pub routing_key: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct IngestGroupFrontier {
+    flow_max_event_ts: Option<DateTime<Utc>>,
+    ob_heavy_max_event_ts: Option<DateTime<Utc>>,
+    deriv_max_event_ts: Option<DateTime<Utc>>,
+}
+
+impl IngestGroupFrontier {
+    fn observe(&mut self, event: &EngineEvent) {
+        let slot = match &event.data {
+            MdData::Trade(_) | MdData::AggTrade1m(_) => &mut self.flow_max_event_ts,
+            MdData::Depth(_)
+            | MdData::OrderbookSnapshot(_)
+            | MdData::Bbo(_)
+            | MdData::AggOrderbook1m(_)
+            | MdData::ForceOrder(_)
+            | MdData::AggLiq1m(_) => &mut self.ob_heavy_max_event_ts,
+            MdData::MarkPrice(_) | MdData::FundingRate(_) | MdData::AggFundingMark1m(_) => {
+                &mut self.deriv_max_event_ts
+            }
+            MdData::Kline(_) => {
+                return;
+            }
+        };
+
+        *slot = Some(slot.map_or(event.event_ts, |prev| prev.max(event.event_ts)));
+    }
+
+    fn ready_watermark_ts(&self) -> Option<DateTime<Utc>> {
+        let flow = self.flow_max_event_ts?;
+        let ob_heavy = self.ob_heavy_max_event_ts?;
+        let deriv = self.deriv_max_event_ts?;
+        Some(flow.min(ob_heavy).min(deriv))
+    }
 }
 
 pub fn build_indicator_runtime_options(
@@ -162,7 +201,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         .eq_ignore_ascii_case("live");
     let live_drop_stale_enabled = ctx.config.indicator.live_drop_stale_enabled;
     let stale_limit_secs = ctx.config.indicator.live_drop_stale_event_secs;
-    let mut max_seen_event_ts: Option<chrono::DateTime<Utc>> = None;
+    let mut ingest_frontier = IngestGroupFrontier::default();
     let mut stale_drop_count: u64 = 0;
     let mut stale_drop_max_lag_secs: i64 = 0;
     let mut stale_drop_max_publish_delay_secs: i64 = 0;
@@ -297,7 +336,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &mut stale_drop_newest_ts,
                         &mut stale_drop_by_msg_type,
                         &metrics,
-                        &mut max_seen_event_ts,
+                        &mut ingest_frontier,
                         &mut state_store,
                     );
                 } else {
@@ -325,7 +364,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &mut stale_drop_newest_ts,
                         &mut stale_drop_by_msg_type,
                         &metrics,
-                        &mut max_seen_event_ts,
+                        &mut ingest_frontier,
                         &mut state_store,
                     );
                 } else {
@@ -337,6 +376,31 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                 }
             }
             _ = tick.tick() => {
+                if drain_pending_ingest_events(
+                    &mut trade_rx,
+                    &mut non_trade_rx,
+                    &mut trade_channel_closed,
+                    &mut non_trade_channel_closed,
+                    startup_replay_cutoff_bucket,
+                    &mut startup_cutover_completed,
+                    consume_mode_live,
+                    live_drop_stale_enabled,
+                    stale_limit_secs,
+                    &mut stale_drop_count,
+                    &mut stale_drop_max_lag_secs,
+                    &mut stale_drop_max_publish_delay_secs,
+                    &mut stale_drop_max_transport_lag_secs,
+                    &mut stale_drop_oldest_ts,
+                    &mut stale_drop_newest_ts,
+                    &mut stale_drop_by_msg_type,
+                    &metrics,
+                    &mut ingest_frontier,
+                    &mut state_store,
+                ) {
+                    warn!("all mq consumers ended, stopping indicator engine");
+                    break;
+                }
+
                 let queue_lag = (trade_rx.len() + non_trade_rx.len()) as i64;
                 metrics.set_queue_lag(queue_lag);
                 if stale_drop_count > 0
@@ -366,7 +430,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     stale_drop_last_report = Instant::now();
                 }
 
-                let Some(watermark_ts) = max_seen_event_ts else {
+                let Some(watermark_ts) = ingest_frontier.ready_watermark_ts() else {
                     continue;
                 };
                 if let Err(err) = process_ready_minutes(
@@ -415,6 +479,102 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn drain_pending_ingest_events(
+    trade_rx: &mut mpsc::Receiver<EngineEvent>,
+    non_trade_rx: &mut mpsc::Receiver<EngineEvent>,
+    trade_channel_closed: &mut bool,
+    non_trade_channel_closed: &mut bool,
+    startup_replay_cutoff_bucket: Option<DateTime<Utc>>,
+    startup_cutover_completed: &mut bool,
+    consume_mode_live: bool,
+    live_drop_stale_enabled: bool,
+    stale_limit_secs: i64,
+    stale_drop_count: &mut u64,
+    stale_drop_max_lag_secs: &mut i64,
+    stale_drop_max_publish_delay_secs: &mut i64,
+    stale_drop_max_transport_lag_secs: &mut i64,
+    stale_drop_oldest_ts: &mut Option<DateTime<Utc>>,
+    stale_drop_newest_ts: &mut Option<DateTime<Utc>>,
+    stale_drop_by_msg_type: &mut HashMap<String, u64>,
+    metrics: &Arc<AppMetrics>,
+    ingest_frontier: &mut IngestGroupFrontier,
+    state_store: &mut StateStore,
+) -> bool {
+    let mut drained = 0usize;
+
+    while drained < INGEST_DRAIN_PER_TICK_LIMIT {
+        let mut progressed = false;
+
+        if !*trade_channel_closed {
+            match trade_rx.try_recv() {
+                Ok(event) => {
+                    handle_ingest_event(
+                        event,
+                        startup_replay_cutoff_bucket,
+                        startup_cutover_completed,
+                        consume_mode_live,
+                        live_drop_stale_enabled,
+                        stale_limit_secs,
+                        stale_drop_count,
+                        stale_drop_max_lag_secs,
+                        stale_drop_max_publish_delay_secs,
+                        stale_drop_max_transport_lag_secs,
+                        stale_drop_oldest_ts,
+                        stale_drop_newest_ts,
+                        stale_drop_by_msg_type,
+                        metrics,
+                        ingest_frontier,
+                        state_store,
+                    );
+                    drained += 1;
+                    progressed = true;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    *trade_channel_closed = true;
+                }
+            }
+        }
+
+        if !*non_trade_channel_closed {
+            match non_trade_rx.try_recv() {
+                Ok(event) => {
+                    handle_ingest_event(
+                        event,
+                        startup_replay_cutoff_bucket,
+                        startup_cutover_completed,
+                        consume_mode_live,
+                        live_drop_stale_enabled,
+                        stale_limit_secs,
+                        stale_drop_count,
+                        stale_drop_max_lag_secs,
+                        stale_drop_max_publish_delay_secs,
+                        stale_drop_max_transport_lag_secs,
+                        stale_drop_oldest_ts,
+                        stale_drop_newest_ts,
+                        stale_drop_by_msg_type,
+                        metrics,
+                        ingest_frontier,
+                        state_store,
+                    );
+                    drained += 1;
+                    progressed = true;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    *non_trade_channel_closed = true;
+                }
+            }
+        }
+
+        if !progressed {
+            break;
+        }
+    }
+
+    *trade_channel_closed && *non_trade_channel_closed
 }
 
 const INDICATOR_COVERAGE_ORDER: [(&str, &str); 24] = [
@@ -479,6 +639,7 @@ fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Opti
     use std::fs::File;
 
     const MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT: usize = 60;
+    const MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT: usize = 1440;
 
     if path.is_empty() {
         return None;
@@ -529,14 +690,28 @@ fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Opti
         &snap.history_futures,
         MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
     ) {
-        warn!(
+        if snapshot_null_price_run_reaches_recent_tail(
+            snap.last_finalized_ts,
+            end,
+            MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
+        ) {
+            warn!(
+                run_start = %start,
+                run_end = %end,
+                run_len = len,
+                max_allowed = MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
+                min_recent_bars_after_run = MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
+                "State snapshot futures history contains recent long null-price run, ignoring"
+            );
+            return None;
+        }
+        info!(
             run_start = %start,
             run_end = %end,
             run_len = len,
-            max_allowed = MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
-            "State snapshot futures history contains long null-price run, ignoring"
+            min_recent_bars_after_run = MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
+            "State snapshot futures history contains only historical long null-price run, accepting snapshot"
         );
-        return None;
     }
     if !snap.history_spot.is_empty()
         && !minute_history_is_strictly_contiguous(&snap.history_spot, snap.last_finalized_ts)
@@ -548,14 +723,28 @@ fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Opti
         &snap.history_spot,
         MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
     ) {
-        warn!(
+        if snapshot_null_price_run_reaches_recent_tail(
+            snap.last_finalized_ts,
+            end,
+            MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
+        ) {
+            warn!(
+                run_start = %start,
+                run_end = %end,
+                run_len = len,
+                max_allowed = MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
+                min_recent_bars_after_run = MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
+                "State snapshot spot history contains recent long null-price run, ignoring"
+            );
+            return None;
+        }
+        info!(
             run_start = %start,
             run_end = %end,
             run_len = len,
-            max_allowed = MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT,
-            "State snapshot spot history contains long null-price run, ignoring"
+            min_recent_bars_after_run = MIN_RECENT_BARS_AFTER_NULL_RUN_IN_SNAPSHOT,
+            "State snapshot spot history contains only historical long null-price run, accepting snapshot"
         );
-        return None;
     }
     Some(snap)
 }
@@ -619,6 +808,14 @@ fn find_long_null_price_run(
     } else {
         None
     }
+}
+
+fn snapshot_null_price_run_reaches_recent_tail(
+    last_finalized_ts: DateTime<Utc>,
+    run_end: DateTime<Utc>,
+    min_recent_bars_after_run: usize,
+) -> bool {
+    (last_finalized_ts - run_end).num_minutes() < min_recent_bars_after_run as i64
 }
 
 fn minute_history_has_any_price(row: &MinuteHistory) -> bool {
@@ -942,7 +1139,7 @@ fn handle_ingest_event(
     stale_drop_newest_ts: &mut Option<DateTime<Utc>>,
     stale_drop_by_msg_type: &mut HashMap<String, u64>,
     metrics: &Arc<AppMetrics>,
-    max_seen_event_ts: &mut Option<DateTime<Utc>>,
+    ingest_frontier: &mut IngestGroupFrontier,
     state_store: &mut StateStore,
 ) {
     let event_bucket_ts = logical_event_bucket_ts(&event);
@@ -992,10 +1189,7 @@ fn handle_ingest_event(
     }
 
     metrics.inc_processed(event.event_ts.timestamp_millis());
-    *max_seen_event_ts = Some(match max_seen_event_ts.as_ref().cloned() {
-        Some(prev) => prev.max(event.event_ts),
-        None => event.event_ts,
-    });
+    ingest_frontier.observe(&event);
     // EventBuffer was a no-op wrapper (push immediately followed by pop with no watermark
     // gating). Ingest directly to avoid the unnecessary allocation round-trip.
     state_store.ingest(event);
@@ -1032,11 +1226,19 @@ async fn process_ready_minutes(
     // windows or recent_7d event coverage) can observe a temporary tail gap and emit
     // false low-coverage snapshots. Drain dirty recompute to completion before releasing
     // additional ready minutes.
+    let mut dirty_windows_processed = 0usize;
     loop {
-        let dirty_batch = state_store.recompute_dirty_finalized_minutes(5);
+        if dirty_windows_processed >= DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK {
+            break;
+        }
+        let remaining_budget =
+            DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK.saturating_sub(dirty_windows_processed);
+        let dirty_batch = state_store
+            .recompute_dirty_finalized_minutes(DIRTY_RECOMPUTE_BATCH_SIZE.min(remaining_budget));
         if dirty_batch.is_empty() {
             break;
         }
+        dirty_windows_processed += dirty_batch.len();
         for window in dirty_batch {
             let minute = window.ts_bucket;
             let snapshots =
@@ -1065,6 +1267,10 @@ async fn process_ready_minutes(
                 }
             }
         }
+    }
+
+    if state_store.has_pending_dirty_recompute() {
+        return Ok(());
     }
 
     for minute in scheduler.ready_minutes(watermark_ts) {
@@ -2318,11 +2524,15 @@ async fn export_snapshots(
 mod tests {
     use super::{
         build_backfill_sql, find_long_null_price_run, minute_history_is_strictly_contiguous,
+        snapshot_null_price_run_reaches_recent_tail, IngestGroupFrontier,
     };
-    use crate::ingest::decoder::MarketKind;
+    use crate::ingest::decoder::{
+        BboEvent, EngineEvent, FundingRateEvent, MarketKind, MdData, TradeEvent,
+    };
     use crate::runtime::state_store::MinuteHistory;
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use std::collections::BTreeMap;
+    use uuid::Uuid;
 
     const MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT: usize = 60;
 
@@ -2386,6 +2596,23 @@ mod tests {
         }
     }
 
+    fn frontier_event(event_ts: chrono::DateTime<Utc>, data: MdData) -> EngineEvent {
+        EngineEvent {
+            schema_version: 1,
+            msg_type: "test".to_string(),
+            message_id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
+            routing_key: "test".to_string(),
+            market: MarketKind::Futures,
+            symbol: "TESTUSDT".to_string(),
+            source_kind: "test".to_string(),
+            backfill_in_progress: false,
+            event_ts,
+            published_at: event_ts,
+            data,
+        }
+    }
+
     #[test]
     fn startup_backfill_sql_filters_canonical_rows_by_ts_bucket() {
         let sql = build_backfill_sql(false, false);
@@ -2413,6 +2640,61 @@ mod tests {
         assert!(!sql.contains("LEFT JOIN md.agg_orderbook_1m"));
         assert!(!sql.contains("LEFT JOIN md.agg_liq_1m"));
         assert!(!sql.contains("LEFT JOIN md.agg_funding_mark_1m"));
+    }
+
+    #[test]
+    fn ingest_group_frontier_uses_slowest_group_watermark() {
+        let start = Utc.with_ymd_and_hms(2026, 3, 10, 5, 0, 0).single().unwrap();
+        let mut frontier = IngestGroupFrontier::default();
+
+        frontier.observe(&frontier_event(
+            start + ChronoDuration::minutes(3),
+            MdData::Trade(TradeEvent {
+                price: 1.0,
+                qty_eth: 1.0,
+                notional_usdt: 1.0,
+                aggressor_side: 1,
+            }),
+        ));
+        frontier.observe(&frontier_event(
+            start + ChronoDuration::minutes(2),
+            MdData::Bbo(BboEvent {
+                bid_price: 1.0,
+                bid_qty: 1.0,
+                ask_price: 2.0,
+                ask_qty: 1.0,
+                sample_count: 1,
+            }),
+        ));
+        assert_eq!(frontier.ready_watermark_ts(), None);
+
+        frontier.observe(&frontier_event(
+            start + ChronoDuration::minutes(1),
+            MdData::FundingRate(FundingRateEvent {
+                funding_time: start + ChronoDuration::minutes(1),
+                funding_rate: 0.001,
+                mark_price: Some(1.0),
+                next_funding_time: None,
+            }),
+        ));
+        assert_eq!(
+            frontier.ready_watermark_ts(),
+            Some(start + ChronoDuration::minutes(1))
+        );
+
+        frontier.observe(&frontier_event(
+            start + ChronoDuration::minutes(4),
+            MdData::FundingRate(FundingRateEvent {
+                funding_time: start + ChronoDuration::minutes(4),
+                funding_rate: 0.002,
+                mark_price: Some(1.0),
+                next_funding_time: None,
+            }),
+        ));
+        assert_eq!(
+            frontier.ready_watermark_ts(),
+            Some(start + ChronoDuration::minutes(2))
+        );
     }
 
     #[test]
@@ -2483,5 +2765,38 @@ mod tests {
             start + ChronoDuration::minutes(MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT as i64)
         );
         assert_eq!(run.2, MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT);
+    }
+
+    #[test]
+    fn snapshot_null_price_guard_tolerates_historical_gap_far_from_tail() {
+        let last_finalized_ts = Utc
+            .with_ymd_and_hms(2026, 3, 20, 22, 48, 0)
+            .single()
+            .unwrap();
+        let run_end = Utc
+            .with_ymd_and_hms(2026, 3, 19, 7, 58, 0)
+            .single()
+            .unwrap();
+
+        assert!(!snapshot_null_price_run_reaches_recent_tail(
+            last_finalized_ts,
+            run_end,
+            1440,
+        ));
+    }
+
+    #[test]
+    fn snapshot_null_price_guard_rejects_gap_that_reaches_recent_tail() {
+        let last_finalized_ts = Utc
+            .with_ymd_and_hms(2026, 3, 20, 22, 48, 0)
+            .single()
+            .unwrap();
+        let run_end = last_finalized_ts - ChronoDuration::minutes(30);
+
+        assert!(snapshot_null_price_run_reaches_recent_tail(
+            last_finalized_ts,
+            run_end,
+            1440,
+        ));
     }
 }
