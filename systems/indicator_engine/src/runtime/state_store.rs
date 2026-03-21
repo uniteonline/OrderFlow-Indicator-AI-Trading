@@ -1354,6 +1354,10 @@ impl StateStore {
         out
     }
 
+    pub fn has_pending_dirty_recompute(&self) -> bool {
+        self.dirty_recompute_from.is_some()
+    }
+
     fn finalize_market(
         &mut self,
         market: MarketKind,
@@ -2642,6 +2646,28 @@ mod tests {
             recomputed[1].history_futures.last().map(|h| h.vpin),
             Some(0.30)
         );
+    }
+
+    #[test]
+    fn dirty_recompute_remains_pending_until_suffix_fully_rebuilt() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 6, 0, 0).single().unwrap();
+        let ts_2 = ts_1 + ChronoDuration::minutes(1);
+
+        store.ingest(agg_trade_event(ts_1, 2.0, 1.0, 0.20));
+        store.finalize_minute(ts_1);
+        store.ingest(agg_trade_event(ts_2, 1.0, 0.0, 0.30));
+        store.finalize_minute(ts_2);
+
+        store.ingest(agg_trade_event(ts_1, 5.0, 1.0, 0.55));
+        let first_batch = store.recompute_dirty_finalized_minutes(1);
+
+        assert_eq!(first_batch.len(), 1);
+        assert!(store.has_pending_dirty_recompute());
+
+        let second_batch = store.recompute_dirty_finalized_minutes(1);
+        assert_eq!(second_batch.len(), 1);
+        assert!(!store.has_pending_dirty_recompute());
     }
 
     #[test]
