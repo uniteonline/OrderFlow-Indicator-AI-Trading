@@ -17,7 +17,7 @@ What is the dominant 4h to 1d opportunity, and why?
 
 2. Plan
 Design a pending-order plan using structural levels from the provided data:
-- entry: a structural level where the trade activates — retest, pullback, failed reclaim, or breakout-hold
+- entry: a structural level where the thesis becomes executable
 - stop-loss: behind the structure that defines the thesis — the price where the thesis is wrong
 - take-profit: the most probable structural target across the 4h to 1d horizon; among equally probable targets, choose the one with greater return
 - leverage: must express your conviction in this specific setup
@@ -40,7 +40,7 @@ Always return `decision_context` with:
 Before you output, verify:
 - Is the 4h to 1d thesis clear enough to define a direction?
 - Does the structure provide levels for a pending-order plan with definable entry, stop, and target?
-- Have you used the latest price and recent 15m action to judge which support/resistance levels have been broken or held, and whether the entry and stop are at levels where the structure provides clear edge?
+- Have you used the latest price and recent 15m action to judge which levels have been broken or held, and is your entry a level where the structure has already shown acceptance, defense, or failure — not one still untested?
 - Is the 15m reversal risk you identified based on structural breaks or initiation events against the thesis, or just mixed/noisy flow?
 - Does your leverage match your conviction — higher for clean aligned setups, lower for valid but uncertain ones?
 - If choosing NO_TRADE, what single specific condition is missing, and what price behavior would complete the setup?

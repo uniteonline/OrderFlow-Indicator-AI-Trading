@@ -1071,6 +1071,26 @@ mod tests {
         );
         assert!(value.pointer("/indicators/fvg/window_code").is_none());
         assert!(value
+            .pointer("/indicators/atr_context/payload/latest_15m_detail/summary/atr14")
+            .and_then(Value::as_f64)
+            .map(|value| value > 0.0)
+            .unwrap_or(false));
+        assert!(value
+            .pointer("/indicators/atr_context/payload/latest_4h_context/summary/atr14")
+            .and_then(Value::as_f64)
+            .map(|value| value > 0.0)
+            .unwrap_or(false));
+        assert!(value
+            .pointer("/indicators/atr_context/payload/latest_1d_background/summary/atr14")
+            .and_then(Value::as_f64)
+            .map(|value| value > 0.0)
+            .unwrap_or(false));
+        assert!(value
+            .pointer("/indicators/atr_context/payload/latest_15m_detail/summary/atr14_pct")
+            .and_then(Value::as_f64)
+            .map(|value| value > 0.0)
+            .unwrap_or(false));
+        assert!(value
             .pointer("/indicators/price_volume_structure/payload/levels")
             .is_none());
         assert!(value
@@ -2001,6 +2021,15 @@ mod tests {
             .is_none());
         assert!(value
             .pointer("/indicators/events_summary/payload/most_recent_absorption")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/atr_context/payload/latest_15m_detail/summary/atr14")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/atr_context/payload/latest_4h_context/summary/atr14")
+            .is_some());
+        assert!(value
+            .pointer("/indicators/atr_context/payload/latest_1d_background/summary/atr14")
             .is_some());
         assert!(
             value
