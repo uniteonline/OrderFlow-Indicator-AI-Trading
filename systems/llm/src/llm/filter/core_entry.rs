@@ -7,7 +7,8 @@ use super::core_shared::{
     resolve_reference_mark_price, CORE_WINDOWS_WITH_3D,
 };
 use chrono::{DateTime, Utc};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
+use std::cmp::Ordering;
 
 const AVWAP_LIMITS: &[(&str, usize)] = &[("15m", 5), ("4h", 3), ("1d", 2)];
 const KLINE_LIMITS: &[(&str, usize)] = &[("15m", 20), ("4h", 12), ("1d", 8)];
@@ -90,6 +91,15 @@ pub(super) fn filter_indicators(
     core_shared::insert_filtered_indicator(&mut indicators, source, "kline_history", |payload| {
         prune_nulls(filter_kline_history(payload, KLINE_LIMITS))
     });
+    if let Some(atr_context) = build_atr_context(&indicators) {
+        indicators.insert(
+            "atr_context".to_string(),
+            Value::Object(Map::from_iter([(
+                "payload".to_string(),
+                Value::Object(atr_context),
+            )])),
+        );
+    }
     core_shared::insert_filtered_indicator(
         &mut indicators,
         source,
@@ -343,6 +353,103 @@ fn build_events_summary(
     (!payload.is_empty()).then_some(payload)
 }
 
+fn build_atr_context(indicators: &Map<String, Value>) -> Option<Map<String, Value>> {
+    let mut payload = Map::new();
+
+    for (tf, output_key) in [
+        ("15m", "latest_15m_detail"),
+        ("4h", "latest_4h_context"),
+        ("1d", "latest_1d_background"),
+    ] {
+        let Some(bars) = extract_filtered_futures_bars(indicators, tf) else {
+            continue;
+        };
+        let snapshot = build_atr_snapshot(&bars);
+        if snapshot.is_null() {
+            continue;
+        }
+        payload.insert(output_key.to_string(), snapshot);
+    }
+
+    (!payload.is_empty()).then_some(payload)
+}
+
+fn build_atr_snapshot(bars: &[Map<String, Value>]) -> Value {
+    let closed_bars = bars
+        .iter()
+        .filter(|bar| {
+            bar.get("is_closed")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let atr14 = compute_atr14(&closed_bars);
+    let current_partial_bar = bars
+        .last()
+        .filter(|bar| {
+            !bar.get("is_closed")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
+        .map(compact_bar_with_derived);
+
+    let mut snapshot = Map::new();
+    snapshot.insert(
+        "summary".to_string(),
+        build_path_summary(&closed_bars, atr14),
+    );
+    if let Some(current_partial_bar) = current_partial_bar {
+        snapshot.insert("current_partial_bar".to_string(), current_partial_bar);
+    }
+
+    prune_nulls(Value::Object(snapshot))
+}
+
+fn build_path_summary(bars: &[Map<String, Value>], atr14: Option<f64>) -> Value {
+    let Some(oldest) = bars.first() else {
+        return Value::Null;
+    };
+    let Some(latest) = bars.last() else {
+        return Value::Null;
+    };
+
+    let oldest_open = oldest.get("open").and_then(Value::as_f64);
+    let latest_close = latest.get("close").and_then(Value::as_f64);
+    let range_high = bars
+        .iter()
+        .filter_map(|bar| bar.get("high").and_then(Value::as_f64))
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let range_low = bars
+        .iter()
+        .filter_map(|bar| bar.get("low").and_then(Value::as_f64))
+        .min_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let range_pct = match (range_high, range_low, oldest_open) {
+        (Some(high), Some(low), Some(open)) if open.abs() > f64::EPSILON => {
+            Some(round2((high - low) / open * 100.0))
+        }
+        _ => None,
+    };
+    let atr14_pct = match (atr14, latest_close) {
+        (Some(atr14), Some(close)) if close.abs() > f64::EPSILON => {
+            Some(round2(atr14 / close * 100.0))
+        }
+        _ => None,
+    };
+
+    prune_nulls(json!({
+        "bars_count": bars.len(),
+        "oldest_open": oldest_open,
+        "latest_close": latest_close,
+        "atr14": atr14.map(round2),
+        "atr14_pct": atr14_pct,
+        "net_change_pct": pct_delta(latest_close, oldest_open).map(round2),
+        "range_high": range_high,
+        "range_low": range_low,
+        "range_pct": range_pct,
+    }))
+}
+
 fn build_most_recent_event_summary(
     indicator: Option<&Value>,
     current_ts: Option<DateTime<Utc>>,
@@ -540,6 +647,67 @@ fn compute_atr14(bars: &[Map<String, Value>]) -> Option<f64> {
             .sum::<f64>()
             / window as f64,
     )
+}
+
+fn compact_bar_with_derived(bar: &Map<String, Value>) -> Value {
+    let open = bar.get("open").and_then(Value::as_f64);
+    let high = bar.get("high").and_then(Value::as_f64);
+    let low = bar.get("low").and_then(Value::as_f64);
+    let close = bar.get("close").and_then(Value::as_f64);
+    let bar_range = match (high, low) {
+        (Some(high), Some(low)) if (high - low).abs() > f64::EPSILON => Some(high - low),
+        _ => None,
+    };
+    let close_location_pct = match (close, low, bar_range) {
+        (Some(close), Some(low), Some(range)) => Some(round2((close - low) / range * 100.0)),
+        _ => None,
+    };
+    let upper_wick_pct_of_range = match (open, close, high, bar_range) {
+        (Some(open), Some(close), Some(high), Some(range)) => {
+            Some(round2((high - open.max(close)) / range * 100.0))
+        }
+        _ => None,
+    };
+    let lower_wick_pct_of_range = match (open, close, low, bar_range) {
+        (Some(open), Some(close), Some(low), Some(range)) => {
+            Some(round2((open.min(close) - low) / range * 100.0))
+        }
+        _ => None,
+    };
+    let range_pct = match (high, low, open) {
+        (Some(high), Some(low), Some(open)) if open.abs() > f64::EPSILON => {
+            Some(round2((high - low) / open * 100.0))
+        }
+        _ => None,
+    };
+
+    prune_nulls(json!({
+        "ts": bar
+            .get("open_time")
+            .or_else(|| bar.get("ts"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "open": open,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume_base": bar.get("volume_base").and_then(Value::as_f64),
+        "is_closed": bar.get("is_closed").and_then(Value::as_bool),
+        "net_return_pct": pct_delta(close, open).map(round2),
+        "close_location_pct": close_location_pct,
+        "upper_wick_pct_of_range": upper_wick_pct_of_range,
+        "lower_wick_pct_of_range": lower_wick_pct_of_range,
+        "range_pct": range_pct,
+    }))
+}
+
+fn pct_delta(current: Option<f64>, reference: Option<f64>) -> Option<f64> {
+    let current = current?;
+    let reference = reference?;
+    if reference.abs() <= f64::EPSILON {
+        return None;
+    }
+    Some((current - reference) / reference * 100.0)
 }
 
 fn parse_rfc3339_utc(ts: &str) -> Option<DateTime<Utc>> {
