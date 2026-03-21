@@ -17,7 +17,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "tim
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 log = "0.4"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 urlencoding = "2"
 flate2 = "1.0"
 market_data_ingestor = { path = "../market_data_ingestor" }

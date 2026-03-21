@@ -16,6 +16,23 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::debug;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchMode {
+    WarmStateOnly,
+    ReplayMaterialize,
+    Live,
+}
+
+impl DispatchMode {
+    fn persist_outputs(self) -> bool {
+        !matches!(self, Self::WarmStateOnly)
+    }
+
+    fn publish_outputs(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
 pub struct Dispatcher {
     flow_indicators: Vec<Arc<dyn Indicator>>,
     deriv_indicators: Vec<Arc<dyn Indicator>>,
@@ -86,6 +103,7 @@ impl Dispatcher {
     pub async fn process_window(
         &self,
         ctx: &IndicatorContext,
+        mode: DispatchMode,
     ) -> Result<Vec<IndicatorSnapshotRow>> {
         let flow_handle = spawn_group_worker(self.flow_indicators.clone(), ctx.clone());
         let deriv_handle = spawn_group_worker(self.deriv_indicators.clone(), ctx.clone());
@@ -153,77 +171,89 @@ impl Dispatcher {
                 }),
             );
         }
-        self.snapshot_writer
-            .write_snapshots(ctx.ts_bucket, &ctx.symbol, &snapshots)
-            .await?;
-        self.level_writer
-            .write_indicator_levels(ctx.ts_bucket, &ctx.symbol, &levels)
-            .await?;
-        self.level_writer
-            .write_liquidation_levels(ctx.ts_bucket, &ctx.symbol, &liq_rows)
-            .await?;
-        let event_history_start_ts = event_history_start_ts(ctx);
-        let event_history_end_ts = ctx.ts_bucket + chrono::Duration::minutes(1);
-        self.event_writer
-            .write_indicator_events(
-                &ctx.symbol,
-                event_history_start_ts,
-                event_history_end_ts,
-                &events,
-            )
-            .await;
-        self.event_writer
-            .write_divergence_events(
-                &ctx.symbol,
-                event_history_start_ts,
-                event_history_end_ts,
-                &divergence_rows,
-            )
-            .await;
-        self.event_writer
-            .write_absorption_events(
-                &ctx.symbol,
-                event_history_start_ts,
-                event_history_end_ts,
-                &absorption_rows,
-            )
-            .await;
-        self.event_writer
-            .write_initiation_events(
-                &ctx.symbol,
-                event_history_start_ts,
-                event_history_end_ts,
-                &initiation_rows,
-            )
-            .await;
-        self.event_writer
-            .write_exhaustion_events(
-                &ctx.symbol,
-                event_history_start_ts,
-                event_history_end_ts,
-                &exhaustion_rows,
-            )
-            .await;
-        self.feature_writer.write_all(ctx).await?;
-
-        self.publisher
-            .publish_minute_bundle(
+        let live_messages = if mode.publish_outputs() {
+            let indicators_json_value = Value::Object(indicators_json.clone());
+            let mut messages = Vec::with_capacity(snapshots.len() + 1);
+            messages.push(self.publisher.build_minute_bundle_message(
                 ctx.ts_bucket,
                 &ctx.symbol,
-                &Value::Object(indicators_json),
+                &indicators_json_value,
                 snapshots.len(),
-            )
-            .await?;
-
-        for s in &snapshots {
-            self.publisher
-                .publish_snapshot(
+            )?);
+            for snapshot in &snapshots {
+                messages.push(self.publisher.build_snapshot_message(
                     ctx.ts_bucket,
                     &ctx.symbol,
-                    s.indicator_code,
-                    &s.payload_json,
+                    snapshot,
+                )?);
+            }
+            Some(messages)
+        } else {
+            None
+        };
+
+        if mode.persist_outputs() {
+            self.snapshot_writer
+                .write_snapshots(ctx.ts_bucket, &ctx.symbol, &snapshots)
+                .await?;
+            self.level_writer
+                .write_indicator_levels(ctx.ts_bucket, &ctx.symbol, &levels)
+                .await?;
+            self.level_writer
+                .write_liquidation_levels(ctx.ts_bucket, &ctx.symbol, &liq_rows)
+                .await?;
+            let event_history_start_ts = event_history_start_ts(ctx);
+            let event_history_end_ts = ctx.ts_bucket + chrono::Duration::minutes(1);
+            self.event_writer
+                .write_indicator_events(
+                    &ctx.symbol,
+                    event_history_start_ts,
+                    event_history_end_ts,
+                    &events,
                 )
                 .await?;
+            self.event_writer
+                .write_divergence_events(
+                    &ctx.symbol,
+                    event_history_start_ts,
+                    event_history_end_ts,
+                    &divergence_rows,
+                )
+                .await?;
+            self.event_writer
+                .write_absorption_events(
+                    &ctx.symbol,
+                    event_history_start_ts,
+                    event_history_end_ts,
+                    &absorption_rows,
+                )
+                .await?;
+            self.event_writer
+                .write_initiation_events(
+                    &ctx.symbol,
+                    event_history_start_ts,
+                    event_history_end_ts,
+                    &initiation_rows,
+                )
+                .await?;
+            self.event_writer
+                .write_exhaustion_events(
+                    &ctx.symbol,
+                    event_history_start_ts,
+                    event_history_end_ts,
+                    &exhaustion_rows,
+                )
+                .await?;
+            self.feature_writer.write_all(ctx).await?;
+            if let Some(messages) = live_messages.as_ref() {
+                self.snapshot_writer
+                    .advance_progress_with_outbox(&ctx.symbol, ctx.ts_bucket, messages)
+                    .await?;
+            } else {
+                self.snapshot_writer
+                    .advance_progress(&ctx.symbol, ctx.ts_bucket)
+                    .await?;
+            }
         }
 
         debug!(
@@ -243,6 +273,27 @@ impl Dispatcher {
         );
 
         Ok(snapshots)
+    }
+
+    pub async fn rewind_progress(
+        &self,
+        symbol: &str,
+        ts_bucket: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        self.snapshot_writer
+            .rewind_progress(symbol, ts_bucket)
+            .await
+    }
+
+    pub async fn rewind_persisted_tail(
+        &self,
+        symbol: &str,
+        repair_start_ts: chrono::DateTime<chrono::Utc>,
+        exchange_name: &str,
+    ) -> Result<()> {
+        self.snapshot_writer
+            .rewind_persisted_tail(symbol, repair_start_ts, exchange_name)
+            .await
     }
 }
 

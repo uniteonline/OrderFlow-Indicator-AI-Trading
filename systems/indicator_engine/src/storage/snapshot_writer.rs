@@ -1,6 +1,8 @@
 use crate::indicators::context::IndicatorSnapshotRow;
+use crate::publish::ind_publisher::OutboxMessage;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use market_data_ingestor::sinks::outbox_writer::OutboxWriter;
 use serde_json::{json, Map, Value};
 use sqlx::{PgPool, Postgres, Transaction};
 
@@ -57,7 +59,7 @@ impl SnapshotWriter {
             .pool
             .begin()
             .await
-            .context("begin indicator snapshot/progress tx")?;
+            .context("begin indicator snapshot tx")?;
 
         // Single round-trip: batch all rows with UNNEST.
         sqlx::query(
@@ -107,11 +109,164 @@ impl SnapshotWriter {
             )
         })?;
 
+        tx.commit().await.context("commit indicator snapshot tx")?;
+
+        Ok(())
+    }
+
+    pub async fn advance_progress(&self, symbol: &str, ts_bucket: DateTime<Utc>) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin indicator progress tx")?;
+        upsert_indicator_progress(&mut tx, symbol, ts_bucket).await?;
+        tx.commit().await.context("commit indicator progress tx")?;
+        Ok(())
+    }
+
+    pub async fn advance_progress_with_outbox(
+        &self,
+        symbol: &str,
+        ts_bucket: DateTime<Utc>,
+        messages: &[OutboxMessage],
+    ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin indicator progress+outbox tx")?;
+        for message in messages {
+            OutboxWriter::enqueue_in_tx(
+                &mut tx,
+                &message.exchange_name,
+                &message.routing_key,
+                message.message_id,
+                message.schema_version,
+                message.headers_json.clone(),
+                message.payload_json.clone(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "enqueue indicator outbox message routing_key={}",
+                    message.routing_key
+                )
+            })?;
+        }
         upsert_indicator_progress(&mut tx, symbol, ts_bucket).await?;
         tx.commit()
             .await
-            .context("commit indicator snapshot/progress tx")?;
+            .context("commit indicator progress+outbox tx")?;
+        Ok(())
+    }
 
+    pub async fn rewind_progress(&self, symbol: &str, ts_bucket: DateTime<Utc>) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO feat.indicator_progress (symbol, last_success_ts)
+            VALUES ($1, $2)
+            ON CONFLICT (symbol)
+            DO UPDATE SET
+                last_success_ts = EXCLUDED.last_success_ts,
+                updated_at = now()
+            "#,
+        )
+        .bind(symbol.to_uppercase())
+        .bind(ts_bucket)
+        .execute(&self.pool)
+        .await
+        .context("rewind feat.indicator_progress")?;
+        Ok(())
+    }
+
+    pub async fn rewind_persisted_tail(
+        &self,
+        symbol: &str,
+        repair_start_ts: DateTime<Utc>,
+        exchange_name: &str,
+    ) -> Result<()> {
+        let rewind_target_ts = repair_start_ts - ChronoDuration::minutes(1);
+        let symbol_upper = symbol.to_uppercase();
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin indicator persisted tail rewind tx")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM ops.outbox_event
+            WHERE exchange_name = $1
+              AND upper(payload_json->>'symbol') = $2
+              AND COALESCE(
+                    NULLIF(payload_json->>'ts_bucket', '')::timestamptz,
+                    NULLIF(payload_json->>'event_ts', '')::timestamptz
+                  ) >= $3
+            "#,
+        )
+        .bind(exchange_name)
+        .bind(&symbol_upper)
+        .bind(repair_start_ts)
+        .execute(&mut *tx)
+        .await
+        .context("delete indicator outbox tail for overlap repair")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM feat.indicator_snapshot
+            WHERE symbol = $1
+              AND ts_snapshot >= $2
+            "#,
+        )
+        .bind(&symbol_upper)
+        .bind(repair_start_ts)
+        .execute(&mut *tx)
+        .await
+        .context("delete feat.indicator_snapshot tail for overlap repair")?;
+
+        for (table, ts_col) in [
+            ("feat.indicator_level_value", "ts_snapshot"),
+            ("feat.liquidation_density_level", "ts_snapshot"),
+            ("feat.trade_flow_feature", "ts_bucket"),
+            ("feat.orderbook_feature", "ts_bucket"),
+            ("feat.funding_feature", "ts_bucket"),
+            ("feat.avwap_feature", "ts_bucket"),
+            ("feat.cvd_pack", "ts_bucket"),
+            ("feat.whale_trade_rollup", "ts_bucket"),
+            ("feat.funding_change_event", "ts_change"),
+        ] {
+            let query = format!("DELETE FROM {table} WHERE symbol = $1 AND {ts_col} >= $2");
+            sqlx::query(&query)
+                .bind(&symbol_upper)
+                .bind(repair_start_ts)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("delete {table} tail for overlap repair"))?;
+        }
+
+        for table in [
+            "evt.indicator_event",
+            "evt.divergence_event",
+            "evt.absorption_event",
+            "evt.initiation_event",
+            "evt.exhaustion_event",
+        ] {
+            let query = format!(
+                "DELETE FROM {table} WHERE symbol = $1 AND COALESCE(event_available_ts, ts_event_end, ts_event_start) >= $2"
+            );
+            sqlx::query(&query)
+                .bind(&symbol_upper)
+                .bind(repair_start_ts)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("delete {table} tail for overlap repair"))?;
+        }
+
+        set_indicator_progress_exact(&mut tx, &symbol_upper, rewind_target_ts).await?;
+        tx.commit()
+            .await
+            .context("commit indicator persisted tail rewind tx")?;
         Ok(())
     }
 }
@@ -154,6 +309,29 @@ async fn upsert_indicator_progress(
     .execute(&mut **tx)
     .await
     .context("upsert feat.indicator_progress")?;
+    Ok(())
+}
+
+async fn set_indicator_progress_exact(
+    tx: &mut Transaction<'_, Postgres>,
+    symbol: &str,
+    ts_bucket: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO feat.indicator_progress (symbol, last_success_ts)
+        VALUES ($1, $2)
+        ON CONFLICT (symbol)
+        DO UPDATE SET
+            last_success_ts = EXCLUDED.last_success_ts,
+            updated_at = now()
+        "#,
+    )
+    .bind(symbol)
+    .bind(ts_bucket)
+    .execute(&mut **tx)
+    .await
+    .context("set feat.indicator_progress exact")?;
     Ok(())
 }
 

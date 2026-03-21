@@ -29,26 +29,43 @@ impl WindowScheduler {
         }
     }
 
-    pub fn ready_minutes(&mut self, now: DateTime<Utc>) -> Vec<DateTime<Utc>> {
-        let latest_closed = self.watermark.closed_minute(now);
+    pub fn next_minute_to_emit(&self) -> Option<DateTime<Utc>> {
+        self.last_emitted.map(|last| last + Duration::minutes(1))
+    }
+
+    pub fn mark_emitted_through(&mut self, bucket_ts: DateTime<Utc>) {
+        self.last_emitted = Some(floor_minute(bucket_ts));
+    }
+
+    pub fn closed_minute(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        self.watermark.closed_minute(now)
+    }
+
+    pub fn ready_minutes_through(&mut self, bucket_ts: DateTime<Utc>) -> Vec<DateTime<Utc>> {
+        let latest_ready = floor_minute(bucket_ts);
 
         let start = match self.last_emitted {
             Some(last) => last + Duration::minutes(1),
-            None => latest_closed,
+            None => latest_ready,
         };
 
-        if start > latest_closed {
+        if start > latest_ready {
             return Vec::new();
         }
 
         let mut out = Vec::new();
         let mut cur = floor_minute(start);
-        while cur <= latest_closed {
+        while cur <= latest_ready {
             out.push(cur);
             cur += Duration::minutes(1);
         }
 
         self.last_emitted = out.last().cloned();
         out
+    }
+
+    pub fn ready_minutes(&mut self, now: DateTime<Utc>) -> Vec<DateTime<Utc>> {
+        let latest_closed = self.watermark.closed_minute(now);
+        self.ready_minutes_through(latest_closed)
     }
 }

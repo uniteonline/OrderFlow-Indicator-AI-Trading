@@ -298,6 +298,19 @@ impl CanonicalMinuteByMarket {
     }
 }
 
+fn canonical_futures_minute_is_complete(inputs: &CanonicalMinuteInputs) -> bool {
+    inputs.trade.is_some() && inputs.orderbook.is_some() && inputs.funding_mark.is_some()
+}
+
+fn canonical_spot_minute_is_complete(inputs: &CanonicalMinuteInputs) -> bool {
+    inputs.trade.is_some() && inputs.orderbook.is_some()
+}
+
+fn canonical_minute_is_complete(minute: &CanonicalMinuteByMarket) -> bool {
+    canonical_futures_minute_is_complete(&minute.futures)
+        && canonical_spot_minute_is_complete(&minute.spot)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FinalizedVpinState {
     ts_bucket: DateTime<Utc>,
@@ -833,7 +846,7 @@ pub struct VpinState {
 }
 
 impl VpinState {
-    fn new(bucket_size: f64, rolling_bucket_count: usize) -> Self {
+    pub(crate) fn new(bucket_size: f64, rolling_bucket_count: usize) -> Self {
         Self {
             bucket_size,
             rolling_bucket_count,
@@ -1087,6 +1100,7 @@ impl OrderbookState {
 pub struct StateStore {
     symbol: String,
     whale_threshold_usdt: f64,
+    effective_history_floor_ts: Option<DateTime<Utc>>,
     buckets: HashMap<(MarketKind, i64), MinuteBucket>,
     canonical_minutes: BTreeMap<i64, CanonicalMinuteByMarket>,
     history_futures: VecDeque<MinuteHistory>,
@@ -1125,6 +1139,7 @@ impl StateStore {
         Self {
             symbol,
             whale_threshold_usdt,
+            effective_history_floor_ts: None,
             buckets: HashMap::new(),
             canonical_minutes: BTreeMap::new(),
             history_futures: VecDeque::new(),
@@ -1147,6 +1162,107 @@ impl StateStore {
             dirty_recompute_truncated: false,
             last_finalized_minute: None,
         }
+    }
+
+    pub fn set_effective_history_floor(&mut self, ts: Option<DateTime<Utc>>) {
+        self.effective_history_floor_ts = ts;
+    }
+
+    pub fn last_finalized_minute(&self) -> Option<DateTime<Utc>> {
+        self.last_finalized_minute
+    }
+
+    pub fn reset_finalized_state(&mut self) {
+        self.history_futures.clear();
+        self.history_spot.clear();
+        self.finalized_vpin_futures.clear();
+        self.finalized_vpin_spot.clear();
+        self.cvd_futures = 0.0;
+        self.cvd_spot = 0.0;
+        self.vpin_futures = VpinState::new(VPIN_BUCKET_SIZE_BASE, VPIN_ROLLING_BUCKETS);
+        self.vpin_spot = VpinState::new(VPIN_BUCKET_SIZE_BASE, VPIN_ROLLING_BUCKETS);
+        self.latest_mark = None;
+        self.latest_funding = None;
+        self.funding_changes.clear();
+        self.mark_timeline.clear();
+        self.funding_timeline.clear();
+        self.dirty_recompute_from = None;
+        self.dirty_recompute_end = None;
+        self.dirty_recompute_truncated = false;
+        self.last_finalized_minute = None;
+    }
+
+    pub fn rewind_finalized_state_from(&mut self, start: DateTime<Utc>) {
+        self.truncate_finalized_suffix(start);
+    }
+
+    pub fn reset_for_new_continuous_segment(&mut self, start: DateTime<Utc>) {
+        self.buckets.clear();
+        self.canonical_minutes.clear();
+        self.depth_conflation.clear();
+        self.orderbooks.clear();
+        self.orderbooks
+            .insert(MarketKind::Spot, OrderbookState::default());
+        self.orderbooks
+            .insert(MarketKind::Futures, OrderbookState::default());
+        self.reset_finalized_state();
+        self.effective_history_floor_ts = Some(start);
+    }
+
+    pub fn latest_contiguous_complete_canonical_minute_from(
+        &self,
+        start: DateTime<Utc>,
+        max_ts: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        if start > max_ts {
+            return None;
+        }
+
+        let mut cur = start;
+        let mut latest_ready = None;
+        while cur <= max_ts {
+            let Some(minute) = self.canonical_minutes.get(&cur.timestamp()) else {
+                break;
+            };
+            if !canonical_minute_is_complete(minute) {
+                break;
+            }
+            latest_ready = Some(cur);
+            cur += Duration::minutes(1);
+        }
+
+        latest_ready
+    }
+
+    pub fn latest_continuous_canonical_segment(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let mut current_start: Option<DateTime<Utc>> = None;
+        let mut prev_complete: Option<DateTime<Utc>> = None;
+        let mut latest_segment: Option<(DateTime<Utc>, DateTime<Utc>)> = None;
+
+        for minute_sec in self.canonical_minutes.keys() {
+            let Some(ts_bucket) = Utc.timestamp_opt(*minute_sec, 0).single() else {
+                continue;
+            };
+            let minute = &self.canonical_minutes[minute_sec];
+            if !canonical_minute_is_complete(minute) {
+                current_start = None;
+                prev_complete = None;
+                continue;
+            }
+
+            let starts_new_segment = prev_complete
+                .map(|prev| ts_bucket != prev + Duration::minutes(1))
+                .unwrap_or(true);
+            if starts_new_segment {
+                current_start = Some(ts_bucket);
+            }
+
+            let segment_start = current_start.unwrap_or(ts_bucket);
+            latest_segment = Some((segment_start, ts_bucket));
+            prev_complete = Some(ts_bucket);
+        }
+
+        latest_segment
     }
 
     pub fn ingest(&mut self, event: EngineEvent) {
@@ -1927,6 +2043,7 @@ impl StateStore {
             symbol: self.symbol.clone(),
             last_finalized_ts,
             saved_at: Utc::now(),
+            effective_history_floor_ts: self.effective_history_floor_ts,
             cvd_futures: self.cvd_futures,
             cvd_spot: self.cvd_spot,
             vpin_futures: self.vpin_futures.clone(),
@@ -1944,6 +2061,7 @@ impl StateStore {
     }
 
     pub fn restore_from_snapshot(&mut self, snap: StateSnapshot) {
+        self.effective_history_floor_ts = snap.effective_history_floor_ts;
         self.vpin_futures = snap.vpin_futures;
         self.vpin_spot = snap.vpin_spot;
         self.finalized_vpin_futures = snap.finalized_vpin_futures.into_iter().collect();
@@ -1971,6 +2089,8 @@ pub struct StateSnapshot {
     pub symbol: String,
     pub last_finalized_ts: DateTime<Utc>,
     pub saved_at: DateTime<Utc>,
+    #[serde(default)]
+    pub effective_history_floor_ts: Option<DateTime<Utc>>,
     /// Informational only; CVD is re-derived from history tail on restore.
     pub cvd_futures: f64,
     pub cvd_spot: f64,
@@ -2138,9 +2258,9 @@ fn collect_heatmap_levels(
 mod tests {
     use super::StateStore;
     use crate::ingest::decoder::{
-        AggFundingMark1mEvent, AggFundingPoint, AggHeatmapLevel, AggMarkPoint, AggOrderbook1mEvent,
-        AggProfileLevel, AggTrade1mEvent, AggVpinSnapshot, AggWhaleStats, BboEvent, EngineEvent,
-        KlineEvent, MarketKind, MdData,
+        AggFundingMark1mEvent, AggFundingPoint, AggHeatmapLevel, AggLiq1mEvent, AggLiqLevel,
+        AggMarkPoint, AggOrderbook1mEvent, AggProfileLevel, AggTrade1mEvent, AggVpinSnapshot,
+        AggWhaleStats, BboEvent, EngineEvent, KlineEvent, MarketKind, MdData,
     };
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
     use uuid::Uuid;
@@ -2200,6 +2320,18 @@ mod tests {
                 }),
             }),
         }
+    }
+
+    fn agg_trade_event_spot(
+        ts_bucket: chrono::DateTime<Utc>,
+        buy_qty: f64,
+        sell_qty: f64,
+        last_vpin: f64,
+    ) -> EngineEvent {
+        let mut event = agg_trade_event(ts_bucket, buy_qty, sell_qty, last_vpin);
+        event.market = MarketKind::Spot;
+        event.routing_key = "md.agg.spot.trade.1m.testusdt".to_string();
+        event
     }
 
     fn agg_trade_event_with_profile(
@@ -2272,6 +2404,45 @@ mod tests {
         }
     }
 
+    fn agg_orderbook_event_spot(
+        ts_bucket: chrono::DateTime<Utc>,
+        sample_count: i64,
+        bbo_updates: i64,
+        obi_k_dw_sum: f64,
+    ) -> EngineEvent {
+        let mut event = agg_orderbook_event(ts_bucket, sample_count, bbo_updates, obi_k_dw_sum);
+        event.market = MarketKind::Spot;
+        event.routing_key = "md.agg.spot.orderbook.1m.testusdt".to_string();
+        event
+    }
+
+    fn agg_liq_event(ts_bucket: chrono::DateTime<Utc>, notional: f64) -> EngineEvent {
+        EngineEvent {
+            schema_version: 1,
+            msg_type: "md.agg.liq.1m".to_string(),
+            message_id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
+            routing_key: "md.agg.futures.liq.1m.testusdt".to_string(),
+            market: MarketKind::Futures,
+            symbol: "TESTUSDT".to_string(),
+            source_kind: "test".to_string(),
+            backfill_in_progress: false,
+            event_ts: ts_bucket + ChronoDuration::seconds(59),
+            published_at: ts_bucket + ChronoDuration::seconds(59),
+            data: MdData::AggLiq1m(AggLiq1mEvent {
+                ts_bucket,
+                chunk_start_ts: ts_bucket,
+                chunk_end_ts: ts_bucket + ChronoDuration::seconds(59),
+                source_event_count: 1,
+                levels: vec![AggLiqLevel {
+                    price: 2000.0,
+                    long_liq: notional,
+                    short_liq: notional / 2.0,
+                }],
+            }),
+        }
+    }
+
     fn agg_funding_mark_event(
         ts_bucket: chrono::DateTime<Utc>,
         point_offset_secs: i64,
@@ -2313,6 +2484,104 @@ mod tests {
                 }],
             }),
         }
+    }
+
+    #[test]
+    fn latest_continuous_canonical_segment_uses_last_complete_run() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+        let ts_2 = ts_1 + ChronoDuration::minutes(1);
+        let ts_3 = ts_1 + ChronoDuration::minutes(2);
+        let ts_4 = ts_1 + ChronoDuration::minutes(3);
+
+        for ts in [ts_1, ts_3, ts_4] {
+            store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+            store.ingest(agg_orderbook_event(ts, 4, 4, 0.1));
+            store.ingest(agg_liq_event(ts, 10.0));
+            store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+            store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+            store.ingest(agg_orderbook_event_spot(ts, 4, 4, 0.1));
+        }
+
+        // Break continuity on ts_2 by omitting spot orderbook.
+        store.ingest(agg_trade_event(ts_2, 1.0, 0.5, 0.2));
+        store.ingest(agg_orderbook_event(ts_2, 4, 4, 0.1));
+        store.ingest(agg_liq_event(ts_2, 10.0));
+        store.ingest(agg_funding_mark_event(ts_2, 45, 2000.0, 0.01));
+        store.ingest(agg_trade_event_spot(ts_2, 1.0, 0.5, 0.2));
+
+        let segment = store.latest_continuous_canonical_segment().unwrap();
+        assert_eq!(segment.0, ts_3);
+        assert_eq!(segment.1, ts_4);
+    }
+
+    #[test]
+    fn latest_contiguous_complete_canonical_minute_from_stops_on_missing_spot_inputs() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+        let ts_2 = ts_1 + ChronoDuration::minutes(1);
+        let ts_3 = ts_1 + ChronoDuration::minutes(2);
+
+        for ts in [ts_1, ts_2] {
+            store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+            store.ingest(agg_orderbook_event(ts, 4, 4, 0.1));
+            store.ingest(agg_liq_event(ts, 10.0));
+            store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+            store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+            if ts != ts_2 {
+                store.ingest(agg_orderbook_event_spot(ts, 4, 4, 0.1));
+            }
+        }
+        for ts in [ts_2, ts_3] {
+            if ts == ts_3 {
+                store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+                store.ingest(agg_orderbook_event(ts, 4, 4, 0.1));
+                store.ingest(agg_liq_event(ts, 10.0));
+                store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+                store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+                store.ingest(agg_orderbook_event_spot(ts, 4, 4, 0.1));
+            }
+        }
+
+        let latest = store.latest_contiguous_complete_canonical_minute_from(ts_1, ts_3);
+        assert_eq!(latest, Some(ts_1));
+    }
+
+    #[test]
+    fn latest_contiguous_complete_canonical_minute_from_allows_missing_liq_inputs() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+        let ts_2 = ts_1 + ChronoDuration::minutes(1);
+
+        for ts in [ts_1, ts_2] {
+            store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+            store.ingest(agg_orderbook_event(ts, 4, 4, 0.1));
+            store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+            store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+            store.ingest(agg_orderbook_event_spot(ts, 4, 4, 0.1));
+        }
+
+        let latest = store.latest_contiguous_complete_canonical_minute_from(ts_1, ts_2);
+        assert_eq!(latest, Some(ts_2));
+    }
+
+    #[test]
+    fn latest_continuous_canonical_segment_allows_missing_liq_minutes() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+        let ts_2 = ts_1 + ChronoDuration::minutes(1);
+
+        for ts in [ts_1, ts_2] {
+            store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+            store.ingest(agg_orderbook_event(ts, 4, 4, 0.1));
+            store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+            store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+            store.ingest(agg_orderbook_event_spot(ts, 4, 4, 0.1));
+        }
+
+        let segment = store.latest_continuous_canonical_segment().unwrap();
+        assert_eq!(segment.0, ts_1);
+        assert_eq!(segment.1, ts_2);
     }
 
     #[test]

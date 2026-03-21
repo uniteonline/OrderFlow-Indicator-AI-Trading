@@ -460,6 +460,17 @@ impl LiqChunk {
         }
     }
 
+    fn synthetic_zero(key: &MinuteKey, backfill_in_progress: bool) -> Self {
+        Self {
+            chunk_start_ts: key.canonical_chunk_start_ts(),
+            chunk_end_ts: key.canonical_chunk_end_ts(),
+            backfill_in_progress,
+            dirty: true,
+            source_event_count: 0,
+            force_liq: BTreeMap::new(),
+        }
+    }
+
     fn touch(&mut self, event: &NormalizedMdEvent) {
         if event.event_ts < self.chunk_start_ts {
             self.chunk_start_ts = event.event_ts;
@@ -819,6 +830,7 @@ impl MinuteBatchAggregator {
         &mut self,
         ready_before_minute_ms: i64,
     ) -> Vec<NormalizedMdEvent> {
+        self.synthesize_ready_zero_liq_chunks(ready_before_minute_ms);
         let mut out = Vec::with_capacity(
             self.trade_chunks
                 .len()
@@ -842,6 +854,33 @@ impl MinuteBatchAggregator {
         self.trim_emitted_chunks(ready_before_minute_ms);
         sort_output_events(&mut out);
         out
+    }
+
+    fn synthesize_ready_zero_liq_chunks(&mut self, ready_before_minute_ms: i64) {
+        if self.lane != AggregateLane::NonTrade {
+            return;
+        }
+
+        let mut ready_futures_minutes = HashMap::<MinuteKey, bool>::new();
+        for (key, chunk) in self.orderbook_chunks.iter().filter(|(key, chunk)| {
+            key.minute_ms < ready_before_minute_ms && chunk.dirty && key.market == "futures"
+        }) {
+            ready_futures_minutes.insert(key.clone(), chunk.backfill_in_progress);
+        }
+        for (key, chunk) in self.funding_mark_chunks.iter().filter(|(key, chunk)| {
+            key.minute_ms < ready_before_minute_ms && chunk.dirty && key.market == "futures"
+        }) {
+            ready_futures_minutes
+                .entry(key.clone())
+                .and_modify(|flag| *flag |= chunk.backfill_in_progress)
+                .or_insert(chunk.backfill_in_progress);
+        }
+
+        for (key, backfill_in_progress) in ready_futures_minutes {
+            self.liq_chunks
+                .entry(key.clone())
+                .or_insert_with(|| LiqChunk::synthetic_zero(&key, backfill_in_progress));
+        }
     }
 
     fn trim_emitted_chunks(&mut self, reference_minute_ms: i64) {
@@ -1822,8 +1861,10 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(outputs.len(), 1);
-        let orderbook_1m = &outputs[0];
+        let orderbook_1m = outputs
+            .iter()
+            .find(|event| event.msg_type == "md.agg.orderbook.1m")
+            .expect("expected canonical orderbook minute");
         assert_eq!(orderbook_1m.msg_type, "md.agg.orderbook.1m");
         assert_eq!(
             parse_optional_ts(&orderbook_1m.data, "ts_bucket"),
@@ -1856,6 +1897,108 @@ mod tests {
             Some(minute_open)
         );
         assert_eq!(value_i64(&flushed[0].data, "trade_count"), Some(2));
+    }
+
+    #[test]
+    fn emits_zero_liq_row_for_ready_futures_minute_without_force_orders() {
+        let mut aggregator = MinuteBatchAggregator::new(AggregateLane::NonTrade, 1_000.0);
+        let minute_open = ts(2026, 3, 6, 0, 0, 0, 0);
+
+        let outputs = aggregator.aggregate_batch(&[
+            bbo_event(
+                minute_open + ChronoDuration::seconds(5),
+                100.0,
+                1.0,
+                101.0,
+                2.0,
+            ),
+            bbo_event(
+                minute_open + ChronoDuration::minutes(1) + ChronoDuration::seconds(1),
+                100.5,
+                3.0,
+                101.5,
+                3.0,
+            ),
+        ]);
+
+        let liq_1m = outputs
+            .iter()
+            .find(|event| event.msg_type == "md.agg.liq.1m")
+            .expect("expected synthetic liq minute");
+        assert_eq!(
+            parse_optional_ts(&liq_1m.data, "ts_bucket"),
+            Some(minute_open)
+        );
+        assert_eq!(
+            parse_optional_ts(&liq_1m.data, "chunk_start_ts"),
+            Some(minute_open)
+        );
+        assert_eq!(
+            parse_optional_ts(&liq_1m.data, "chunk_end_ts"),
+            Some(minute_open + ChronoDuration::seconds(59) + ChronoDuration::milliseconds(999))
+        );
+        assert_eq!(value_i64(&liq_1m.data, "source_event_count"), Some(0));
+        assert_eq!(
+            liq_1m.data["force_liq_levels"]
+                .as_array()
+                .map(|levels| levels.len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn late_force_order_re_emits_minute_after_synthetic_zero_liq() {
+        let mut aggregator = MinuteBatchAggregator::new(AggregateLane::NonTrade, 1_000.0);
+        let minute_open = ts(2026, 3, 6, 0, 0, 0, 0);
+
+        let first = aggregator.aggregate_batch(&[
+            bbo_event(
+                minute_open + ChronoDuration::seconds(5),
+                100.0,
+                1.0,
+                101.0,
+                2.0,
+            ),
+            bbo_event(
+                minute_open + ChronoDuration::minutes(1) + ChronoDuration::seconds(1),
+                100.5,
+                3.0,
+                101.5,
+                3.0,
+            ),
+        ]);
+        assert!(first.iter().any(|event| event.msg_type == "md.agg.liq.1m"));
+
+        let second = aggregator.aggregate_batch(&[
+            force_order_event(
+                minute_open + ChronoDuration::seconds(45),
+                100.0,
+                2.0,
+                "long_liq",
+            ),
+            bbo_event(
+                minute_open + ChronoDuration::minutes(2) + ChronoDuration::seconds(1),
+                100.8,
+                1.5,
+                101.8,
+                1.2,
+            ),
+        ]);
+
+        let updated = second
+            .iter()
+            .find(|event| {
+                event.msg_type == "md.agg.liq.1m"
+                    && parse_optional_ts(&event.data, "ts_bucket") == Some(minute_open)
+            })
+            .expect("expected liq re-emit after late force order");
+        assert_eq!(value_i64(&updated.data, "source_event_count"), Some(1));
+        assert_eq!(
+            updated.data["force_liq_levels"]
+                .as_array()
+                .map(|levels| levels.len()),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1984,6 +2127,30 @@ mod tests {
                 "ask_price": ask_price,
                 "ask_qty": ask_qty,
                 "sample_count": 1,
+            }),
+        }
+    }
+
+    fn force_order_event(
+        ts: chrono::DateTime<Utc>,
+        price: f64,
+        filled_qty: f64,
+        liq_side: &str,
+    ) -> NormalizedMdEvent {
+        NormalizedMdEvent {
+            msg_type: "md.force_order".to_string(),
+            market: "futures".to_string(),
+            symbol: "TESTUSDT".to_string(),
+            source_kind: "ws".to_string(),
+            backfill_in_progress: false,
+            routing_key: "md.futures.force_order.testusdt".to_string(),
+            stream_name: "force_order".to_string(),
+            event_ts: ts,
+            data: json!({
+                "price": price,
+                "filled_qty": filled_qty,
+                "notional_usdt": price * filled_qty,
+                "liq_side": liq_side,
             }),
         }
     }

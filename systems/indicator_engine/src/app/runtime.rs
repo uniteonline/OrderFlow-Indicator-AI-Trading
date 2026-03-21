@@ -10,7 +10,8 @@ use crate::ingest::watermark::floor_minute;
 use crate::observability::heartbeat;
 use crate::observability::metrics::AppMetrics;
 use crate::publish::ind_publisher::IndPublisher;
-use crate::runtime::dispatcher::Dispatcher;
+use crate::publish::outbox_dispatcher::OutboxDispatcher;
+use crate::runtime::dispatcher::{DispatchMode, Dispatcher};
 use crate::runtime::state_store::{
     MinuteHistory, StateSnapshot, StateStore, HISTORY_LIMIT_MINUTES, STATE_SNAPSHOT_VERSION,
 };
@@ -60,42 +61,6 @@ pub struct BackfillCursor {
     pub market: String,
     pub symbol: String,
     pub routing_key: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct IngestGroupFrontier {
-    flow_max_event_ts: Option<DateTime<Utc>>,
-    ob_heavy_max_event_ts: Option<DateTime<Utc>>,
-    deriv_max_event_ts: Option<DateTime<Utc>>,
-}
-
-impl IngestGroupFrontier {
-    fn observe(&mut self, event: &EngineEvent) {
-        let slot = match &event.data {
-            MdData::Trade(_) | MdData::AggTrade1m(_) => &mut self.flow_max_event_ts,
-            MdData::Depth(_)
-            | MdData::OrderbookSnapshot(_)
-            | MdData::Bbo(_)
-            | MdData::AggOrderbook1m(_)
-            | MdData::ForceOrder(_)
-            | MdData::AggLiq1m(_) => &mut self.ob_heavy_max_event_ts,
-            MdData::MarkPrice(_) | MdData::FundingRate(_) | MdData::AggFundingMark1m(_) => {
-                &mut self.deriv_max_event_ts
-            }
-            MdData::Kline(_) => {
-                return;
-            }
-        };
-
-        *slot = Some(slot.map_or(event.event_ts, |prev| prev.max(event.event_ts)));
-    }
-
-    fn ready_watermark_ts(&self) -> Option<DateTime<Utc>> {
-        let flow = self.flow_max_event_ts?;
-        let ob_heavy = self.ob_heavy_max_event_ts?;
-        let deriv = self.deriv_max_event_ts?;
-        Some(flow.min(ob_heavy).min(deriv))
-    }
 }
 
 pub fn build_indicator_runtime_options(
@@ -176,7 +141,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     let level_writer = LevelWriter::new(ctx.db_pool.clone());
     let event_writer = EventWriter::new(ctx.db_pool.clone(), metrics.clone());
     let publisher = IndPublisher::new(
-        ctx.mq_publish_channel.clone(),
         ctx.config.mq.exchanges.ind.name.clone(),
         ctx.producer_instance_id.clone(),
     );
@@ -188,7 +152,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         event_writer,
         publisher,
     );
-
     let mut state_store = StateStore::new(
         ctx.config.indicator.symbol.to_uppercase(),
         ctx.config.indicator.whale_threshold_usdt,
@@ -201,7 +164,6 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         .eq_ignore_ascii_case("live");
     let live_drop_stale_enabled = ctx.config.indicator.live_drop_stale_enabled;
     let stale_limit_secs = ctx.config.indicator.live_drop_stale_event_secs;
-    let mut ingest_frontier = IngestGroupFrontier::default();
     let mut stale_drop_count: u64 = 0;
     let mut stale_drop_max_lag_secs: i64 = 0;
     let mut stale_drop_max_publish_delay_secs: i64 = 0;
@@ -257,44 +219,36 @@ pub async fn run(ctx: AppContext) -> Result<()> {
             match result {
                 Ok(v) => v,
                 Err(err) => {
-                    warn!(
-                        error = %err,
-                        error_chain = %format!("{err:#}"),
-                        "startup historical backfill failed, continue with live stream"
-                    );
-                    None
+                    return Err(err).context("startup historical backfill failed");
                 }
             }
         }
     };
 
     if got_signal_before_live {
-        // Only save snapshot if backfill progressed far enough to be useful.
-        // A snapshot with insufficient history would cause the next restart to
-        // skip the full backfill it still needs, producing wrong indicator results.
-        // Require at least 1 day (1440 bars) of history before saving.
         let snapshot_path = ctx
             .config
             .indicator
             .snapshot_file_path
             .replace("{symbol}", &ctx.config.indicator.symbol);
-        let history_len = state_store.history_futures_len();
-        if !snapshot_path.is_empty() && history_len >= 1440 {
+        let snap = state_store.extract_snapshot();
+        let history_len = snap.history_futures.len();
+        if !snapshot_path.is_empty() && snapshot_has_required_history(&snap) {
             info!(
                 history_bars = history_len,
                 "Saving state snapshot before exit (mid-backfill)..."
             );
-            let snap = state_store.extract_snapshot();
             match save_state_snapshot(&snap, &snapshot_path).await {
                 Ok(()) => {
                     info!(path = %snapshot_path, history_bars = history_len, "State snapshot saved (mid-backfill)")
                 }
                 Err(e) => warn!(error = %e, "Failed to save state snapshot"),
             }
-        } else if history_len < 1440 {
+        } else {
             info!(
                 history_bars = history_len,
-                "Skipping snapshot save — too little history from early backfill (< 1440 bars)"
+                effective_history_floor_ts = ?snap.effective_history_floor_ts,
+                "Skipping snapshot save — state does not yet cover a reusable restart window"
             );
         }
         heartbeat_handle.abort();
@@ -305,6 +259,12 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     }
 
     let mut startup_cutover_completed = startup_replay_cutoff_bucket.is_none();
+    let outbox_dispatcher = OutboxDispatcher::new(
+        ctx.db_pool.clone(),
+        ctx.mq_publish_channel.clone(),
+        ctx.config.mq.exchanges.ind.name.clone(),
+    );
+    let outbox_handle = tokio::spawn(async move { outbox_dispatcher.run_loop().await });
 
     let mut trade_channel_closed = false;
     let mut non_trade_channel_closed = false;
@@ -336,8 +296,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &mut stale_drop_newest_ts,
                         &mut stale_drop_by_msg_type,
                         &metrics,
-                        &mut ingest_frontier,
                         &mut state_store,
+                        &mut scheduler,
                     );
                 } else {
                     trade_channel_closed = true;
@@ -364,8 +324,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                         &mut stale_drop_newest_ts,
                         &mut stale_drop_by_msg_type,
                         &metrics,
-                        &mut ingest_frontier,
                         &mut state_store,
+                        &mut scheduler,
                     );
                 } else {
                     non_trade_channel_closed = true;
@@ -394,8 +354,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     &mut stale_drop_newest_ts,
                     &mut stale_drop_by_msg_type,
                     &metrics,
-                    &mut ingest_frontier,
                     &mut state_store,
+                    &mut scheduler,
                 ) {
                     warn!("all mq consumers ended, stopping indicator engine");
                     break;
@@ -430,7 +390,13 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     stale_drop_last_report = Instant::now();
                 }
 
-                let Some(watermark_ts) = ingest_frontier.ready_watermark_ts() else {
+                let Some(next_minute) = scheduler.next_minute_to_emit() else {
+                    continue;
+                };
+                let latest_closed = scheduler.closed_minute(Utc::now());
+                let Some(ready_through_ts) = state_store
+                    .latest_contiguous_complete_canonical_minute_from(next_minute, latest_closed)
+                else {
                     continue;
                 };
                 if let Err(err) = process_ready_minutes(
@@ -440,7 +406,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     &mut state_store,
                     &mut scheduler,
                     &runtime_options,
-                    watermark_ts,
+                    ready_through_ts,
                 )
                 .await
                 {
@@ -474,6 +440,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     }
 
     heartbeat_handle.abort();
+    outbox_handle.abort();
     for h in consumer_handles {
         h.abort();
     }
@@ -499,8 +466,8 @@ fn drain_pending_ingest_events(
     stale_drop_newest_ts: &mut Option<DateTime<Utc>>,
     stale_drop_by_msg_type: &mut HashMap<String, u64>,
     metrics: &Arc<AppMetrics>,
-    ingest_frontier: &mut IngestGroupFrontier,
     state_store: &mut StateStore,
+    scheduler: &mut WindowScheduler,
 ) -> bool {
     let mut drained = 0usize;
 
@@ -525,8 +492,8 @@ fn drain_pending_ingest_events(
                         stale_drop_newest_ts,
                         stale_drop_by_msg_type,
                         metrics,
-                        ingest_frontier,
                         state_store,
+                        scheduler,
                     );
                     drained += 1;
                     progressed = true;
@@ -556,8 +523,8 @@ fn drain_pending_ingest_events(
                         stale_drop_newest_ts,
                         stale_drop_by_msg_type,
                         metrics,
-                        ingest_frontier,
                         state_store,
+                        scheduler,
                     );
                     drained += 1;
                     progressed = true;
@@ -670,16 +637,7 @@ fn try_load_state_snapshot(path: &str, symbol: &str, max_age_hours: u64) -> Opti
         );
         return None;
     }
-    // Reject snapshots with insufficient history (< 1 day = 1440 bars).
-    // Such snapshots are saved mid-early-backfill and would cause the next
-    // restart to skip the full history rebuild it still needs.
-    const MIN_SNAPSHOT_BARS: usize = 1440;
-    if snap.history_futures.len() < MIN_SNAPSHOT_BARS {
-        warn!(
-            bars = snap.history_futures.len(),
-            min = MIN_SNAPSHOT_BARS,
-            "State snapshot has insufficient history, ignoring"
-        );
+    if !snapshot_has_required_history(&snap) {
         return None;
     }
     if !minute_history_is_strictly_contiguous(&snap.history_futures, snap.last_finalized_ts) {
@@ -824,6 +782,53 @@ fn minute_history_has_any_price(row: &MinuteHistory) -> bool {
         || row.low_price.is_some()
         || row.close_price.is_some()
         || row.last_price.is_some()
+}
+
+fn snapshot_has_required_history(snap: &StateSnapshot) -> bool {
+    let required_start_ts = required_snapshot_history_start_ts(snap);
+    if !snapshot_history_reaches_required_start(&snap.history_futures, required_start_ts) {
+        warn!(
+            required_start_ts = %required_start_ts,
+            history_start_ts = ?snap.history_futures.first().map(|row| row.ts_bucket),
+            history_len = snap.history_futures.len(),
+            effective_history_floor_ts = ?snap.effective_history_floor_ts,
+            history_limit_minutes = HISTORY_LIMIT_MINUTES,
+            "State snapshot futures history does not cover required restart window, ignoring"
+        );
+        return false;
+    }
+    if !snap.history_spot.is_empty()
+        && !snapshot_history_reaches_required_start(&snap.history_spot, required_start_ts)
+    {
+        warn!(
+            required_start_ts = %required_start_ts,
+            history_start_ts = ?snap.history_spot.first().map(|row| row.ts_bucket),
+            history_len = snap.history_spot.len(),
+            effective_history_floor_ts = ?snap.effective_history_floor_ts,
+            history_limit_minutes = HISTORY_LIMIT_MINUTES,
+            "State snapshot spot history does not cover required restart window, ignoring"
+        );
+        return false;
+    }
+    true
+}
+
+fn required_snapshot_history_start_ts(snap: &StateSnapshot) -> DateTime<Utc> {
+    let retention_floor =
+        snap.last_finalized_ts - ChronoDuration::minutes((HISTORY_LIMIT_MINUTES as i64) - 1);
+    snap.effective_history_floor_ts
+        .map(|floor| retention_floor.max(floor))
+        .unwrap_or(retention_floor)
+}
+
+fn snapshot_history_reaches_required_start(
+    history: &[MinuteHistory],
+    required_start_ts: DateTime<Utc>,
+) -> bool {
+    history
+        .first()
+        .map(|row| row.ts_bucket <= required_start_ts)
+        .unwrap_or(false)
 }
 
 async fn save_state_snapshot(snap: &StateSnapshot, path: &str) -> anyhow::Result<()> {
@@ -1124,6 +1129,15 @@ fn interval_code_to_minutes(interval_code: &str) -> i64 {
     }
 }
 
+fn minute_exclusive_upper_bound(ts: DateTime<Utc>) -> DateTime<Utc> {
+    let floored = floor_minute(ts);
+    if ts == floored {
+        floored
+    } else {
+        floored + ChronoDuration::minutes(1)
+    }
+}
+
 fn handle_ingest_event(
     event: EngineEvent,
     startup_replay_cutoff_bucket: Option<DateTime<Utc>>,
@@ -1139,8 +1153,8 @@ fn handle_ingest_event(
     stale_drop_newest_ts: &mut Option<DateTime<Utc>>,
     stale_drop_by_msg_type: &mut HashMap<String, u64>,
     metrics: &Arc<AppMetrics>,
-    ingest_frontier: &mut IngestGroupFrontier,
     state_store: &mut StateStore,
+    scheduler: &mut WindowScheduler,
 ) {
     let event_bucket_ts = logical_event_bucket_ts(&event);
     if let Some(cutoff_bucket_ts) = startup_replay_cutoff_bucket {
@@ -1148,6 +1162,15 @@ fn handle_ingest_event(
             return;
         }
         if !*startup_cutover_completed {
+            if event_bucket_ts > cutoff_bucket_ts {
+                warn!(
+                    cutoff_bucket_ts = %cutoff_bucket_ts,
+                    first_live_bucket_ts = %event_bucket_ts,
+                    "startup replay cutover detected continuity gap; dropping pre-gap state and restarting live continuity window"
+                );
+                state_store.reset_for_new_continuous_segment(event_bucket_ts);
+                scheduler.mark_emitted_through(event_bucket_ts - ChronoDuration::minutes(1));
+            }
             info!(
                 cutoff_bucket_ts = %cutoff_bucket_ts,
                 first_live_event_ts = %event.event_ts,
@@ -1189,7 +1212,15 @@ fn handle_ingest_event(
     }
 
     metrics.inc_processed(event.event_ts.timestamp_millis());
-    ingest_frontier.observe(&event);
+    if matches!(
+        &event.data,
+        MdData::AggTrade1m(_)
+            | MdData::AggOrderbook1m(_)
+            | MdData::AggLiq1m(_)
+            | MdData::AggFundingMark1m(_)
+    ) {
+        scheduler.prime_start_from(event_bucket_ts);
+    }
     // EventBuffer was a no-op wrapper (push immediately followed by pop with no watermark
     // gating). Ingest directly to avoid the unnecessary allocation round-trip.
     state_store.ingest(event);
@@ -1212,7 +1243,7 @@ async fn process_ready_minutes(
     state_store: &mut StateStore,
     scheduler: &mut WindowScheduler,
     runtime_options: &IndicatorRuntimeOptions,
-    watermark_ts: DateTime<Utc>,
+    ready_through_ts: DateTime<Utc>,
 ) -> Result<()> {
     let mut windows_processed = 0usize;
     let mut first_bucket: Option<DateTime<Utc>> = None;
@@ -1241,8 +1272,14 @@ async fn process_ready_minutes(
         dirty_windows_processed += dirty_batch.len();
         for window in dirty_batch {
             let minute = window.ts_bucket;
-            let snapshots =
-                process_window_bundle(ctx, dispatcher, runtime_options, &window).await?;
+            let snapshots = process_window_bundle(
+                ctx,
+                dispatcher,
+                runtime_options,
+                &window,
+                DispatchMode::Live,
+            )
+            .await?;
             metrics.inc_exported_window();
             let (computed, missing) = indicator_coverage(&snapshots);
             windows_processed += 1;
@@ -1273,9 +1310,17 @@ async fn process_ready_minutes(
         return Ok(());
     }
 
-    for minute in scheduler.ready_minutes(watermark_ts) {
+    for minute in scheduler.ready_minutes_through(ready_through_ts) {
         let window = state_store.finalize_minute(minute);
-        match process_window_bundle(ctx, dispatcher, runtime_options, &window).await {
+        match process_window_bundle(
+            ctx,
+            dispatcher,
+            runtime_options,
+            &window,
+            DispatchMode::Live,
+        )
+        .await
+        {
             Ok(snapshots) => {
                 metrics.inc_exported_window();
                 let (computed, missing) = indicator_coverage(&snapshots);
@@ -1309,6 +1354,8 @@ async fn process_ready_minutes(
                     minute = %minute,
                     "process indicator window failed"
                 );
+                return Err(err)
+                    .with_context(|| format!("process indicator window minute={} failed", minute));
             }
         }
     }
@@ -1352,6 +1399,7 @@ async fn process_window_bundle(
     dispatcher: &Dispatcher,
     runtime_options: &IndicatorRuntimeOptions,
     window: &crate::runtime::state_store::WindowBundle,
+    mode: DispatchMode,
 ) -> Result<Vec<IndicatorSnapshotRow>> {
     let minute = window.ts_bucket;
     let kline_history_supplement = load_kline_history_supplement(
@@ -1374,7 +1422,7 @@ async fn process_window_bundle(
     .await;
     let ictx = IndicatorContext::from_bundle(window, runtime_options, kline_history_supplement);
 
-    dispatcher.process_window(&ictx).await
+    dispatcher.process_window(&ictx, mode).await
 }
 
 #[allow(dead_code)]
@@ -1440,48 +1488,27 @@ async fn run_startup_backfill(
     runtime_options: &IndicatorRuntimeOptions,
 ) -> Result<Option<DateTime<Utc>>> {
     let now = Utc::now();
-    let latest_resume_ts = match latest_indicator_progress_ts(
-        &ctx.db_pool,
-        &ctx.config.indicator.symbol,
-    )
-    .await
-    {
-        Ok(ts) => ts,
-        Err(progress_err) => {
-            match latest_indicator_snapshot_ts(&ctx.db_pool, &ctx.config.indicator.symbol).await {
-                Ok(ts) => {
-                    warn!(
-                        error = %progress_err,
-                        error_chain = %format!("{progress_err:#}"),
-                        symbol = %ctx.config.indicator.symbol,
-                        "query latest indicator progress ts failed; fallback to indicator_snapshot"
-                    );
-                    ts
-                }
-                Err(snapshot_err) => {
-                    warn!(
-                        error = %snapshot_err,
-                        error_chain = %format!("{snapshot_err:#}"),
-                        symbol = %ctx.config.indicator.symbol,
-                        fallback_lookback_minutes = STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES,
-                        "query latest resume ts failed; fallback to fixed lookback window"
-                    );
-                    None
-                }
-            }
-        }
-    };
-    let mut from_ts = match latest_resume_ts {
+    let latest_progress_ts =
+        latest_indicator_progress_ts(&ctx.db_pool, &ctx.config.indicator.symbol)
+            .await
+            .context("query latest indicator progress ts")?;
+    let latest_snapshot_table_ts =
+        latest_indicator_snapshot_ts(&ctx.db_pool, &ctx.config.indicator.symbol)
+            .await
+            .context("query latest indicator snapshot ts")?;
+    let persisted_frontier_ts = latest_progress_ts.or(latest_snapshot_table_ts);
+    let mut from_ts = match persisted_frontier_ts {
         Some(ts) => ts - ChronoDuration::minutes(STARTUP_BACKFILL_OVERLAP_MINUTES),
         None => now - ChronoDuration::minutes(STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES),
     };
     let raw_to_ts = now - ChronoDuration::seconds(STARTUP_BACKFILL_SAFETY_LAG_SECS);
     // Backfill must stop at a full-minute boundary so we never ingest a partial
     // minute from replay and then mix it with live stream data.
-    let to_ts = floor_minute(raw_to_ts);
+    // `fetch_backfill_batch` uses `ts_bucket < to_ts_exclusive`, so partial minutes
+    // must round up to include the last fully closed bucket before `raw_to_ts`.
+    let to_ts = minute_exclusive_upper_bound(raw_to_ts);
     let mut startup_max_catchup_minutes = ctx.config.indicator.startup_max_catchup_minutes;
     const STRICT_MIN_CATCHUP_MINUTES_7D: i64 = 7 * 24 * 60;
-    let strict_history_floor_minutes = HISTORY_LIMIT_MINUTES as i64;
     if startup_max_catchup_minutes > 0
         && startup_max_catchup_minutes < STRICT_MIN_CATCHUP_MINUTES_7D
     {
@@ -1505,20 +1532,6 @@ async fn run_startup_backfill(
             from_ts = catchup_floor;
         }
     }
-    let strict_history_floor = to_ts - ChronoDuration::minutes(strict_history_floor_minutes);
-    if from_ts > strict_history_floor {
-        info!(
-            original_from_ts = %from_ts,
-            strict_history_floor = %strict_history_floor,
-            history_limit_minutes = strict_history_floor_minutes,
-            "startup historical backfill expanded to rebuild full in-memory retention"
-        );
-        from_ts = strict_history_floor;
-    }
-    // Startup replay is bucket-based for canonical 1m rows. Floor the lower bound so
-    // we never drop a completed ts_bucket just because the resume timestamp carried
-    // non-zero seconds.
-    from_ts = floor_minute(from_ts);
 
     // Try to load state snapshot for fast startup
     // Support {symbol} placeholder in path (e.g. "/tmp/indicator_engine_{symbol}.json.gz")
@@ -1537,20 +1550,58 @@ async fn run_startup_backfill(
             let snap_ts = snap.last_finalized_ts;
             state_store.restore_from_snapshot(snap);
             snapshot_was_loaded = true;
-            // CRITICAL: start from snap_ts + 1min, NO overlap.
-            // CVD/VPIN from the snapshot already include all minutes up to snap_ts;
-            // using overlap would double-count those delta/volume values.
-            from_ts = snap_ts + ChronoDuration::minutes(1);
+            let snap_overlap_from_ts =
+                floor_minute(snap_ts - ChronoDuration::minutes(STARTUP_BACKFILL_OVERLAP_MINUTES));
+            from_ts = from_ts.min(snap_overlap_from_ts);
             info!(
                 snap_ts = %snap_ts,
-                new_from_ts = %from_ts,
-                "State snapshot loaded successfully, running gap-only backfill"
+                overlap_from_ts = %snap_overlap_from_ts,
+                effective_from_ts = %from_ts,
+                "State snapshot loaded successfully, running overlap repair backfill"
             );
         } else {
             info!("No valid state snapshot found, running full backfill");
+            let strict_history_floor_minutes = HISTORY_LIMIT_MINUTES as i64;
+            let strict_history_floor =
+                to_ts - ChronoDuration::minutes(strict_history_floor_minutes);
+            if from_ts > strict_history_floor {
+                info!(
+                    original_from_ts = %from_ts,
+                    strict_history_floor = %strict_history_floor,
+                    history_limit_minutes = strict_history_floor_minutes,
+                    "startup historical backfill expanded to rebuild full in-memory retention"
+                );
+                from_ts = strict_history_floor;
+            }
+        }
+    } else {
+        let strict_history_floor_minutes = HISTORY_LIMIT_MINUTES as i64;
+        let strict_history_floor = to_ts - ChronoDuration::minutes(strict_history_floor_minutes);
+        if from_ts > strict_history_floor {
+            info!(
+                original_from_ts = %from_ts,
+                strict_history_floor = %strict_history_floor,
+                history_limit_minutes = strict_history_floor_minutes,
+                "startup historical backfill expanded to rebuild full in-memory retention"
+            );
+            from_ts = strict_history_floor;
         }
     }
+    // Startup replay is bucket-based for canonical 1m rows. Floor the lower bound so
+    // we never drop a completed ts_bucket just because the resume timestamp carried
+    // non-zero seconds.
+    from_ts = floor_minute(from_ts);
     if from_ts >= to_ts {
+        if let Some(last_finalized_ts) = state_store.last_finalized_minute() {
+            scheduler.mark_emitted_through(last_finalized_ts);
+            let replay_cutoff_bucket = last_finalized_ts + ChronoDuration::minutes(1);
+            info!(
+                last_finalized_ts = %last_finalized_ts,
+                replay_cutoff_bucket = %replay_cutoff_bucket,
+                "skip startup historical backfill because snapshot already covers current frontier"
+            );
+            return Ok(Some(replay_cutoff_bucket));
+        }
         info!(
             from_ts = %from_ts,
             to_ts = %to_ts,
@@ -1563,6 +1614,7 @@ async fn run_startup_backfill(
         from_ts = %from_ts,
         to_ts = %to_ts,
         raw_to_ts = %raw_to_ts,
+        persisted_frontier_ts = ?persisted_frontier_ts,
         symbol = %ctx.config.indicator.symbol,
         fallback_lookback_minutes = STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES,
         overlap_minutes = STARTUP_BACKFILL_OVERLAP_MINUTES,
@@ -1574,15 +1626,7 @@ async fn run_startup_backfill(
 
     let mut cursor: Option<BackfillCursor> = None;
     let mut total_rows = 0_u64;
-    let mut max_event_ts: Option<DateTime<Utc>> = None;
     let startup_backfill_batch_size = ctx.config.indicator.startup_backfill_batch_size.max(100);
-    // Track the earliest ts_bucket seen across all backfill rows so we can
-    // prime the scheduler to start from there instead of the default
-    // latest_closed.  Without priming, ready_minutes(last_emitted=None) jumps
-    // straight to latest_closed and silently abandons all older accumulated
-    // buckets — the root cause of the 4-minute kline gap and the delayed
-    // divergence activation on restart.
-    let mut min_event_bucket_ts: Option<DateTime<Utc>> = None;
 
     loop {
         let rows = fetch_backfill_batch(
@@ -1610,24 +1654,9 @@ async fn run_startup_backfill(
         }
 
         for row in rows {
-            // Extract ts_bucket before consuming the row.  All backfill event
-            // types (trade, orderbook, liq, funding) include a "ts_bucket"
-            // field formatted as RFC 3339 by the fetch SQL.
-            if let Some(ts) = row
-                .data_json
-                .get("ts_bucket")
-                .and_then(|v| v.as_str())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc))
-            {
-                min_event_bucket_ts = Some(min_event_bucket_ts.map_or(ts, |prev| prev.min(ts)));
-            }
-
             match replay_row_to_engine_event(row) {
                 Ok(event) => {
                     metrics.inc_processed(event.event_ts.timestamp_millis());
-                    max_event_ts =
-                        Some(max_event_ts.map_or(event.event_ts, |prev| prev.max(event.event_ts)));
                     state_store.ingest(event);
                     total_rows += 1;
                 }
@@ -1638,40 +1667,187 @@ async fn run_startup_backfill(
         }
     }
 
-    // Prime the scheduler so that process_ready_minutes starts from the oldest
-    // backfilled bucket rather than jumping to latest_closed.  This ensures
-    // every accumulated minute bucket is finalized in chronological order,
-    // rebuilding full in-memory history on restart.
-    if let Some(min_bucket) = min_event_bucket_ts {
-        scheduler.prime_start_from(min_bucket);
+    if total_rows == 0 {
+        if let Some(last_finalized_ts) = state_store.last_finalized_minute() {
+            scheduler.mark_emitted_through(last_finalized_ts);
+            return Ok(Some(last_finalized_ts + ChronoDuration::minutes(1)));
+        }
+        info!("startup historical backfill found no canonical rows in requested range");
+        return Ok(None);
+    }
+
+    let Some((continuous_start_ts, continuous_end_ts)) =
+        state_store.latest_continuous_canonical_segment()
+    else {
+        warn!(
+            from_ts = %from_ts,
+            to_ts = %to_ts,
+            "startup historical backfill found no continuous canonical segment"
+        );
+        if let Some(last_finalized_ts) = state_store.last_finalized_minute() {
+            scheduler.mark_emitted_through(last_finalized_ts);
+            return Ok(Some(last_finalized_ts + ChronoDuration::minutes(1)));
+        }
+        return Ok(None);
+    };
+
+    let replay_start_ts = continuous_start_ts.max(from_ts);
+    let replay_end_ts = continuous_end_ts.min(to_ts - ChronoDuration::minutes(1));
+    if replay_start_ts > replay_end_ts {
+        warn!(
+            from_ts = %from_ts,
+            continuous_start_ts = %continuous_start_ts,
+            continuous_end_ts = %continuous_end_ts,
+            to_ts = %to_ts,
+            "startup historical backfill continuity window does not overlap requested range"
+        );
+        if let Some(last_finalized_ts) = state_store.last_finalized_minute() {
+            scheduler.mark_emitted_through(last_finalized_ts);
+            return Ok(Some(last_finalized_ts + ChronoDuration::minutes(1)));
+        }
+        return Ok(None);
+    }
+
+    if snapshot_was_loaded {
+        if replay_start_ts > from_ts {
+            state_store.reset_finalized_state();
+        } else {
+            state_store.rewind_finalized_state_from(replay_start_ts);
+        }
+    }
+    state_store.set_effective_history_floor(Some(replay_start_ts));
+
+    let repair_start_candidate = if snapshot_was_loaded {
+        from_ts
+    } else {
+        persisted_frontier_ts
+            .map(|ts| floor_minute(ts - ChronoDuration::minutes(STARTUP_BACKFILL_OVERLAP_MINUTES)))
+            .unwrap_or(replay_start_ts)
+    };
+    let repair_start_ts = replay_start_ts.max(repair_start_candidate);
+    let warm_end_ts = repair_start_ts - ChronoDuration::minutes(1);
+
+    if persisted_frontier_ts
+        .map(|frontier| repair_start_ts <= frontier)
+        .unwrap_or(false)
+    {
+        let rewind_target_ts = repair_start_ts - ChronoDuration::minutes(1);
+        dispatcher
+            .rewind_persisted_tail(
+                &ctx.config.indicator.symbol,
+                repair_start_ts,
+                &ctx.config.mq.exchanges.ind.name,
+            )
+            .await?;
         info!(
-            min_bucket_ts = %min_bucket,
-            "primed window scheduler from earliest backfill bucket"
+            rewind_target_ts = %rewind_target_ts,
+            repair_start_ts = %repair_start_ts,
+            persisted_frontier_ts = ?persisted_frontier_ts,
+            exchange_name = %ctx.config.mq.exchanges.ind.name,
+            "rewound persisted indicator tail to protect overlap repair checkpoint"
         );
     }
 
-    if max_event_ts.is_some() {
-        // We queried replay rows with ts_event < to_ts, where to_ts is a minute boundary.
-        // Drive scheduler watermark past this boundary so the last complete minute
-        // (to_ts - 1m) is finalized.
-        let backfill_watermark_ts = to_ts
-            + ChronoDuration::seconds(ctx.config.indicator.watermark_lateness_secs.max(0) + 1);
-        process_ready_minutes(
+    info!(
+        replay_start_ts = %replay_start_ts,
+        repair_start_ts = %repair_start_ts,
+        replay_end_ts = %replay_end_ts,
+        continuity_start_ts = %continuous_start_ts,
+        continuity_end_ts = %continuous_end_ts,
+        snapshot_was_loaded = snapshot_was_loaded,
+        "startup backfill replay plan"
+    );
+
+    if replay_start_ts <= warm_end_ts {
+        let mut minute = replay_start_ts;
+        while minute <= warm_end_ts {
+            state_store.finalize_minute(minute);
+            minute += ChronoDuration::minutes(1);
+        }
+        info!(
+            warm_start_ts = %replay_start_ts,
+            warm_end_ts = %warm_end_ts,
+            "startup warm-state replay completed"
+        );
+    }
+
+    let mut materialized_windows = 0usize;
+    let mut last_computed: Vec<String> = Vec::new();
+    let mut missing_union: BTreeSet<String> = BTreeSet::new();
+    let mut first_materialized_bucket: Option<DateTime<Utc>> = None;
+    let mut last_materialized_bucket: Option<DateTime<Utc>> = None;
+
+    let mut minute = repair_start_ts;
+    while minute <= replay_end_ts {
+        let window = state_store.finalize_minute(minute);
+        let snapshots = process_window_bundle(
             ctx,
-            metrics,
             dispatcher,
-            state_store,
-            scheduler,
             runtime_options,
-            backfill_watermark_ts,
+            &window,
+            DispatchMode::ReplayMaterialize,
         )
         .await?;
+        metrics.inc_exported_window();
+        materialized_windows += 1;
+        first_materialized_bucket.get_or_insert(minute);
+        last_materialized_bucket = Some(minute);
+        let (computed, missing) = indicator_coverage(&snapshots);
+        last_computed = computed;
+        for item in missing {
+            missing_union.insert(item);
+        }
+        if ctx.config.indicator.enable_file_export {
+            if let Err(err) = export_snapshots(
+                &ctx.config.indicator.export_dir,
+                minute,
+                &ctx.config.indicator.symbol,
+                &snapshots,
+            )
+            .await
+            {
+                warn!(error = %err, "export indicator snapshot file failed");
+            }
+        }
+        minute += ChronoDuration::minutes(1);
     }
+
+    if let Some(last_bucket) = last_materialized_bucket {
+        let first_bucket = first_materialized_bucket.unwrap_or(last_bucket);
+        if missing_union.is_empty() {
+            info!(
+                ts_bucket_from = %first_bucket,
+                ts_bucket_to = %last_bucket,
+                processed_windows = materialized_windows,
+                computed_count = last_computed.len(),
+                missing_count = 0,
+                computed_indicators = %last_computed.join(","),
+                missing_indicators = "none",
+                "startup backfill indicator coverage"
+            );
+        } else {
+            let missing_indicators = missing_union.iter().cloned().collect::<Vec<_>>().join(",");
+            warn!(
+                ts_bucket_from = %first_bucket,
+                ts_bucket_to = %last_bucket,
+                processed_windows = materialized_windows,
+                computed_count = last_computed.len(),
+                missing_count = missing_union.len(),
+                computed_indicators = %last_computed.join(","),
+                missing_indicators = %missing_indicators,
+                "startup backfill indicator coverage has missing indicators (warmup or data gap)"
+            );
+        }
+    }
+
+    scheduler.mark_emitted_through(replay_end_ts);
 
     info!(
         total_rows = total_rows,
-        has_backfill = max_event_ts.is_some(),
-        replay_cutoff_bucket_ts = %to_ts,
+        replay_start_ts = %replay_start_ts,
+        replay_end_ts = %replay_end_ts,
+        replay_cutoff_bucket_ts = %(replay_end_ts + ChronoDuration::minutes(1)),
+        materialized_windows = materialized_windows,
         "startup historical backfill completed"
     );
 
@@ -1683,11 +1859,7 @@ async fn run_startup_backfill(
     }
     let _ = snapshot_was_loaded; // used by snapshot_verify_full_recompute when implemented
 
-    if max_event_ts.is_some() {
-        Ok(Some(to_ts))
-    } else {
-        Ok(None)
-    }
+    Ok(Some(replay_end_ts + ChronoDuration::minutes(1)))
 }
 
 async fn latest_indicator_snapshot_ts(
@@ -2523,15 +2695,20 @@ async fn export_snapshots(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_backfill_sql, find_long_null_price_run, minute_history_is_strictly_contiguous,
-        snapshot_null_price_run_reaches_recent_tail, IngestGroupFrontier,
+        build_backfill_sql, find_long_null_price_run, handle_ingest_event,
+        minute_exclusive_upper_bound, minute_history_is_strictly_contiguous,
+        snapshot_has_required_history, snapshot_null_price_run_reaches_recent_tail,
     };
-    use crate::ingest::decoder::{
-        BboEvent, EngineEvent, FundingRateEvent, MarketKind, MdData, TradeEvent,
+    use crate::ingest::decoder::{EngineEvent, MarketKind, MdData, TradeEvent};
+    use crate::observability::metrics::AppMetrics;
+    use crate::runtime::state_store::{
+        FinalizedVpinState, FundingChange, LatestFundingState, LatestMarkState, MinuteHistory,
+        StateSnapshot, VpinState, HISTORY_LIMIT_MINUTES, STATE_SNAPSHOT_VERSION,
     };
-    use crate::runtime::state_store::MinuteHistory;
+    use crate::runtime::window_scheduler::WindowScheduler;
     use chrono::{Duration as ChronoDuration, TimeZone, Utc};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
     use uuid::Uuid;
 
     const MAX_CONSECUTIVE_NULL_PRICE_MINUTES_IN_SNAPSHOT: usize = 60;
@@ -2613,6 +2790,34 @@ mod tests {
         }
     }
 
+    fn snapshot_fixture(
+        last_finalized_ts: chrono::DateTime<Utc>,
+        history_futures: Vec<MinuteHistory>,
+        history_spot: Vec<MinuteHistory>,
+        effective_history_floor_ts: Option<chrono::DateTime<Utc>>,
+    ) -> StateSnapshot {
+        StateSnapshot {
+            version: STATE_SNAPSHOT_VERSION,
+            symbol: "TESTUSDT".to_string(),
+            last_finalized_ts,
+            saved_at: last_finalized_ts,
+            effective_history_floor_ts,
+            cvd_futures: 0.0,
+            cvd_spot: 0.0,
+            vpin_futures: VpinState::new(50.0, 50),
+            vpin_spot: VpinState::new(50.0, 50),
+            finalized_vpin_futures: Vec::<FinalizedVpinState>::new(),
+            finalized_vpin_spot: Vec::<FinalizedVpinState>::new(),
+            history_futures,
+            history_spot,
+            latest_mark: Option::<LatestMarkState>::None,
+            latest_funding: Option::<LatestFundingState>::None,
+            funding_changes: Vec::<FundingChange>::new(),
+            mark_timeline: Vec::<LatestMarkState>::new(),
+            funding_timeline: Vec::<LatestFundingState>::new(),
+        }
+    }
+
     #[test]
     fn startup_backfill_sql_filters_canonical_rows_by_ts_bucket() {
         let sql = build_backfill_sql(false, false);
@@ -2643,58 +2848,28 @@ mod tests {
     }
 
     #[test]
-    fn ingest_group_frontier_uses_slowest_group_watermark() {
-        let start = Utc.with_ymd_and_hms(2026, 3, 10, 5, 0, 0).single().unwrap();
-        let mut frontier = IngestGroupFrontier::default();
-
-        frontier.observe(&frontier_event(
-            start + ChronoDuration::minutes(3),
-            MdData::Trade(TradeEvent {
-                price: 1.0,
-                qty_eth: 1.0,
-                notional_usdt: 1.0,
-                aggressor_side: 1,
-            }),
-        ));
-        frontier.observe(&frontier_event(
-            start + ChronoDuration::minutes(2),
-            MdData::Bbo(BboEvent {
-                bid_price: 1.0,
-                bid_qty: 1.0,
-                ask_price: 2.0,
-                ask_qty: 1.0,
-                sample_count: 1,
-            }),
-        ));
-        assert_eq!(frontier.ready_watermark_ts(), None);
-
-        frontier.observe(&frontier_event(
-            start + ChronoDuration::minutes(1),
-            MdData::FundingRate(FundingRateEvent {
-                funding_time: start + ChronoDuration::minutes(1),
-                funding_rate: 0.001,
-                mark_price: Some(1.0),
-                next_funding_time: None,
-            }),
-        ));
+    fn minute_exclusive_upper_bound_rounds_partial_minute_up() {
+        let raw_to_ts = Utc
+            .with_ymd_and_hms(2026, 3, 21, 8, 23, 52)
+            .single()
+            .unwrap();
+        let to_ts_exclusive = minute_exclusive_upper_bound(raw_to_ts);
         assert_eq!(
-            frontier.ready_watermark_ts(),
-            Some(start + ChronoDuration::minutes(1))
+            to_ts_exclusive,
+            Utc.with_ymd_and_hms(2026, 3, 21, 8, 24, 0)
+                .single()
+                .unwrap()
         );
+    }
 
-        frontier.observe(&frontier_event(
-            start + ChronoDuration::minutes(4),
-            MdData::FundingRate(FundingRateEvent {
-                funding_time: start + ChronoDuration::minutes(4),
-                funding_rate: 0.002,
-                mark_price: Some(1.0),
-                next_funding_time: None,
-            }),
-        ));
-        assert_eq!(
-            frontier.ready_watermark_ts(),
-            Some(start + ChronoDuration::minutes(2))
-        );
+    #[test]
+    fn minute_exclusive_upper_bound_keeps_exact_minute_boundary() {
+        let raw_to_ts = Utc
+            .with_ymd_and_hms(2026, 3, 21, 8, 24, 0)
+            .single()
+            .unwrap();
+        let to_ts_exclusive = minute_exclusive_upper_bound(raw_to_ts);
+        assert_eq!(to_ts_exclusive, raw_to_ts);
     }
 
     #[test]
@@ -2798,5 +2973,107 @@ mod tests {
             run_end,
             1440,
         ));
+    }
+
+    #[test]
+    fn snapshot_required_history_accepts_short_history_when_it_starts_at_effective_floor() {
+        let last_finalized_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
+        let effective_floor_ts = last_finalized_ts - ChronoDuration::minutes(90);
+        let history = (0..=90)
+            .map(|offset| {
+                priced_history_row(effective_floor_ts + ChronoDuration::minutes(offset), 2000.0)
+            })
+            .collect::<Vec<_>>();
+        let snap = snapshot_fixture(
+            last_finalized_ts,
+            history.clone(),
+            history,
+            Some(effective_floor_ts),
+        );
+
+        assert!(snapshot_has_required_history(&snap));
+    }
+
+    #[test]
+    fn snapshot_required_history_rejects_short_history_without_effective_floor() {
+        let last_finalized_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
+        let history_start_ts =
+            last_finalized_ts - ChronoDuration::minutes((HISTORY_LIMIT_MINUTES as i64) - 10);
+        let history = (0..10)
+            .map(|offset| {
+                priced_history_row(history_start_ts + ChronoDuration::minutes(offset), 2000.0)
+            })
+            .collect::<Vec<_>>();
+        let snap = snapshot_fixture(last_finalized_ts, history.clone(), history, None);
+
+        assert!(!snapshot_has_required_history(&snap));
+    }
+
+    #[test]
+    fn cutover_gap_resets_state_and_scheduler_to_first_live_bucket() {
+        let cutoff_bucket_ts = Utc.with_ymd_and_hms(2026, 3, 21, 3, 0, 0).single().unwrap();
+        let prior_bucket_ts = cutoff_bucket_ts - ChronoDuration::minutes(1);
+        let first_live_bucket_ts = cutoff_bucket_ts + ChronoDuration::minutes(5);
+        let mut state_store =
+            crate::runtime::state_store::StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        state_store.ingest(frontier_event(
+            prior_bucket_ts + ChronoDuration::seconds(5),
+            MdData::Trade(TradeEvent {
+                price: 2000.0,
+                qty_eth: 1.0,
+                notional_usdt: 2000.0,
+                aggressor_side: 1,
+            }),
+        ));
+        state_store.finalize_minute(prior_bucket_ts);
+
+        let mut startup_cutover_completed = false;
+        let mut stale_drop_count = 0_u64;
+        let mut stale_drop_max_lag_secs = 0_i64;
+        let mut stale_drop_max_publish_delay_secs = 0_i64;
+        let mut stale_drop_max_transport_lag_secs = 0_i64;
+        let mut stale_drop_oldest_ts = None;
+        let mut stale_drop_newest_ts = None;
+        let mut stale_drop_by_msg_type = HashMap::new();
+        let metrics = Arc::new(AppMetrics::default());
+        let mut scheduler = WindowScheduler::new(0);
+        scheduler.mark_emitted_through(prior_bucket_ts);
+
+        handle_ingest_event(
+            frontier_event(
+                first_live_bucket_ts + ChronoDuration::seconds(5),
+                MdData::Trade(TradeEvent {
+                    price: 2100.0,
+                    qty_eth: 1.0,
+                    notional_usdt: 2100.0,
+                    aggressor_side: 1,
+                }),
+            ),
+            Some(cutoff_bucket_ts),
+            &mut startup_cutover_completed,
+            false,
+            false,
+            0,
+            &mut stale_drop_count,
+            &mut stale_drop_max_lag_secs,
+            &mut stale_drop_max_publish_delay_secs,
+            &mut stale_drop_max_transport_lag_secs,
+            &mut stale_drop_oldest_ts,
+            &mut stale_drop_newest_ts,
+            &mut stale_drop_by_msg_type,
+            &metrics,
+            &mut state_store,
+            &mut scheduler,
+        );
+
+        assert!(startup_cutover_completed);
+        assert_eq!(state_store.history_futures_len(), 0);
+        assert_eq!(
+            state_store.extract_snapshot().effective_history_floor_ts,
+            Some(first_live_bucket_ts)
+        );
+
+        let ready = scheduler.ready_minutes(first_live_bucket_ts + ChronoDuration::minutes(2));
+        assert_eq!(ready.first().copied(), Some(first_live_bucket_ts));
     }
 }

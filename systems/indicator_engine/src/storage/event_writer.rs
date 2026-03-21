@@ -4,6 +4,7 @@ use crate::indicators::context::{
 };
 use crate::indicators::shared::event_ids::{build_divergence_event_id, build_indicator_event_id};
 use crate::observability::metrics::AppMetrics;
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::collections::BTreeSet;
@@ -86,7 +87,7 @@ impl EventWriter {
         history_start_ts: DateTime<Utc>,
         history_end_ts: DateTime<Utc>,
         rows: &[IndicatorEventRow],
-    ) {
+    ) -> Result<()> {
         let mut all_ok = true;
         let generic_rows = rows
             .iter()
@@ -198,6 +199,14 @@ impl EventWriter {
 
         if all_ok {
             self.metrics.record_event_writer_success();
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "write_indicator_events failed symbol={} scope={}..{}",
+                symbol,
+                history_start_ts,
+                history_end_ts
+            ))
         }
     }
 
@@ -207,7 +216,7 @@ impl EventWriter {
         history_start_ts: DateTime<Utc>,
         history_end_ts: DateTime<Utc>,
         rows: &[DivergenceEventRow],
-    ) {
+    ) -> Result<()> {
         let mut all_ok = true;
         let expected_event_ids = rows
             .iter()
@@ -381,6 +390,14 @@ impl EventWriter {
 
         if all_ok {
             self.metrics.record_event_writer_success();
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "write_divergence_events failed symbol={} scope={}..{}",
+                symbol,
+                history_start_ts,
+                history_end_ts
+            ))
         }
     }
 
@@ -390,7 +407,7 @@ impl EventWriter {
         history_start_ts: DateTime<Utc>,
         history_end_ts: DateTime<Utc>,
         rows: &[AbsorptionEventRow],
-    ) {
+    ) -> Result<()> {
         let mut all_ok = true;
         let expected_event_ids = rows
             .iter()
@@ -508,6 +525,14 @@ impl EventWriter {
 
         if all_ok {
             self.metrics.record_event_writer_success();
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "write_absorption_events failed symbol={} scope={}..{}",
+                symbol,
+                history_start_ts,
+                history_end_ts
+            ))
         }
     }
 
@@ -517,7 +542,7 @@ impl EventWriter {
         history_start_ts: DateTime<Utc>,
         history_end_ts: DateTime<Utc>,
         rows: &[InitiationEventRow],
-    ) {
+    ) -> Result<()> {
         let mut all_ok = true;
         let expected_event_ids = rows
             .iter()
@@ -628,6 +653,14 @@ impl EventWriter {
 
         if all_ok {
             self.metrics.record_event_writer_success();
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "write_initiation_events failed symbol={} scope={}..{}",
+                symbol,
+                history_start_ts,
+                history_end_ts
+            ))
         }
     }
 
@@ -637,7 +670,7 @@ impl EventWriter {
         history_start_ts: DateTime<Utc>,
         history_end_ts: DateTime<Utc>,
         rows: &[ExhaustionEventRow],
-    ) {
+    ) -> Result<()> {
         let mut all_ok = true;
         let expected_event_ids = rows
             .iter()
@@ -742,6 +775,14 @@ impl EventWriter {
 
         if all_ok {
             self.metrics.record_event_writer_success();
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "write_exhaustion_events failed symbol={} scope={}..{}",
+                symbol,
+                history_start_ts,
+                history_end_ts
+            ))
         }
     }
 
