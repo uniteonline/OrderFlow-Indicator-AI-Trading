@@ -1588,7 +1588,7 @@ fn qwen_output_contract(
     } else if pending_order_mode {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `reason` and `params`. `analysis` and `self_check` may be present as extra objects.\n- `reason` must be a non-empty top-level string. Do not place `reason` inside `analysis`.\n- `params` must contain exactly: `entry`, `tp`, `sl`, `leverage` — each a number or null.\n- Set all params to null if there is no valid setup.\n".to_string()
     } else if management_mode {
-        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `decision`, `reason`, and `params`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- Allowed decisions: VALID, INVALID, ADJUST.\n- `params` must always be present.\n- For VALID: keep `params` present; action fields may be null.\n- For INVALID: set `params.close_price` to a number or null.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], [\"tp\",\"sl\"], [\"add\"], or [\"reduce\"]), and corresponding values: `new_tp`/`new_sl` for tp/sl adjustments, `qty_ratio` (number 0-1) for add/reduce.\n".to_string()
+        "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Top-level keys must be `decision`, `reason`, `management_context`, and `params`. `analysis` may be present as an extra object.\n- `reason` must be a non-empty top-level string.\n- `management_context` must include `direction_state`, `ltf_move_meaning`, `sl_noise_risk_15m`, `tp_state`, and `key_condition`.\n- Allowed decisions: VALID, INVALID, ADJUST.\n- `params` must always be present.\n- For VALID: keep `params` present; action fields may be null.\n- For INVALID: set `params.close_price` to a number or null.\n- For ADJUST: set `params.adjust_fields` (array: [\"tp\"], [\"sl\"], [\"tp\",\"sl\"], [\"add\"], or [\"reduce\"]), and corresponding values: `new_tp`/`new_sl` for tp/sl adjustments, `qty_ratio` (number 0-1) for add/reduce.\n".to_string()
     } else {
         "\n\nQWEN OUTPUT CONTRACT:\n- Return exactly one JSON object.\n- Keep `reason` as a top-level string. Do not place `reason` inside `analysis`.\n- Top-level keys must be `decision`, `reason`, `decision_context`, and `params`. `analysis` and `self_check` may be present as extra objects.\n- `decision_context` must include `thesis_flow_alignment`, `entry_readiness`, `entry_exposure`, and `key_condition`.\n- Allowed entry decisions: LONG, SHORT, NO_TRADE. Never use HOLD in entry mode.\n- For LONG or SHORT, params must include `entry`, `tp`, `sl`, `leverage`, and `horizon`.\n- For NO_TRADE, set `params.entry`, `params.tp`, `params.sl`, `params.leverage`, and `params.horizon` to null.\n".to_string()
     }
@@ -1728,6 +1728,74 @@ fn qwen_entry_scan_response_schema() -> Value {
     })
 }
 
+fn management_context_schema_openai() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "direction_state",
+            "ltf_move_meaning",
+            "sl_noise_risk_15m",
+            "tp_state",
+            "key_condition"
+        ],
+        "properties": {
+            "direction_state": {
+                "type": "string",
+                "enum": ["aligned", "challenged", "reversed"]
+            },
+            "ltf_move_meaning": {
+                "type": "string",
+                "enum": ["noise", "caution", "invalidation"]
+            },
+            "sl_noise_risk_15m": {
+                "type": "string",
+                "enum": ["low", "medium", "high"]
+            },
+            "tp_state": {
+                "type": "string",
+                "enum": ["keep", "revise_closer", "revise_farther", "obsolete"]
+            },
+            "key_condition": {
+                "type": "string",
+                "minLength": 1
+            }
+        }
+    })
+}
+
+fn management_context_schema_gemini() -> Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "direction_state": {
+                "type": "STRING",
+                "enum": ["aligned", "challenged", "reversed"]
+            },
+            "ltf_move_meaning": {
+                "type": "STRING",
+                "enum": ["noise", "caution", "invalidation"]
+            },
+            "sl_noise_risk_15m": {
+                "type": "STRING",
+                "enum": ["low", "medium", "high"]
+            },
+            "tp_state": {
+                "type": "STRING",
+                "enum": ["keep", "revise_closer", "revise_farther", "obsolete"]
+            },
+            "key_condition": { "type": "STRING" }
+        },
+        "required": [
+            "direction_state",
+            "ltf_move_meaning",
+            "sl_noise_risk_15m",
+            "tp_state",
+            "key_condition"
+        ]
+    })
+}
+
 fn qwen_entry_response_schema() -> Value {
     json!({
         "type": "object",
@@ -1852,7 +1920,7 @@ fn qwen_management_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["decision", "reason", "params"],
+        "required": ["decision", "reason", "management_context", "params"],
         "properties": {
             "decision": {
                 "type": "string",
@@ -1862,6 +1930,7 @@ fn qwen_management_response_schema() -> Value {
                 "type": "string",
                 "minLength": 1
             },
+            "management_context": management_context_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": true
@@ -1878,7 +1947,7 @@ fn custom_llm_management_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "reason", "params"],
+        "required": ["decision", "reason", "management_context", "params"],
         "properties": {
             "decision": {
                 "type": "string",
@@ -1888,6 +1957,7 @@ fn custom_llm_management_response_schema() -> Value {
                 "type": "string",
                 "minLength": 1
             },
+            "management_context": management_context_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": false,
@@ -2408,12 +2478,13 @@ fn grok_management_response_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "params", "reason"],
+        "required": ["decision", "management_context", "params", "reason"],
         "properties": {
             "decision": {
                 "type": "string",
                 "enum": ["VALID", "INVALID", "ADJUST"]
             },
+            "management_context": management_context_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": false,
@@ -2726,9 +2797,10 @@ fn ml_grok_management_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "params", "reason"],
+        "required": ["decision", "management_context", "params", "reason"],
         "properties": {
             "decision": { "type": "string", "enum": ["VALID", "INVALID", "ADJUST"] },
+            "management_context": management_context_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": false,
@@ -2813,6 +2885,7 @@ fn ml_gemini_management_schema() -> Value {
         "type": "OBJECT",
         "properties": {
             "decision": { "type": "STRING", "enum": ["VALID", "INVALID", "ADJUST"] },
+            "management_context": management_context_schema_gemini(),
             "params": {
                 "type": "OBJECT",
                 "properties": {
@@ -2826,7 +2899,7 @@ fn ml_gemini_management_schema() -> Value {
             },
             "reason": { "type": "STRING" }
         },
-        "required": ["decision", "params", "reason"]
+        "required": ["decision", "management_context", "params", "reason"]
     })
 }
 
@@ -2885,10 +2958,11 @@ fn ml_qwen_management_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": true,
-        "required": ["decision", "reason", "params"],
+        "required": ["decision", "reason", "management_context", "params"],
         "properties": {
             "decision": { "type": "string", "enum": ["VALID", "INVALID", "ADJUST"] },
             "reason": { "type": "string", "minLength": 1 },
+            "management_context": management_context_schema_openai(),
             "params": { "type": "object", "additionalProperties": true },
             "analysis": { "type": ["object", "null"], "additionalProperties": true }
         }
@@ -2960,10 +3034,11 @@ fn ml_custom_llm_management_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["decision", "reason", "params"],
+        "required": ["decision", "reason", "management_context", "params"],
         "properties": {
             "decision": { "type": "string", "enum": ["VALID", "INVALID", "ADJUST"] },
             "reason": { "type": "string", "minLength": 1 },
+            "management_context": management_context_schema_openai(),
             "params": {
                 "type": "object",
                 "additionalProperties": false,
@@ -3082,6 +3157,7 @@ fn gemini_management_response_schema() -> Value {
                 "type": "STRING",
                 "enum": ["VALID", "INVALID", "ADJUST"]
             },
+            "management_context": management_context_schema_gemini(),
             "params": {
                 "type": "OBJECT",
                 "properties": {
@@ -3095,7 +3171,7 @@ fn gemini_management_response_schema() -> Value {
             },
             "reason": { "type": "STRING" }
         },
-        "required": ["decision", "params", "reason"]
+        "required": ["decision", "management_context", "params", "reason"]
     })
 }
 
@@ -4403,6 +4479,33 @@ mod tests {
     }
 
     #[test]
+    fn custom_llm_management_schema_disables_additional_properties() {
+        let schema = super::custom_llm_response_schema(
+            true,
+            false,
+            super::prompt::EntryPromptStage::Finalize,
+            "big_opportunity",
+        );
+        assert_eq!(
+            schema.get("additionalProperties").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            schema
+                .pointer("/properties/management_context/additionalProperties")
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|required| required
+                .iter()
+                .any(|v| v.as_str() == Some("management_context")))
+            .unwrap_or(false));
+    }
+
+    #[test]
     fn custom_llm_entry_scan_schema_disables_additional_properties() {
         for prompt_template in ["big_opportunity", "medium_large_opportunity"] {
             let schema = super::custom_llm_response_schema(
@@ -4487,6 +4590,22 @@ mod tests {
         assert!(contract.contains("thesis_flow_alignment"));
         assert!(contract.contains("entry_readiness"));
         assert!(contract.contains("entry_exposure"));
+        assert!(contract.contains("key_condition"));
+    }
+
+    #[test]
+    fn qwen_management_output_contract_mentions_management_context() {
+        let contract = super::qwen_output_contract(
+            true,
+            false,
+            super::prompt::EntryPromptStage::Finalize,
+            "medium_large_opportunity",
+        );
+        assert!(contract.contains("management_context"));
+        assert!(contract.contains("direction_state"));
+        assert!(contract.contains("ltf_move_meaning"));
+        assert!(contract.contains("sl_noise_risk_15m"));
+        assert!(contract.contains("tp_state"));
         assert!(contract.contains("key_condition"));
     }
 

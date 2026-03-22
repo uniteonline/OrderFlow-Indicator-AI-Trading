@@ -154,7 +154,11 @@ fn build_core_root(root: &Value, mode: CoreMode) -> Value {
             .cloned()
             .map(|value| {
                 if matches!(mode, CoreMode::Pending | CoreMode::Management) {
-                    prune_nulls_root(value)
+                    let mut value = prune_nulls_root(value);
+                    if matches!(mode, CoreMode::Management) {
+                        strip_management_entry_reason(&mut value);
+                    }
+                    value
                 } else {
                     value
                 }
@@ -165,6 +169,14 @@ fn build_core_root(root: &Value, mode: CoreMode) -> Value {
     }
 
     Value::Object(result)
+}
+
+fn strip_management_entry_reason(value: &mut Value) {
+    if let Some(entry_context) = value.pointer_mut("/position_context/entry_context") {
+        if let Some(entry_context_object) = entry_context.as_object_mut() {
+            entry_context_object.remove("entry_reason");
+        }
+    }
 }
 
 fn prune_nulls_root(value: Value) -> Value {
@@ -1652,6 +1664,12 @@ mod tests {
         assert_eq!(value.as_object().map(|obj| obj.len()), Some(5));
         assert!(value.pointer("/management_snapshot").is_some());
         assert!(value.pointer("/trading_state").is_some());
+        assert!(value
+            .pointer("/management_snapshot/position_context/entry_context")
+            .is_some());
+        assert!(value
+            .pointer("/management_snapshot/position_context/entry_context/entry_reason")
+            .is_none());
         assert!(value.pointer("/indicators/footprint/window_code").is_none());
         assert!(value
             .pointer("/indicators/price_volume_structure/payload/value_area_levels")
