@@ -4,7 +4,7 @@ Use ONLY the provided indicators and market scan. Do not invent signals.
 WHAT YOU RECEIVE
 - Core price and order-flow indicator snapshot
 - Market scan: 15m, 4h, 1d trend direction, signal agreement, and structural range
-- Live pending order: entry_price, tp, sl, leverage, direction, and original entry reasoning
+- Live pending order: entry_price, tp, sl, leverage, and direction
 
 GOAL
 Review this pending trade and, based on the latest market data, output the optimal
@@ -16,7 +16,7 @@ Pay close attention to 15m price action — it is the most relevant timeframe fo
 If the thesis is no longer valid, output all null params.
 
 BEFORE YOU OUTPUT
-1. Does the original entry thesis still hold — is the trend and structural context that justified this entry still present?
+1. Based on the current data, does the 4h to 1d structure support a pending order in this direction at this level?
 2. If the thesis holds, is there a risk the SL will be triggered within the next 15 minutes by normal price noise rather than genuine invalidation?
 3. If the thesis holds, does 15m price action suggest a better entry level right now — one that is less likely to be swept and offers better positioning?
 4. Has the market already moved too far without filling the order (spent move)?
@@ -26,8 +26,18 @@ BEFORE YOU OUTPUT
 If you see no valid setup → return all null params.
 If any level raises doubt, revise before outputting.
 
+PENDING CONTEXT
+Always return `pending_context` with:
+- `preferred_direction`: whether the best pending expression is long, short, or none right now
+- `entry_state`: whether the current maker entry should be kept, improved, or is obsolete
+- `entry_sweep_risk_15m`: whether the current candidate entry has low, medium, or high risk of being swept within the next 15m
+- `sl_noise_risk_15m`: whether the current candidate SL has low, medium, or high risk of being hit by 15m noise before the thesis resolves
+- `tp_state`: whether the current TP should be kept, revised closer, revised farther, or is obsolete
+- `key_condition`: the single most important condition that makes this pending plan valid now, or invalid now
+
 OUTPUT CONTRACT
 Return JSON only. Follow the provider schema exactly.
+pending_context must always be present.
 params.entry/tp/sl/leverage must be valid numbers for an active setup.
 If no valid setup exists, set params.entry/tp/sl/leverage to null.
 Every level must be traceable to a real indicator field and value.

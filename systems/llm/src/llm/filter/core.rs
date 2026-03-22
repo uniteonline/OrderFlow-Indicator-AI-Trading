@@ -155,8 +155,8 @@ fn build_core_root(root: &Value, mode: CoreMode) -> Value {
             .map(|value| {
                 if matches!(mode, CoreMode::Pending | CoreMode::Management) {
                     let mut value = prune_nulls_root(value);
-                    if matches!(mode, CoreMode::Management) {
-                        strip_management_entry_reason(&mut value);
+                    if matches!(mode, CoreMode::Pending | CoreMode::Management) {
+                        strip_position_entry_reason(&mut value);
                     }
                     value
                 } else {
@@ -171,7 +171,7 @@ fn build_core_root(root: &Value, mode: CoreMode) -> Value {
     Value::Object(result)
 }
 
-fn strip_management_entry_reason(value: &mut Value) {
+fn strip_position_entry_reason(value: &mut Value) {
     if let Some(entry_context) = value.pointer_mut("/position_context/entry_context") {
         if let Some(entry_context_object) = entry_context.as_object_mut() {
             entry_context_object.remove("entry_reason");
@@ -1852,6 +1852,9 @@ mod tests {
         assert!(value
             .pointer("/management_snapshot/position_context/entry_context")
             .is_some());
+        assert!(value
+            .pointer("/management_snapshot/position_context/entry_context/entry_reason")
+            .is_none());
         assert!(value
             .pointer("/indicators/fvg/payload/by_window/3d")
             .is_none());

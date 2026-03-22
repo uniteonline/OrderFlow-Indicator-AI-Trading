@@ -8,7 +8,7 @@ WHAT YOU RECEIVE
   - `entry_price` = current live maker entry on Binance
   - `current_tp_price` / `current_sl_price` = ACTUAL live exit orders on Binance; `null` means no live TP/SL is currently recognized
   - `planned_tp_price` / `planned_sl_price` = shadow/context reference levels from lifecycle state or original entry context; these are NOT proof a live order currently exists
-  - leverage, direction, and original entry reasoning
+  - leverage and direction
 
 GOAL
 Review this pending trade and, based on the latest market data, output the optimal
@@ -31,8 +31,18 @@ BEFORE YOU OUTPUT
 If you see no valid setup → return all null params.
 If any level raises doubt, revise before outputting.
 
+PENDING CONTEXT
+Always return `pending_context` with:
+- `preferred_direction`: whether the best pending expression is long, short, or none right now
+- `entry_state`: whether the current maker entry should be kept, improved, or is obsolete
+- `entry_sweep_risk_15m`: whether the current candidate entry has low, medium, or high risk of being swept within the next 15m
+- `sl_noise_risk_15m`: whether the current candidate SL has low, medium, or high risk of being hit by 15m noise before the thesis resolves
+- `tp_state`: whether the current TP should be kept, revised closer, revised farther, or is obsolete
+- `key_condition`: the single most important condition that makes this pending plan valid now, or invalid now
+
 OUTPUT CONTRACT
 Return JSON only. Follow the provider schema exactly.
+pending_context must always be present.
 params.entry/tp/sl/leverage must be valid numbers for an active setup.
 If no valid setup exists, set params.entry/tp/sl/leverage to null.
 Every level must be traceable to a real indicator field and value.
