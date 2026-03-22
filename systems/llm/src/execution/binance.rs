@@ -219,6 +219,24 @@ fn is_entry_like_order(order: &OpenOrderSnapshot) -> bool {
         && (order.side.eq_ignore_ascii_case("BUY") || order.side.eq_ignore_ascii_case("SELL"))
 }
 
+fn effective_active_position_side(
+    position: &ActivePositionSnapshot,
+    hedge_mode: bool,
+) -> &'static str {
+    if let Some(side) = strict_hedge_position_side(&position.position_side) {
+        return side;
+    }
+    if position.position_amt > 0.0 {
+        "LONG"
+    } else if position.position_amt < 0.0 {
+        "SHORT"
+    } else if hedge_mode {
+        "BOTH"
+    } else {
+        "BOTH"
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitKind {
     TakeProfit,
@@ -1250,6 +1268,7 @@ pub async fn fetch_symbol_trading_state(
         active_position_source,
         &active_positions,
         &open_orders,
+        exec_config.hedge_mode,
     ) {
         let ws_position_count = active_positions.len();
         let rest_positions =
@@ -1259,7 +1278,7 @@ pub async fn fetch_symbol_trading_state(
                 symbol = %symbol,
                 ws_position_count = ws_position_count,
                 rest_position_count = rest_positions.len(),
-                "reconciled account-ws position snapshot against rest because no exit orders were open"
+                "reconciled account-ws position snapshot against rest because live exit coverage was incomplete"
             );
         }
         active_positions = rest_positions;
@@ -3344,10 +3363,41 @@ fn should_reconcile_ws_positions_with_rest(
     source: ActivePositionSource,
     active_positions: &[ActivePositionSnapshot],
     open_orders: &[OpenOrderSnapshot],
+    hedge_mode: bool,
 ) -> bool {
     matches!(source, ActivePositionSource::AccountWs)
         && !active_positions.is_empty()
-        && open_orders.is_empty()
+        && (open_orders.is_empty()
+            || active_positions.iter().any(|position| {
+                let position_side = effective_active_position_side(position, hedge_mode);
+                let side_orders = open_orders
+                    .iter()
+                    .filter(|order| order_matches_position_side(order, position_side, hedge_mode))
+                    .collect::<Vec<_>>();
+                if side_orders.is_empty() {
+                    return false;
+                }
+                if side_orders.iter().any(|order| is_entry_like_order(order)) {
+                    return false;
+                }
+                let has_live_tp = find_live_exit_trigger_price(
+                    open_orders,
+                    position_side,
+                    hedge_mode,
+                    Some(position.entry_price),
+                    ExitKind::TakeProfit,
+                )
+                .is_some();
+                let has_live_sl = find_live_exit_trigger_price(
+                    open_orders,
+                    position_side,
+                    hedge_mode,
+                    Some(position.entry_price),
+                    ExitKind::StopLoss,
+                )
+                .is_some();
+                has_live_tp != has_live_sl
+            }))
 }
 
 async fn is_position_side_flat_on_rest(
@@ -5226,13 +5276,15 @@ mod tests {
             ActivePositionSource::AccountWs,
             &active_positions,
             &[],
+            false,
         ));
         assert!(!should_reconcile_ws_positions_with_rest(
             ActivePositionSource::Rest,
             &active_positions,
             &[],
+            false,
         ));
-        assert!(!should_reconcile_ws_positions_with_rest(
+        assert!(should_reconcile_ws_positions_with_rest(
             ActivePositionSource::AccountWs,
             &active_positions,
             &[OpenOrderSnapshot {
@@ -5249,6 +5301,61 @@ mod tests {
                 reduce_only: true,
                 is_algo_order: true,
             }],
+            false,
+        ));
+        assert!(should_reconcile_ws_positions_with_rest(
+            ActivePositionSource::AccountWs,
+            &active_positions,
+            &[OpenOrderSnapshot {
+                order_id: 503,
+                side: "BUY".to_string(),
+                position_side: "BOTH".to_string(),
+                order_type: "STOP_MARKET".to_string(),
+                status: "NEW".to_string(),
+                orig_qty: 0.07,
+                executed_qty: 0.0,
+                price: 0.0,
+                stop_price: 2244.0,
+                close_position: true,
+                reduce_only: true,
+                is_algo_order: true,
+            }],
+            false,
+        ));
+        assert!(!should_reconcile_ws_positions_with_rest(
+            ActivePositionSource::AccountWs,
+            &active_positions,
+            &[
+                OpenOrderSnapshot {
+                    order_id: 501,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "TAKE_PROFIT_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.07,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2144.0,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: true,
+                },
+                OpenOrderSnapshot {
+                    order_id: 502,
+                    side: "BUY".to_string(),
+                    position_side: "BOTH".to_string(),
+                    order_type: "STOP_MARKET".to_string(),
+                    status: "NEW".to_string(),
+                    orig_qty: 0.07,
+                    executed_qty: 0.0,
+                    price: 0.0,
+                    stop_price: 2244.0,
+                    close_position: true,
+                    reduce_only: true,
+                    is_algo_order: true,
+                },
+            ],
+            false,
         ));
     }
 
