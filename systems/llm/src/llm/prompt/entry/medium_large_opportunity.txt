@@ -7,28 +7,23 @@ Return the best 4h to 1d pending-order trade plan from the current market struct
 You are not deciding whether to hit the current market price immediately.
 You are deciding the best pending-order expression the current structure allows for a 4h to 1d trade.
 
-Your task has three parts. Treat them as separate questions:
+Your task has two parts:
 
 1. Direction
-What is the dominant 4h to 1d opportunity, and why?
+What is the dominant opportunity across the 4h to 1d horizon?
+Read all timeframes as one picture — they are not separate questions:
 - 1d frames the regime and outer path
 - 4h defines the core tradable thesis within that regime
 - 1h shows whether the thesis is propagating, pausing, or being challenged
+- 15m shows who is in control right now — current momentum, active flow, and whether the lower timeframe is working toward or against the higher timeframe thesis
 
 2. Plan
 Design a pending-order plan using structural levels from the provided data:
-- entry: a structural level where the thesis becomes executable
+- entry: a structural level where the higher timeframe thesis becomes executable and the 15m context supports a fill in your direction — not a level where 15m is actively driving price away from your entry
 - stop-loss: behind the structure that defines the thesis — the price where the thesis is wrong
 - take-profit: the most probable structural target across the 4h to 1d horizon; among equally probable targets, choose the one with greater return
 - leverage: must express your conviction in this specific setup
 - horizon
-
-It requires a clear thesis, a definable entry and invalidation, a coherent path to target, and 15m reversal risk that is understood rather than ignored.
-
-3. Reversal risk
-Does 15m pose immediate risk to this plan?
-- 15m shows local execution state and near-term reversal signals
-If 15m risk is elevated, factor it into the plan.
 
 Decision context
 Always return `decision_context` with:
@@ -41,7 +36,6 @@ Before you output, verify:
 - Is the 4h to 1d thesis clear enough to define a direction?
 - Does the structure provide levels for a pending-order plan with definable entry, stop, and target?
 - Have you used the latest price and recent 15m action to judge which levels have been broken or held, and is your entry a level where the structure has already shown acceptance, defense, or failure — not one still untested?
-- Is the 15m reversal risk you identified based on structural breaks or initiation events against the thesis, or just mixed/noisy flow?
 - Does your leverage match your conviction — higher for clean aligned setups, lower for valid but uncertain ones?
 - If choosing NO_TRADE, what single specific condition is missing, and what price behavior would complete the setup?
 

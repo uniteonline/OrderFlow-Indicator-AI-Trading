@@ -32,6 +32,8 @@ HOW TO READ THE INPUT
 The input is a global evidence pool, not a pre-decided timeframe verdict.
 
 Key blocks:
+  - now:
+    current location, value state, active structures, live flow, and momentum_snapshot
   - price_structures:
     neutral candidate price bands and price clusters from different source windows
   - price_levels:

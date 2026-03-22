@@ -156,7 +156,7 @@ fn build_scan_root(root: &Value) -> Value {
 
     result.insert(
         "version".to_string(),
-        Value::String("scan_v6_1".to_string()),
+        Value::String("scan_v6_2".to_string()),
     );
     if let Some(symbol) = root.get("symbol") {
         result.insert("symbol".to_string(), symbol.clone());
@@ -1115,6 +1115,7 @@ fn build_timeframe_momentum_snapshot(source: &Map<String, Value>, tf: &str) -> V
     let mut result = Map::new();
 
     let closed_bars = extract_closed_futures_bars(source, tf);
+    let atr14 = compute_atr14(&closed_bars);
     let recent_bars = if closed_bars.len() > 3 {
         &closed_bars[closed_bars.len() - 3..]
     } else {
@@ -1146,6 +1147,43 @@ fn build_timeframe_momentum_snapshot(source: &Map<String, Value>, tf: &str) -> V
             result.insert("bar_return_sum_last_3_pct".to_string(), Value::from(value));
         }
     }
+
+    let last_closed_bar_range_vs_atr = closed_bars.last().and_then(|bar| {
+        let high = bar.get("high").and_then(Value::as_f64);
+        let low = bar.get("low").and_then(Value::as_f64);
+        match (high, low, atr14) {
+            (Some(high), Some(low), Some(atr14)) if atr14.abs() > f64::EPSILON => {
+                Some(round2((high - low) / atr14))
+            }
+            _ => None,
+        }
+    });
+    result.insert(
+        "last_closed_bar_range_vs_atr".to_string(),
+        last_closed_bar_range_vs_atr
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
+
+    let last_closed_bar_close_location_pct = closed_bars.last().and_then(|bar| {
+        let low = bar.get("low").and_then(Value::as_f64);
+        let high = bar.get("high").and_then(Value::as_f64);
+        let close = bar.get("close").and_then(Value::as_f64);
+        let range = match (high, low) {
+            (Some(high), Some(low)) if (high - low).abs() > f64::EPSILON => Some(high - low),
+            _ => None,
+        };
+        match (close, low, range) {
+            (Some(close), Some(low), Some(range)) => Some(round2((close - low) / range * 100.0)),
+            _ => None,
+        }
+    });
+    result.insert(
+        "last_closed_bar_close_location_pct".to_string(),
+        last_closed_bar_close_location_pct
+            .map(Value::from)
+            .unwrap_or(Value::Null),
+    );
 
     let cvd_delta_last_3 = extract_indicator_payload(source, "cvd_pack")
         .and_then(|payload| payload.get("by_window").and_then(Value::as_object))
@@ -5614,7 +5652,7 @@ mod tests {
 
         assert_eq!(
             value.pointer("/version").and_then(Value::as_str),
-            Some("scan_v6_1")
+            Some("scan_v6_2")
         );
         assert_eq!(
             value.pointer("/current_price").and_then(Value::as_f64),
@@ -5832,6 +5870,18 @@ mod tests {
         );
         assert_eq!(
             value
+                .pointer("/now/momentum_snapshot/15m/last_closed_bar_range_vs_atr")
+                .and_then(Value::as_f64),
+            Some(1.0)
+        );
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/15m/last_closed_bar_close_location_pct")
+                .and_then(Value::as_f64),
+            Some(57.14)
+        );
+        assert_eq!(
+            value
                 .pointer("/now/momentum_snapshot/15m/cvd_delta_last_3")
                 .and_then(Value::as_array)
                 .map(|v| {
@@ -5873,6 +5923,18 @@ mod tests {
         );
         assert_eq!(
             value
+                .pointer("/now/momentum_snapshot/4h/last_closed_bar_range_vs_atr")
+                .and_then(Value::as_f64),
+            Some(0.77)
+        );
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/4h/last_closed_bar_close_location_pct")
+                .and_then(Value::as_f64),
+            Some(60.0)
+        );
+        assert_eq!(
+            value
                 .pointer("/now/momentum_snapshot/4h/cvd_slope")
                 .and_then(Value::as_f64),
             Some(40.0)
@@ -5900,6 +5962,18 @@ mod tests {
                 .pointer("/now/momentum_snapshot/1d/bar_return_sum_last_3_pct")
                 .and_then(Value::as_f64),
             Some(2.14)
+        );
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/1d/last_closed_bar_range_vs_atr")
+                .and_then(Value::as_f64),
+            Some(0.72)
+        );
+        assert_eq!(
+            value
+                .pointer("/now/momentum_snapshot/1d/last_closed_bar_close_location_pct")
+                .and_then(Value::as_f64),
+            Some(80.0)
         );
         assert_eq!(
             value

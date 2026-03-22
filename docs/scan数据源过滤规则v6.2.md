@@ -1,6 +1,6 @@
 # Scan 数据源过滤规则 v6.2
 
-**状态**：草案（待复核，未执行）  
+**状态**：已执行  
 **定位**：在 `v6.1` 已完成去重和结构压缩之后，继续增强 `stage1 scan` 对“方向判断”的支持  
 **适用文件**：`systems/llm/src/llm/filter/scan.rs`  
 **依赖文档**：
@@ -116,6 +116,8 @@
     "15m": {
       "bar_return_last_3_pct": [0.0, 0.0, 0.0],
       "bar_return_sum_last_3_pct": 0.0,
+      "last_closed_bar_range_vs_atr": 0.0,
+      "last_closed_bar_close_location_pct": 0.0,
       "cvd_delta_last_3": [0.0, 0.0, 0.0],
       "cvd_slope": 0.0,
       "whale_delta_notional": 0.0
@@ -123,6 +125,8 @@
     "4h": {
       "bar_return_last_3_pct": [0.0, 0.0, 0.0],
       "bar_return_sum_last_3_pct": 0.0,
+      "last_closed_bar_range_vs_atr": 0.0,
+      "last_closed_bar_close_location_pct": 0.0,
       "cvd_delta_last_3": [0.0, 0.0, 0.0],
       "cvd_slope": 0.0,
       "whale_delta_notional": 0.0
@@ -130,6 +134,8 @@
     "1d": {
       "bar_return_last_3_pct": [0.0, 0.0, 0.0],
       "bar_return_sum_last_3_pct": 0.0,
+      "last_closed_bar_range_vs_atr": 0.0,
+      "last_closed_bar_close_location_pct": 0.0,
       "cvd_delta_last_3": [0.0, 0.0, 0.0],
       "cvd_slope": 0.0,
       "whale_delta_notional": 0.0
@@ -196,7 +202,50 @@
 
 - 从旧到新
 
-### 5.4 `cvd_slope`
+### 5.4 `last_closed_bar_range_vs_atr`
+
+含义：
+
+- 最近 `1` 根闭合 bar 的真实波动范围，相对于该 timeframe `ATR14` 的倍数
+
+规则：
+
+- `(latest_closed_bar.high - latest_closed_bar.low) / atr14`
+
+这个字段的作用是让模型快速知道：
+
+- 最近这根 bar 是否只是正常波动
+- 还是已经明显扩张到异常水平
+
+示例：
+
+```json
+"last_closed_bar_range_vs_atr": 2.55
+```
+
+### 5.5 `last_closed_bar_close_location_pct`
+
+含义：
+
+- 最近 `1` 根闭合 bar 的收盘位置，位于该 bar 自身区间中的百分位
+
+规则：
+
+- `(close - low) / (high - low) * 100`
+
+解释方式：
+
+- 对大阳线来说，越接近 `100`，越像延续式收盘
+- 对大阴线来说，越接近 `0`，越像延续式收盘
+- 如果最近 bar 很大，但收盘位置没有停留在扩张方向的一端，更像耗竭或反转前兆
+
+示例：
+
+```json
+"last_closed_bar_close_location_pct": 16.7
+```
+
+### 5.6 `cvd_slope`
 
 含义：
 
@@ -211,7 +260,7 @@
 - 当前 CVD 是在继续同向推进
 - 还是已经明显衰减
 
-### 5.5 `whale_delta_notional`
+### 5.7 `whale_delta_notional`
 
 含义：
 
@@ -347,6 +396,8 @@
 
 - `bar_return_last_3_pct`
 - `bar_return_sum_last_3_pct`
+- `last_closed_bar_range_vs_atr`
+- `last_closed_bar_close_location_pct`
 - `cvd_delta_last_3`
 - `cvd_slope`
 - `whale_delta_notional`

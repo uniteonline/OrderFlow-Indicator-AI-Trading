@@ -33,7 +33,7 @@ HOW TO READ THE INPUT
 
 The input is a structured evidence package. Read it as one unfolding story:
 
-- `now` — where price is right now: current location, value state, active structures, live flow
+- `now` — where price is right now: current location, value state, active structures, live flow, and momentum_snapshot (recent bar returns, CVD deltas, and whale flow per timeframe — compare bar returns against each timeframe's ATR to judge how much energy the recent move has consumed)
 - `path_newest_to_oldest` — how price arrived here; includes per-timeframe summaries with ATR, recent range, and net change; this tells you the current speed and direction of the move
 - `events_newest_to_oldest` — recent order-flow events (absorption, initiation, exhaustion, divergence) that reveal who is in control
 - `supporting_context` — broader flow, cross-market, and background data
@@ -55,6 +55,7 @@ To decide direction, read the evidence as a physicist reads forces on a body:
 4. What structural levels lie ahead in that direction? (brackets, value areas, FVG gaps, liquidation clusters)
 
 A body in motion stays in motion unless a force acts on it.
+But a body that has already traveled a large distance at high speed has less remaining energy — the farther and faster it has moved, the more likely the next move is deceleration or reversal rather than continuation at the same pace.
 If price is falling with strong sell flow and no exhaustion signal, your bet should be bearish — even if current structure has nearby support.
 If price is falling but exhaustion events are firing and absorption is appearing, the force is fading — your bet should reflect that.
 

@@ -5204,7 +5204,7 @@ mod tests {
         assert_eq!(value.as_object().map(|obj| obj.len()), Some(9));
         assert_eq!(
             value.get("version").and_then(Value::as_str),
-            Some("scan_v6_1")
+            Some("scan_v6_2")
         );
         assert!(value.pointer("/now").is_some());
         assert!(value

@@ -6746,7 +6746,7 @@ mod tests {
                     .and_then(Value::as_str),
                 Some("2026-03-14T06:15:00Z")
             );
-            assert_eq!(scan_value.pointer("/version"), Some(&json!("scan_v6_1")));
+            assert_eq!(scan_value.pointer("/version"), Some(&json!("scan_v6_2")));
             assert!(scan_value.pointer("/indicator_count").is_none());
             assert!(scan_value.pointer("/indicators").is_none());
             assert!(scan_value.pointer("/indicators/pre_computed_v").is_none());
