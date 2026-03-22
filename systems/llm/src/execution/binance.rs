@@ -3195,19 +3195,42 @@ fn select_margin_budget(
     exec_config: &LlmExecutionConfig,
     account_balance: &FuturesAccountBalance,
 ) -> Result<(f64, &'static str)> {
-    if exec_config.account_margin_ratio > 0.0 {
-        let budget = account_balance.total_wallet_balance * exec_config.account_margin_ratio;
+    let (raw_budget, raw_source) = if exec_config.account_margin_ratio > 0.0 {
+        let budget = account_balance.available_balance * exec_config.account_margin_ratio;
         if budget <= 0.0 {
             return Err(anyhow!(
-                "computed margin budget from account balance is <= 0: total_wallet_balance={} ratio={}",
-                account_balance.total_wallet_balance,
+                "computed margin budget from account available balance is <= 0: available_balance={} ratio={}",
+                account_balance.available_balance,
                 exec_config.account_margin_ratio
             ));
         }
-        return Ok((budget, "account_ratio"));
+        (budget, "available_account_ratio")
+    } else {
+        (exec_config.margin_usdt, "fixed_usdt")
+    };
+
+    let capped = exec_config.max_margin_usdt > 0.0 && raw_budget > exec_config.max_margin_usdt;
+    let final_budget = if capped {
+        exec_config.max_margin_usdt
+    } else {
+        raw_budget
+    };
+
+    if final_budget <= 0.0 {
+        return Err(anyhow!(
+            "selected margin budget is <= 0 after cap: raw_budget={} max_margin_usdt={}",
+            raw_budget,
+            exec_config.max_margin_usdt
+        ));
     }
 
-    Ok((exec_config.margin_usdt, "fixed_usdt"))
+    let source = match (raw_source, capped) {
+        ("available_account_ratio", true) => "available_account_ratio_capped",
+        ("fixed_usdt", true) => "fixed_usdt_capped",
+        _ => raw_source,
+    };
+
+    Ok((final_budget, source))
 }
 
 fn compute_order_quantity(
@@ -4747,6 +4770,52 @@ mod tests {
         let (lv3, src3) = select_leverage(&exec, &sample_trade_intent(10.0)).expect("lv3");
         assert_eq!(lv3, 150);
         assert_eq!(src3, "model_ratio");
+    }
+
+    #[test]
+    fn select_margin_budget_uses_available_balance_for_ratio() {
+        let mut exec = LlmExecutionConfig::default();
+        exec.account_margin_ratio = 0.5;
+        exec.max_margin_usdt = 0.0;
+        let account_balance = FuturesAccountBalance {
+            total_wallet_balance: 100.0,
+            available_balance: 40.0,
+        };
+
+        let (budget, source) = select_margin_budget(&exec, &account_balance).expect("budget");
+        assert!((budget - 20.0).abs() < f64::EPSILON);
+        assert_eq!(source, "available_account_ratio");
+    }
+
+    #[test]
+    fn select_margin_budget_caps_ratio_budget_with_max_margin_usdt() {
+        let mut exec = LlmExecutionConfig::default();
+        exec.account_margin_ratio = 0.78;
+        exec.max_margin_usdt = 30.0;
+        let account_balance = FuturesAccountBalance {
+            total_wallet_balance: 100.0,
+            available_balance: 90.0,
+        };
+
+        let (budget, source) = select_margin_budget(&exec, &account_balance).expect("budget");
+        assert!((budget - 30.0).abs() < f64::EPSILON);
+        assert_eq!(source, "available_account_ratio_capped");
+    }
+
+    #[test]
+    fn select_margin_budget_caps_fixed_budget_with_max_margin_usdt() {
+        let mut exec = LlmExecutionConfig::default();
+        exec.account_margin_ratio = 0.0;
+        exec.margin_usdt = 50.0;
+        exec.max_margin_usdt = 30.0;
+        let account_balance = FuturesAccountBalance {
+            total_wallet_balance: 100.0,
+            available_balance: 90.0,
+        };
+
+        let (budget, source) = select_margin_budget(&exec, &account_balance).expect("budget");
+        assert!((budget - 30.0).abs() < f64::EPSILON);
+        assert_eq!(source, "fixed_usdt_capped");
     }
 
     #[test]

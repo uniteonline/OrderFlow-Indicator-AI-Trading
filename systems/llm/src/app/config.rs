@@ -533,6 +533,8 @@ pub struct LlmExecutionConfig {
     pub dry_run: bool,
     #[serde(default)]
     pub account_margin_ratio: f64,
+    #[serde(default = "default_execution_max_margin_usdt")]
+    pub max_margin_usdt: f64,
     #[serde(default = "default_execution_margin_usdt")]
     pub margin_usdt: f64,
     #[serde(
@@ -579,6 +581,7 @@ impl Default for LlmExecutionConfig {
             enabled: false,
             dry_run: false,
             account_margin_ratio: 0.0,
+            max_margin_usdt: default_execution_max_margin_usdt(),
             margin_usdt: default_execution_margin_usdt(),
             default_leverage_ratio: default_execution_default_leverage_ratio(),
             max_leverage: default_execution_max_leverage(),
@@ -907,6 +910,7 @@ mod tests {
         let execution = LlmConfig::default().execution;
         assert!((execution.min_distance_v - 1.0).abs() < f64::EPSILON);
         assert!((execution.min_rr - 2.0).abs() < f64::EPSILON);
+        assert!((execution.max_margin_usdt - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -956,6 +960,10 @@ fn default_models() -> Vec<LlmModelConfig> {
 
 fn default_execution_margin_usdt() -> f64 {
     50.0
+}
+
+fn default_execution_max_margin_usdt() -> f64 {
+    0.0
 }
 
 fn default_execution_max_leverage() -> u32 {
@@ -1437,6 +1445,12 @@ fn validate_config(cfg: &RootConfig) -> Result<()> {
             return Err(anyhow!(
                 "llm.execution.account_margin_ratio must be between 0.0 and 1.0"
             ));
+        }
+        if !cfg.llm.execution.max_margin_usdt.is_finite() {
+            return Err(anyhow!("llm.execution.max_margin_usdt must be finite"));
+        }
+        if cfg.llm.execution.max_margin_usdt < 0.0 {
+            return Err(anyhow!("llm.execution.max_margin_usdt must be >= 0"));
         }
         if cfg.llm.execution.max_leverage == 0 {
             return Err(anyhow!("llm.execution.max_leverage must be > 0"));
