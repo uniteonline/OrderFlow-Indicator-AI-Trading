@@ -298,6 +298,79 @@ impl CanonicalMinuteByMarket {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CanonicalMinutePresence {
+    pub minute_present: bool,
+    pub trade_futures: bool,
+    pub trade_spot: bool,
+    pub orderbook_futures: bool,
+    pub orderbook_spot: bool,
+    pub liq_futures: bool,
+    pub funding_futures: bool,
+}
+
+impl CanonicalMinutePresence {
+    pub fn complete_under_current_policy(&self) -> bool {
+        self.trade_futures
+            && self.orderbook_futures
+            && self.funding_futures
+            && self.trade_spot
+            && self.orderbook_spot
+    }
+
+    pub fn missing_required_sources(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if !self.trade_futures {
+            missing.push("trade_futures");
+        }
+        if !self.orderbook_futures {
+            missing.push("orderbook_futures");
+        }
+        if !self.funding_futures {
+            missing.push("funding_futures");
+        }
+        if !self.trade_spot {
+            missing.push("trade_spot");
+        }
+        if !self.orderbook_spot {
+            missing.push("orderbook_spot");
+        }
+        missing
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CanonicalFrontierSnapshot {
+    pub trade_futures_ts: Option<DateTime<Utc>>,
+    pub trade_spot_ts: Option<DateTime<Utc>>,
+    pub orderbook_futures_ts: Option<DateTime<Utc>>,
+    pub orderbook_spot_ts: Option<DateTime<Utc>>,
+    pub liq_futures_ts: Option<DateTime<Utc>>,
+    pub funding_futures_ts: Option<DateTime<Utc>>,
+    pub last_canonical_minute_ts: Option<DateTime<Utc>>,
+    pub latest_contiguous_complete_minute_ts: Option<DateTime<Utc>>,
+    pub last_finalized_minute_ts: Option<DateTime<Utc>>,
+    pub effective_history_floor_ts: Option<DateTime<Utc>>,
+    pub dirty_recompute_from_ts: Option<DateTime<Utc>>,
+    pub dirty_recompute_end_ts: Option<DateTime<Utc>>,
+}
+
+fn canonical_minute_presence(minute: Option<&CanonicalMinuteByMarket>) -> CanonicalMinutePresence {
+    let Some(minute) = minute else {
+        return CanonicalMinutePresence::default();
+    };
+
+    CanonicalMinutePresence {
+        minute_present: true,
+        trade_futures: minute.futures.trade.is_some(),
+        trade_spot: minute.spot.trade.is_some(),
+        orderbook_futures: minute.futures.orderbook.is_some(),
+        orderbook_spot: minute.spot.orderbook.is_some(),
+        liq_futures: minute.futures.liq.is_some(),
+        funding_futures: minute.futures.funding_mark.is_some(),
+    }
+}
+
 fn canonical_futures_minute_is_complete(inputs: &CanonicalMinuteInputs) -> bool {
     inputs.trade.is_some() && inputs.orderbook.is_some() && inputs.funding_mark.is_some()
 }
@@ -1196,6 +1269,12 @@ impl StateStore {
         self.truncate_finalized_suffix(start);
     }
 
+    pub fn clear_dirty_recompute_state(&mut self) {
+        self.dirty_recompute_from = None;
+        self.dirty_recompute_end = None;
+        self.dirty_recompute_truncated = false;
+    }
+
     pub fn reset_for_new_continuous_segment(&mut self, start: DateTime<Utc>) {
         self.buckets.clear();
         self.canonical_minutes.clear();
@@ -1232,6 +1311,51 @@ impl StateStore {
         }
 
         latest_ready
+    }
+
+    pub fn canonical_minute_presence(&self, ts_bucket: DateTime<Utc>) -> CanonicalMinutePresence {
+        canonical_minute_presence(self.canonical_minutes.get(&ts_bucket.timestamp()))
+    }
+
+    pub fn canonical_frontier_snapshot(&self) -> CanonicalFrontierSnapshot {
+        let mut snapshot = CanonicalFrontierSnapshot {
+            latest_contiguous_complete_minute_ts: self
+                .latest_continuous_canonical_segment()
+                .map(|(_, end)| end),
+            last_finalized_minute_ts: self.last_finalized_minute,
+            effective_history_floor_ts: self.effective_history_floor_ts,
+            dirty_recompute_from_ts: self.dirty_recompute_from,
+            dirty_recompute_end_ts: self.dirty_recompute_end,
+            ..CanonicalFrontierSnapshot::default()
+        };
+
+        for (minute_sec, minute) in &self.canonical_minutes {
+            let Some(ts_bucket) = Utc.timestamp_opt(*minute_sec, 0).single() else {
+                continue;
+            };
+            let presence = canonical_minute_presence(Some(minute));
+            snapshot.last_canonical_minute_ts = Some(ts_bucket);
+            if presence.trade_futures {
+                snapshot.trade_futures_ts = Some(ts_bucket);
+            }
+            if presence.trade_spot {
+                snapshot.trade_spot_ts = Some(ts_bucket);
+            }
+            if presence.orderbook_futures {
+                snapshot.orderbook_futures_ts = Some(ts_bucket);
+            }
+            if presence.orderbook_spot {
+                snapshot.orderbook_spot_ts = Some(ts_bucket);
+            }
+            if presence.liq_futures {
+                snapshot.liq_futures_ts = Some(ts_bucket);
+            }
+            if presence.funding_futures {
+                snapshot.funding_futures_ts = Some(ts_bucket);
+            }
+        }
+
+        snapshot
     }
 
     pub fn latest_continuous_canonical_segment(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
@@ -2585,6 +2709,55 @@ mod tests {
     }
 
     #[test]
+    fn canonical_minute_presence_reports_missing_required_sources() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+
+        store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+        store.ingest(agg_orderbook_event(ts, 4, 4, 0.1));
+        store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+        store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+
+        let presence = store.canonical_minute_presence(ts);
+        assert!(presence.minute_present);
+        assert!(presence.trade_futures);
+        assert!(presence.orderbook_futures);
+        assert!(presence.funding_futures);
+        assert!(presence.trade_spot);
+        assert!(!presence.orderbook_spot);
+        assert!(!presence.complete_under_current_policy());
+        assert_eq!(presence.missing_required_sources(), vec!["orderbook_spot"]);
+    }
+
+    #[test]
+    fn canonical_frontier_snapshot_tracks_each_source_frontier() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 5, 0, 0).single().unwrap();
+        let ts_2 = ts_1 + ChronoDuration::minutes(1);
+
+        for ts in [ts_1, ts_2] {
+            store.ingest(agg_trade_event(ts, 1.0, 0.5, 0.2));
+            store.ingest(agg_orderbook_event(ts, 4, 4, 0.1));
+            store.ingest(agg_funding_mark_event(ts, 45, 2000.0, 0.01));
+            store.ingest(agg_trade_event_spot(ts, 1.0, 0.5, 0.2));
+            if ts == ts_1 {
+                store.ingest(agg_orderbook_event_spot(ts, 4, 4, 0.1));
+                store.ingest(agg_liq_event(ts, 10.0));
+            }
+        }
+
+        let snapshot = store.canonical_frontier_snapshot();
+        assert_eq!(snapshot.trade_futures_ts, Some(ts_2));
+        assert_eq!(snapshot.orderbook_futures_ts, Some(ts_2));
+        assert_eq!(snapshot.funding_futures_ts, Some(ts_2));
+        assert_eq!(snapshot.trade_spot_ts, Some(ts_2));
+        assert_eq!(snapshot.orderbook_spot_ts, Some(ts_1));
+        assert_eq!(snapshot.liq_futures_ts, Some(ts_1));
+        assert_eq!(snapshot.latest_contiguous_complete_minute_ts, Some(ts_1));
+        assert_eq!(snapshot.last_canonical_minute_ts, Some(ts_2));
+    }
+
+    #[test]
     fn one_minute_kline_uses_open_time_bucket() {
         let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
         let open_time = Utc.with_ymd_and_hms(2026, 3, 6, 4, 49, 0).single().unwrap();
@@ -2937,6 +3110,27 @@ mod tests {
         let second_batch = store.recompute_dirty_finalized_minutes(1);
         assert_eq!(second_batch.len(), 1);
         assert!(!store.has_pending_dirty_recompute());
+    }
+
+    #[test]
+    fn rewind_finalized_state_clears_dirty_recompute_markers() {
+        let mut store = StateStore::new("TESTUSDT".to_string(), 1_000.0);
+        let ts_1 = Utc.with_ymd_and_hms(2026, 3, 6, 8, 0, 0).single().unwrap();
+        let ts_2 = ts_1 + ChronoDuration::minutes(1);
+
+        store.ingest(agg_trade_event(ts_1, 2.0, 1.0, 0.20));
+        store.finalize_minute(ts_1);
+        store.ingest(agg_trade_event(ts_2, 1.0, 0.0, 0.30));
+        store.finalize_minute(ts_2);
+
+        store.ingest(agg_trade_event(ts_1, 5.0, 1.0, 0.55));
+        assert!(store.has_pending_dirty_recompute());
+
+        store.rewind_finalized_state_from(ts_1);
+        store.clear_dirty_recompute_state();
+
+        assert!(!store.has_pending_dirty_recompute());
+        assert_eq!(store.last_finalized_minute(), None);
     }
 
     #[test]

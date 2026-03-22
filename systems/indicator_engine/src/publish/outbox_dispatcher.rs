@@ -22,6 +22,9 @@ const OUTBOX_GC_BATCH_SIZE: i64 = 10_000;
 const OUTBOX_GC_MAX_BATCHES_PER_ROUND: usize = 3;
 const OUTBOX_PARTITION_PRECREATE_DAYS_AHEAD: i32 = 7;
 const OUTBOX_PARTITION_PRECREATE_DAYS_BACK: i32 = 2;
+const OUTBOX_CLAIM_WARN_MS: u128 = 1_000;
+const OUTBOX_DISPATCH_WARN_MS: u128 = 2_000;
+const OUTBOX_MAX_BATCHES_PER_WAKE: usize = 32;
 
 #[derive(Clone)]
 pub struct OutboxDispatcher {
@@ -85,13 +88,28 @@ impl OutboxDispatcher {
                 Err(_) => {}
             }
 
-            if let Err(err) = self.dispatch_batch(OUTBOX_DISPATCH_BATCH_SIZE).await {
-                warn!(
-                    error = %err,
-                    debug_error = ?err,
-                    exchange_name = %self.exchange_name,
-                    "indicator outbox dispatch batch failed"
-                );
+            for batch_idx in 0..OUTBOX_MAX_BATCHES_PER_WAKE {
+                match self.dispatch_batch(OUTBOX_DISPATCH_BATCH_SIZE).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if batch_idx + 1 == OUTBOX_MAX_BATCHES_PER_WAKE {
+                            warn!(
+                                exchange_name = %self.exchange_name,
+                                max_batches_per_wake = OUTBOX_MAX_BATCHES_PER_WAKE,
+                                "indicator outbox dispatcher hit per-wake drain cap"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            debug_error = ?err,
+                            exchange_name = %self.exchange_name,
+                            "indicator outbox dispatch batch failed"
+                        );
+                        break;
+                    }
+                }
             }
 
             if Instant::now() >= next_housekeeping_at {
@@ -115,10 +133,18 @@ impl OutboxDispatcher {
         }
     }
 
-    async fn dispatch_batch(&self, batch_size: i64) -> Result<()> {
+    async fn dispatch_batch(&self, batch_size: i64) -> Result<usize> {
+        let started_at = Instant::now();
+        let claim_started_at = Instant::now();
         let rows = self.claim_batch(batch_size).await?;
+        let claim_ms = claim_started_at.elapsed().as_millis();
+        let row_count = rows.len();
+        if row_count == 0 {
+            return Ok(0);
+        }
         let mut sent_keys: Vec<(NaiveDate, i64)> = Vec::with_capacity(rows.len());
 
+        let publish_started_at = Instant::now();
         for row in rows {
             match self.publish_row(&row).await {
                 Ok(confirm) => match confirm.await.context("wait publisher confirm")? {
@@ -153,9 +179,26 @@ impl OutboxDispatcher {
                 }
             }
         }
+        let publish_and_confirm_ms = publish_started_at.elapsed().as_millis();
 
+        let delete_started_at = Instant::now();
         self.delete_sent_batch(&sent_keys).await?;
-        Ok(())
+        let delete_ms = delete_started_at.elapsed().as_millis();
+        let total_ms = started_at.elapsed().as_millis();
+        if claim_ms >= OUTBOX_CLAIM_WARN_MS || total_ms >= OUTBOX_DISPATCH_WARN_MS {
+            warn!(
+                exchange_name = %self.exchange_name,
+                batch_size = batch_size,
+                claimed_rows = row_count,
+                sent_rows = sent_keys.len(),
+                claim_ms = claim_ms,
+                publish_and_confirm_ms = publish_and_confirm_ms,
+                delete_ms = delete_ms,
+                total_ms = total_ms,
+                "slow indicator outbox dispatch batch"
+            );
+        }
+        Ok(row_count)
     }
 
     async fn claim_batch(&self, batch_size: i64) -> Result<Vec<OutboxRow>> {

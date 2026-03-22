@@ -13,8 +13,12 @@ use crate::storage::snapshot_writer::SnapshotWriter;
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::task::JoinHandle;
-use tracing::debug;
+use tracing::{debug, warn};
+
+const PROCESS_WINDOW_WARN_MS: u128 = 2_000;
+const PROCESS_WINDOW_STAGE_WARN_MS: u128 = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchMode {
@@ -105,6 +109,7 @@ impl Dispatcher {
         ctx: &IndicatorContext,
         mode: DispatchMode,
     ) -> Result<Vec<IndicatorSnapshotRow>> {
+        let total_started_at = Instant::now();
         let flow_handle = spawn_group_worker(self.flow_indicators.clone(), ctx.clone());
         let deriv_handle = spawn_group_worker(self.deriv_indicators.clone(), ctx.clone());
         let orderbook_handle = spawn_group_worker(self.orderbook_indicators.clone(), ctx.clone());
@@ -112,6 +117,7 @@ impl Dispatcher {
         let flow_output = join_group("flow", flow_handle).await?;
         let deriv_output = join_group("deriv", deriv_handle).await?;
         let orderbook_output = join_group("orderbook_heavy", orderbook_handle).await?;
+        let compute_ms = total_started_at.elapsed().as_millis();
 
         let flow_snapshot_count = flow_output.snapshots.len();
         let deriv_snapshot_count = deriv_output.snapshots.len();
@@ -193,17 +199,22 @@ impl Dispatcher {
         };
 
         if mode.persist_outputs() {
+            let snapshot_started_at = Instant::now();
             self.snapshot_writer
                 .write_snapshots(ctx.ts_bucket, &ctx.symbol, &snapshots)
                 .await?;
+            let snapshot_write_ms = snapshot_started_at.elapsed().as_millis();
+            let level_started_at = Instant::now();
             self.level_writer
                 .write_indicator_levels(ctx.ts_bucket, &ctx.symbol, &levels)
                 .await?;
             self.level_writer
                 .write_liquidation_levels(ctx.ts_bucket, &ctx.symbol, &liq_rows)
                 .await?;
+            let level_write_ms = level_started_at.elapsed().as_millis();
             let event_history_start_ts = event_history_start_ts(ctx);
             let event_history_end_ts = ctx.ts_bucket + chrono::Duration::minutes(1);
+            let event_started_at = Instant::now();
             self.event_writer
                 .write_indicator_events(
                     &ctx.symbol,
@@ -244,7 +255,11 @@ impl Dispatcher {
                     &exhaustion_rows,
                 )
                 .await?;
+            let event_write_ms = event_started_at.elapsed().as_millis();
+            let feature_started_at = Instant::now();
             self.feature_writer.write_all(ctx).await?;
+            let feature_write_ms = feature_started_at.elapsed().as_millis();
+            let progress_started_at = Instant::now();
             if let Some(messages) = live_messages.as_ref() {
                 self.snapshot_writer
                     .advance_progress_with_outbox(&ctx.symbol, ctx.ts_bucket, messages)
@@ -254,10 +269,44 @@ impl Dispatcher {
                     .advance_progress(&ctx.symbol, ctx.ts_bucket)
                     .await?;
             }
+            let progress_commit_ms = progress_started_at.elapsed().as_millis();
+            let total_ms = total_started_at.elapsed().as_millis();
+
+            if total_ms >= PROCESS_WINDOW_WARN_MS
+                || snapshot_write_ms >= PROCESS_WINDOW_STAGE_WARN_MS
+                || level_write_ms >= PROCESS_WINDOW_STAGE_WARN_MS
+                || event_write_ms >= PROCESS_WINDOW_STAGE_WARN_MS
+                || feature_write_ms >= PROCESS_WINDOW_STAGE_WARN_MS
+                || progress_commit_ms >= PROCESS_WINDOW_STAGE_WARN_MS
+            {
+                warn!(
+                    ts_bucket = %ctx.ts_bucket,
+                    symbol = %ctx.symbol,
+                    mode = ?mode,
+                    snapshot_count = snapshots.len(),
+                    level_count = levels.len(),
+                    event_count = events.len(),
+                    divergence_count = divergence_rows.len(),
+                    absorption_count = absorption_rows.len(),
+                    initiation_count = initiation_rows.len(),
+                    exhaustion_count = exhaustion_rows.len(),
+                    liq_levels = liq_rows.len(),
+                    compute_ms = compute_ms,
+                    snapshot_write_ms = snapshot_write_ms,
+                    level_write_ms = level_write_ms,
+                    event_write_ms = event_write_ms,
+                    feature_write_ms = feature_write_ms,
+                    progress_commit_ms = progress_commit_ms,
+                    total_ms = total_ms,
+                    "slow indicator minute processing"
+                );
+            }
         }
 
+        let total_ms = total_started_at.elapsed().as_millis();
         debug!(
             ts_bucket = %ctx.ts_bucket,
+            mode = ?mode,
             snapshot_count = snapshots.len(),
             flow_snapshot_count = flow_snapshot_count,
             deriv_snapshot_count = deriv_snapshot_count,
@@ -269,6 +318,8 @@ impl Dispatcher {
             initiation_count = initiation_rows.len(),
             exhaustion_count = exhaustion_rows.len(),
             liq_levels = liq_rows.len(),
+            compute_ms = compute_ms,
+            total_ms = total_ms,
             "indicator window processed"
         );
 

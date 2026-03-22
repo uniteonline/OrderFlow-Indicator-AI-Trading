@@ -2,9 +2,12 @@ use crate::indicators::context::IndicatorSnapshotRow;
 use crate::publish::ind_publisher::OutboxMessage;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use market_data_ingestor::sinks::outbox_writer::OutboxWriter;
 use serde_json::{json, Map, Value};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, QueryBuilder, Transaction};
+use std::time::Instant;
+use tracing::warn;
+
+const OUTBOX_PROGRESS_TX_WARN_MS: u128 = 1_000;
 
 #[derive(Clone)]
 pub struct SnapshotWriter {
@@ -131,33 +134,39 @@ impl SnapshotWriter {
         ts_bucket: DateTime<Utc>,
         messages: &[OutboxMessage],
     ) -> Result<()> {
+        let total_started_at = Instant::now();
+        let begin_started_at = Instant::now();
         let mut tx = self
             .pool
             .begin()
             .await
             .context("begin indicator progress+outbox tx")?;
-        for message in messages {
-            OutboxWriter::enqueue_in_tx(
-                &mut tx,
-                &message.exchange_name,
-                &message.routing_key,
-                message.message_id,
-                message.schema_version,
-                message.headers_json.clone(),
-                message.payload_json.clone(),
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "enqueue indicator outbox message routing_key={}",
-                    message.routing_key
-                )
-            })?;
-        }
+        let begin_ms = begin_started_at.elapsed().as_millis();
+        let enqueue_started_at = Instant::now();
+        enqueue_outbox_batch_in_tx(&mut tx, messages).await?;
+        let enqueue_ms = enqueue_started_at.elapsed().as_millis();
+        let progress_started_at = Instant::now();
         upsert_indicator_progress(&mut tx, symbol, ts_bucket).await?;
+        let progress_ms = progress_started_at.elapsed().as_millis();
+        let commit_started_at = Instant::now();
         tx.commit()
             .await
             .context("commit indicator progress+outbox tx")?;
+        let commit_ms = commit_started_at.elapsed().as_millis();
+        let total_ms = total_started_at.elapsed().as_millis();
+        if total_ms >= OUTBOX_PROGRESS_TX_WARN_MS {
+            warn!(
+                symbol = symbol,
+                ts_bucket = %ts_bucket,
+                message_count = messages.len(),
+                begin_ms = begin_ms,
+                enqueue_ms = enqueue_ms,
+                progress_ms = progress_ms,
+                commit_ms = commit_ms,
+                total_ms = total_ms,
+                "slow indicator progress+outbox transaction"
+            );
+        }
         Ok(())
     }
 
@@ -269,6 +278,46 @@ impl SnapshotWriter {
             .context("commit indicator persisted tail rewind tx")?;
         Ok(())
     }
+}
+
+async fn enqueue_outbox_batch_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    messages: &[OutboxMessage],
+) -> Result<()> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new(
+        r#"
+        INSERT INTO ops.outbox_event (
+            exchange_name, routing_key, message_id, schema_version, headers_json, payload_json
+        )
+        "#,
+    );
+
+    builder.push_values(messages, |mut b, message| {
+        b.push_bind(&message.exchange_name)
+            .push_bind(&message.routing_key)
+            .push_bind(message.message_id)
+            .push_bind(message.schema_version)
+            .push_bind(&message.headers_json)
+            .push_bind(&message.payload_json);
+    });
+
+    builder.push(" ON CONFLICT DO NOTHING");
+    builder
+        .build()
+        .execute(tx.as_mut())
+        .await
+        .with_context(|| {
+            format!(
+                "batch insert indicator outbox messages count={}",
+                messages.len()
+            )
+        })?;
+
+    Ok(())
 }
 
 fn interval_text_by_window(window_code: &str) -> String {

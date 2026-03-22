@@ -13,7 +13,8 @@ use crate::publish::ind_publisher::IndPublisher;
 use crate::publish::outbox_dispatcher::OutboxDispatcher;
 use crate::runtime::dispatcher::{DispatchMode, Dispatcher};
 use crate::runtime::state_store::{
-    MinuteHistory, StateSnapshot, StateStore, HISTORY_LIMIT_MINUTES, STATE_SNAPSHOT_VERSION,
+    CanonicalFrontierSnapshot, CanonicalMinutePresence, MinuteHistory, StateSnapshot, StateStore,
+    HISTORY_LIMIT_MINUTES, STATE_SNAPSHOT_VERSION,
 };
 use crate::runtime::window_scheduler::WindowScheduler;
 use crate::storage::event_writer::EventWriter;
@@ -21,7 +22,7 @@ use crate::storage::feature_writer::FeatureWriter;
 use crate::storage::level_writer::LevelWriter;
 use crate::storage::snapshot_writer::SnapshotWriter;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use serde_json::{json, Value};
 use sqlx::{postgres::PgRow, PgPool, Row};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -43,6 +44,9 @@ const INGEST_NON_TRADE_CHANNEL_CAPACITY: usize = 100_000;
 const INGEST_DRAIN_PER_TICK_LIMIT: usize = 25_000;
 const DIRTY_RECOMPUTE_BATCH_SIZE: usize = 5;
 const DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK: usize = 50;
+const PROCESS_READY_MINUTES_WARN_MS: u128 = 2_000;
+const STUCK_PROGRESS_IDLE_SECS: u64 = 60;
+const STUCK_WARN_INTERVAL_SECS: u64 = 60;
 
 #[derive(Debug, Clone)]
 pub struct ReplayRow {
@@ -61,6 +65,46 @@ pub struct BackfillCursor {
     pub market: String,
     pub symbol: String,
     pub routing_key: String,
+}
+
+#[derive(Debug)]
+struct RuntimeStallDetector {
+    last_persisted_ts: Option<DateTime<Utc>>,
+    last_progress_advance_at: Instant,
+    last_warn_at: Option<Instant>,
+}
+
+impl RuntimeStallDetector {
+    fn new(last_persisted_ts: Option<DateTime<Utc>>) -> Self {
+        Self {
+            last_persisted_ts,
+            last_progress_advance_at: Instant::now(),
+            last_warn_at: None,
+        }
+    }
+
+    fn observe_persisted_ts(&mut self, current: Option<DateTime<Utc>>) {
+        if current != self.last_persisted_ts {
+            self.last_persisted_ts = current;
+            self.last_progress_advance_at = Instant::now();
+        }
+    }
+
+    fn idle_for_too_long(&self) -> bool {
+        self.last_progress_advance_at.elapsed() >= Duration::from_secs(STUCK_PROGRESS_IDLE_SECS)
+    }
+
+    fn should_emit_warn(&mut self) -> bool {
+        let now = Instant::now();
+        let allow = self
+            .last_warn_at
+            .map(|last| now.duration_since(last) >= Duration::from_secs(STUCK_WARN_INTERVAL_SECS))
+            .unwrap_or(true);
+        if allow {
+            self.last_warn_at = Some(now);
+        }
+        allow
+    }
 }
 
 pub fn build_indicator_runtime_options(
@@ -196,6 +240,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
     // Race backfill against shutdown signals. If a signal arrives during backfill,
     // save the partial snapshot (valid — next start gap-fills missing minutes) and exit.
     let mut got_signal_before_live = false;
+    metrics.set_backfill_mode(true);
     let startup_replay_cutoff_bucket = tokio::select! {
         biased;
         _ = tokio::signal::ctrl_c() => {
@@ -257,6 +302,7 @@ pub async fn run(ctx: AppContext) -> Result<()> {
         }
         return Ok(());
     }
+    metrics.set_backfill_mode(false);
 
     let mut startup_cutover_completed = startup_replay_cutoff_bucket.is_none();
     let outbox_dispatcher = OutboxDispatcher::new(
@@ -268,6 +314,8 @@ pub async fn run(ctx: AppContext) -> Result<()> {
 
     let mut trade_channel_closed = false;
     let mut non_trade_channel_closed = false;
+    let mut stall_detector =
+        RuntimeStallDetector::new(ts_from_millis(metrics.snapshot().last_persisted_ts_ms));
 
     loop {
         tokio::select! {
@@ -390,13 +438,37 @@ pub async fn run(ctx: AppContext) -> Result<()> {
                     stale_drop_last_report = Instant::now();
                 }
 
-                let Some(next_minute) = scheduler.next_minute_to_emit() else {
+                let next_minute = scheduler.next_minute_to_emit();
+                let latest_closed = scheduler.closed_minute(Utc::now());
+                let ready_through_ts = next_minute.and_then(|minute| {
+                    state_store.latest_contiguous_complete_canonical_minute_from(minute, latest_closed)
+                });
+                let frontier_snapshot = refresh_runtime_observability_metrics(
+                    &metrics,
+                    &state_store,
+                    next_minute,
+                    ready_through_ts,
+                    trade_rx.len(),
+                    non_trade_rx.len(),
+                );
+                let next_minute_presence = next_minute
+                    .map(|minute| state_store.canonical_minute_presence(minute))
+                    .unwrap_or_default();
+                maybe_warn_runtime_stall(
+                    &mut stall_detector,
+                    &metrics,
+                    &frontier_snapshot,
+                    next_minute,
+                    ready_through_ts,
+                    &next_minute_presence,
+                    trade_rx.len(),
+                    non_trade_rx.len(),
+                );
+
+                let Some(_next_minute) = next_minute else {
                     continue;
                 };
-                let latest_closed = scheduler.closed_minute(Utc::now());
-                let Some(ready_through_ts) = state_store
-                    .latest_contiguous_complete_canonical_minute_from(next_minute, latest_closed)
-                else {
+                let Some(ready_through_ts) = ready_through_ts else {
                     continue;
                 };
                 if let Err(err) = process_ready_minutes(
@@ -1138,6 +1210,139 @@ fn minute_exclusive_upper_bound(ts: DateTime<Utc>) -> DateTime<Utc> {
     }
 }
 
+fn ts_to_millis(ts: Option<DateTime<Utc>>) -> Option<i64> {
+    ts.map(|value| value.timestamp_millis())
+}
+
+fn ts_from_millis(ts_ms: i64) -> Option<DateTime<Utc>> {
+    if ts_ms > 0 {
+        Utc.timestamp_millis_opt(ts_ms).single()
+    } else {
+        None
+    }
+}
+
+fn refresh_runtime_observability_metrics(
+    metrics: &Arc<AppMetrics>,
+    state_store: &StateStore,
+    next_minute: Option<DateTime<Utc>>,
+    ready_through_ts: Option<DateTime<Utc>>,
+    trade_channel_len: usize,
+    non_trade_channel_len: usize,
+) -> CanonicalFrontierSnapshot {
+    let frontier_snapshot = state_store.canonical_frontier_snapshot();
+    metrics.set_runtime_window_state(
+        ts_to_millis(next_minute),
+        ts_to_millis(ready_through_ts),
+        ts_to_millis(frontier_snapshot.latest_contiguous_complete_minute_ts),
+    );
+    metrics.set_dirty_recompute_bounds(
+        ts_to_millis(frontier_snapshot.dirty_recompute_from_ts),
+        ts_to_millis(frontier_snapshot.dirty_recompute_end_ts),
+    );
+    metrics.set_channel_lengths(trade_channel_len, non_trade_channel_len);
+    metrics.set_canonical_frontiers(
+        ts_to_millis(frontier_snapshot.trade_futures_ts),
+        ts_to_millis(frontier_snapshot.trade_spot_ts),
+        ts_to_millis(frontier_snapshot.orderbook_futures_ts),
+        ts_to_millis(frontier_snapshot.orderbook_spot_ts),
+        ts_to_millis(frontier_snapshot.liq_futures_ts),
+        ts_to_millis(frontier_snapshot.funding_futures_ts),
+    );
+    frontier_snapshot
+}
+
+fn format_missing_required_sources(presence: &CanonicalMinutePresence) -> String {
+    let missing = presence.missing_required_sources();
+    if missing.is_empty() {
+        "none".to_string()
+    } else {
+        missing.join(",")
+    }
+}
+
+fn maybe_warn_runtime_stall(
+    stall_detector: &mut RuntimeStallDetector,
+    metrics: &Arc<AppMetrics>,
+    frontier_snapshot: &CanonicalFrontierSnapshot,
+    next_minute: Option<DateTime<Utc>>,
+    ready_through_ts: Option<DateTime<Utc>>,
+    next_minute_presence: &CanonicalMinutePresence,
+    trade_channel_len: usize,
+    non_trade_channel_len: usize,
+) {
+    let metrics_snapshot = metrics.snapshot();
+    let persisted_ts = ts_from_millis(metrics_snapshot.last_persisted_ts_ms);
+    stall_detector.observe_persisted_ts(persisted_ts);
+    if !stall_detector.idle_for_too_long() {
+        return;
+    }
+
+    let queue_lag = trade_channel_len + non_trade_channel_len;
+    let ready_ahead = ready_through_ts
+        .map(|ready| {
+            persisted_ts
+                .map(|persisted| ready > persisted)
+                .unwrap_or(true)
+        })
+        .unwrap_or(false);
+    let complete_frontier_ahead = frontier_snapshot
+        .latest_contiguous_complete_minute_ts
+        .map(|ready| {
+            persisted_ts
+                .map(|persisted| ready > persisted)
+                .unwrap_or(true)
+        })
+        .unwrap_or(false);
+    let canonical_source_ahead = frontier_snapshot
+        .last_canonical_minute_ts
+        .map(|ready| {
+            persisted_ts
+                .map(|persisted| ready > persisted)
+                .unwrap_or(true)
+        })
+        .unwrap_or(false);
+
+    if !(ready_ahead || complete_frontier_ahead || canonical_source_ahead || queue_lag > 0) {
+        return;
+    }
+    if !stall_detector.should_emit_warn() {
+        return;
+    }
+
+    warn!(
+        persisted_ts = ?persisted_ts,
+        idle_secs = stall_detector.last_progress_advance_at.elapsed().as_secs(),
+        next_minute = ?next_minute,
+        ready_through_ts = ?ready_through_ts,
+        queue_lag = queue_lag,
+        trade_channel_len = trade_channel_len,
+        non_trade_channel_len = non_trade_channel_len,
+        latest_complete_canonical_ts = ?frontier_snapshot.latest_contiguous_complete_minute_ts,
+        last_canonical_minute_ts = ?frontier_snapshot.last_canonical_minute_ts,
+        trade_futures_ts = ?frontier_snapshot.trade_futures_ts,
+        trade_spot_ts = ?frontier_snapshot.trade_spot_ts,
+        orderbook_futures_ts = ?frontier_snapshot.orderbook_futures_ts,
+        orderbook_spot_ts = ?frontier_snapshot.orderbook_spot_ts,
+        liq_futures_ts = ?frontier_snapshot.liq_futures_ts,
+        funding_futures_ts = ?frontier_snapshot.funding_futures_ts,
+        dirty_recompute_from_ts = ?frontier_snapshot.dirty_recompute_from_ts,
+        dirty_recompute_end_ts = ?frontier_snapshot.dirty_recompute_end_ts,
+        last_finalized_minute_ts = ?frontier_snapshot.last_finalized_minute_ts,
+        effective_history_floor_ts = ?frontier_snapshot.effective_history_floor_ts,
+        next_minute_present = next_minute_presence.minute_present,
+        next_minute_complete_under_current_policy = next_minute_presence.complete_under_current_policy(),
+        next_minute_trade_futures = next_minute_presence.trade_futures,
+        next_minute_orderbook_futures = next_minute_presence.orderbook_futures,
+        next_minute_funding_futures = next_minute_presence.funding_futures,
+        next_minute_trade_spot = next_minute_presence.trade_spot,
+        next_minute_orderbook_spot = next_minute_presence.orderbook_spot,
+        next_minute_liq_futures = next_minute_presence.liq_futures,
+        next_minute_missing_required_sources = %format_missing_required_sources(next_minute_presence),
+        "indicator runtime has not advanced persisted frontier; inspect readiness, queues, and outbox timings"
+    );
+}
+
 fn handle_ingest_event(
     event: EngineEvent,
     startup_replay_cutoff_bucket: Option<DateTime<Utc>>,
@@ -1245,11 +1450,17 @@ async fn process_ready_minutes(
     runtime_options: &IndicatorRuntimeOptions,
     ready_through_ts: DateTime<Utc>,
 ) -> Result<()> {
+    let batch_started_at = Instant::now();
+    let batch_start_minute = scheduler.next_minute_to_emit();
+    let planned_ready_minutes = batch_start_minute
+        .map(|start| (ready_through_ts - start).num_minutes().max(0) as usize + 1)
+        .unwrap_or(0);
     let mut windows_processed = 0usize;
     let mut first_bucket: Option<DateTime<Utc>> = None;
     let mut last_bucket: Option<DateTime<Utc>> = None;
     let mut last_computed: Vec<String> = Vec::new();
     let mut missing_union: BTreeSet<String> = BTreeSet::new();
+    let had_dirty_pending_at_start = state_store.has_pending_dirty_recompute();
 
     // Accuracy first: dirty recompute truncates the finalized suffix before rebuilding it.
     // If we publish new live minutes while that suffix is only partially rebuilt, any
@@ -1281,6 +1492,7 @@ async fn process_ready_minutes(
             )
             .await?;
             metrics.inc_exported_window();
+            metrics.set_last_persisted_ts(Some(minute.timestamp_millis()));
             let (computed, missing) = indicator_coverage(&snapshots);
             windows_processed += 1;
             if first_bucket.is_none() {
@@ -1307,6 +1519,18 @@ async fn process_ready_minutes(
     }
 
     if state_store.has_pending_dirty_recompute() {
+        let elapsed_ms = batch_started_at.elapsed().as_millis();
+        if dirty_windows_processed > 0 || elapsed_ms >= PROCESS_READY_MINUTES_WARN_MS {
+            warn!(
+                batch_start_minute = ?batch_start_minute,
+                ready_through_ts = %ready_through_ts,
+                dirty_windows_processed = dirty_windows_processed,
+                dirty_budget_per_tick = DIRTY_RECOMPUTE_WINDOW_BUDGET_PER_TICK,
+                planned_ready_minutes = planned_ready_minutes,
+                elapsed_ms = elapsed_ms,
+                "process_ready_minutes yielded early with dirty recompute still pending"
+            );
+        }
         return Ok(());
     }
 
@@ -1323,6 +1547,7 @@ async fn process_ready_minutes(
         {
             Ok(snapshots) => {
                 metrics.inc_exported_window();
+                metrics.set_last_persisted_ts(Some(minute.timestamp_millis()));
                 let (computed, missing) = indicator_coverage(&snapshots);
                 windows_processed += 1;
                 if first_bucket.is_none() {
@@ -1362,11 +1587,17 @@ async fn process_ready_minutes(
 
     if let Some(last_bucket) = last_bucket {
         let first_bucket = first_bucket.unwrap_or(last_bucket);
+        let elapsed_ms = batch_started_at.elapsed().as_millis();
         if missing_union.is_empty() {
             info!(
                 ts_bucket_from = %first_bucket,
                 ts_bucket_to = %last_bucket,
                 processed_windows = windows_processed,
+                planned_ready_minutes = planned_ready_minutes,
+                dirty_windows_processed = dirty_windows_processed,
+                dirty_pending_at_start = had_dirty_pending_at_start,
+                ready_through_ts = %ready_through_ts,
+                elapsed_ms = elapsed_ms,
                 computed_count = last_computed.len(),
                 missing_count = 0,
                 computed_indicators = %last_computed.join(","),
@@ -1382,6 +1613,11 @@ async fn process_ready_minutes(
                 ts_bucket_from = %first_bucket,
                 ts_bucket_to = %last_bucket,
                 processed_windows = windows_processed,
+                planned_ready_minutes = planned_ready_minutes,
+                dirty_windows_processed = dirty_windows_processed,
+                dirty_pending_at_start = had_dirty_pending_at_start,
+                ready_through_ts = %ready_through_ts,
+                elapsed_ms = elapsed_ms,
                 computed_count = last_computed.len(),
                 missing_count = missing_union.len(),
                 computed_indicators = %last_computed.join(","),
@@ -1497,6 +1733,7 @@ async fn run_startup_backfill(
             .await
             .context("query latest indicator snapshot ts")?;
     let persisted_frontier_ts = latest_progress_ts.or(latest_snapshot_table_ts);
+    metrics.set_last_persisted_ts(persisted_frontier_ts.map(|ts| ts.timestamp_millis()));
     let mut from_ts = match persisted_frontier_ts {
         Some(ts) => ts - ChronoDuration::minutes(STARTUP_BACKFILL_OVERLAP_MINUTES),
         None => now - ChronoDuration::minutes(STARTUP_BACKFILL_FALLBACK_LOOKBACK_MINUTES),
@@ -1714,6 +1951,14 @@ async fn run_startup_backfill(
         } else {
             state_store.rewind_finalized_state_from(replay_start_ts);
         }
+        // Startup replay rows have already been ingested into canonical storage in
+        // order to discover the continuity window. When resuming from a snapshot,
+        // those overlap rows can temporarily mark the already-finalized snapshot
+        // tail as dirty before we rewind the finalized state. The startup replay
+        // below explicitly rebuilds the entire overlap/materialization range, so any
+        // dirty suffix left over from the pre-rewind ingest is stale and must be
+        // cleared before we cut over to live processing.
+        state_store.clear_dirty_recompute_state();
     }
     state_store.set_effective_history_floor(Some(replay_start_ts));
 
@@ -1746,6 +1991,7 @@ async fn run_startup_backfill(
             exchange_name = %ctx.config.mq.exchanges.ind.name,
             "rewound persisted indicator tail to protect overlap repair checkpoint"
         );
+        metrics.set_last_persisted_ts(Some(rewind_target_ts.timestamp_millis()));
     }
 
     info!(
@@ -1764,6 +2010,14 @@ async fn run_startup_backfill(
             state_store.finalize_minute(minute);
             minute += ChronoDuration::minutes(1);
         }
+        refresh_runtime_observability_metrics(
+            &metrics,
+            state_store,
+            Some(repair_start_ts),
+            Some(replay_end_ts),
+            0,
+            0,
+        );
         info!(
             warm_start_ts = %replay_start_ts,
             warm_end_ts = %warm_end_ts,
@@ -1779,6 +2033,14 @@ async fn run_startup_backfill(
 
     let mut minute = repair_start_ts;
     while minute <= replay_end_ts {
+        refresh_runtime_observability_metrics(
+            &metrics,
+            state_store,
+            Some(minute),
+            Some(replay_end_ts),
+            0,
+            0,
+        );
         let window = state_store.finalize_minute(minute);
         let snapshots = process_window_bundle(
             ctx,
@@ -1789,6 +2051,7 @@ async fn run_startup_backfill(
         )
         .await?;
         metrics.inc_exported_window();
+        metrics.set_last_persisted_ts(Some(minute.timestamp_millis()));
         materialized_windows += 1;
         first_materialized_bucket.get_or_insert(minute);
         last_materialized_bucket = Some(minute);
