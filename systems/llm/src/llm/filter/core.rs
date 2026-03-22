@@ -158,6 +158,9 @@ fn build_core_root(root: &Value, mode: CoreMode) -> Value {
                     if matches!(mode, CoreMode::Pending | CoreMode::Management) {
                         strip_position_entry_reason(&mut value);
                     }
+                    if matches!(mode, CoreMode::Pending) {
+                        strip_pending_management_reasons(&mut value);
+                    }
                     value
                 } else {
                     value
@@ -175,6 +178,17 @@ fn strip_position_entry_reason(value: &mut Value) {
     if let Some(entry_context) = value.pointer_mut("/position_context/entry_context") {
         if let Some(entry_context_object) = entry_context.as_object_mut() {
             entry_context_object.remove("entry_reason");
+        }
+    }
+}
+
+fn strip_pending_management_reasons(value: &mut Value) {
+    if let Some(snapshot_object) = value.as_object_mut() {
+        snapshot_object.remove("last_management_reason");
+    }
+    if let Some(position_context) = value.pointer_mut("/position_context") {
+        if let Some(position_context_object) = position_context.as_object_mut() {
+            position_context_object.remove("last_management_reason");
         }
     }
 }
@@ -1854,6 +1868,12 @@ mod tests {
             .is_some());
         assert!(value
             .pointer("/management_snapshot/position_context/entry_context/entry_reason")
+            .is_none());
+        assert!(value
+            .pointer("/management_snapshot/last_management_reason")
+            .is_none());
+        assert!(value
+            .pointer("/management_snapshot/position_context/last_management_reason")
             .is_none());
         assert!(value
             .pointer("/indicators/fvg/payload/by_window/3d")
